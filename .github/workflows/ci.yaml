@@ -37,6 +37,9 @@ jobs:
           path: kalico
           token: ${{ github.token }}
       - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ./scripts/build-native.sh --config-only
+        working-directory: kalico
       - run: KALICO_ROOT=$GITHUB_WORKSPACE/kalico uv run --project kalico python -m pytest tests/ -q
 
   ruff:

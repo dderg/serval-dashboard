@@ -127,11 +127,14 @@ fn asset_table(dist_dir: &Path) -> String {
     let mut rows = String::new();
     for name in &names {
         let path = dist_dir.join(name);
-        rows.push_str(&format!(
-            "    Asset {{ path: {name:?}, mime: {mime:?}, body: include_bytes!({fs_path:?}) }},\n",
+        use std::fmt::Write;
+        writeln!(
+            rows,
+            "    Asset {{ path: {name:?}, mime: {mime:?}, body: include_bytes!({fs_path:?}) }},",
             mime = mime_for(name),
             fs_path = path.to_str().expect("utf-8 OUT_DIR path"),
-        ));
+        )
+        .expect("write asset row");
     }
     format!("pub const BUILT_ASSETS: &[Asset] = &[\n{rows}];\n")
 }
