@@ -56,6 +56,8 @@ for entry in "$EXTRAS"/*; do
     destination="$DESTINATION/$(basename "$entry")"
     if [ -L "$destination" ]; then
         rm "$destination"
+    elif [ -d "$destination" ] && [ -z "$(find "$destination" -type f ! -name '*.pyc' | head -1)" ]; then
+        rm -rf "$destination"
     elif [ -e "$destination" ]; then
         echo "servo-cal: refusing to replace non-symlink $destination" >&2
         exit 1
