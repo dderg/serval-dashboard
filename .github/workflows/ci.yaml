@@ -36,6 +36,14 @@ jobs:
           ref: sota-motion
           path: kalico
           token: ${{ github.token }}
+      - name: fall back to the extraction branch until kalico#313 merges the servo_axis seam
+        run: |
+          if ! grep -q "def belt_pair" klippy/extras/servo_axis.py; then
+            git fetch --depth 1 origin servo-cal-dashboard-extraction
+            git checkout FETCH_HEAD
+            echo "sota-motion lacks servo_axis.belt_pair; using servo-cal-dashboard-extraction"
+          fi
+        working-directory: kalico
       - uses: astral-sh/setup-uv@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: ./scripts/build-native.sh --config-only
