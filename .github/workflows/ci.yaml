@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: oven-sh/setup-bun@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile && bun run check && bun run test
+        working-directory: servo-ident/web
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: dderg/kalico
+          ref: sota-motion
+          path: kalico
+          token: ${{ github.token }}
+      - uses: astral-sh/setup-uv@v5
+      - run: KALICO_ROOT=$GITHUB_WORKSPACE/kalico uv run --project kalico python -m pytest tests/ -q
+
+  ruff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx ruff check klippy_extras tests
+      - run: uvx ruff format --check klippy_extras tests

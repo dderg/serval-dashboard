@@ -1,0 +1,21 @@
+[tool.ruff]
+line-length = 80
+indent-width = 4
+
+[tool.ruff.lint]
+extend-select = [
+  "B006",
+  "FA100",
+  "FA102",
+  "I001",
+  "I002",
+]
+ignore = [
+  "C901",
+  "E501",
+  "E302",
+  "E722",
+  "E741",
+  "F841",
+  "E721",
+]

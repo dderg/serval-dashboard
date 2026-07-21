@@ -1,0 +1,14 @@
+[Unit]
+Description=serval servo calibration dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=@SERVO_CAL_USER@
+ExecStart=@SERVO_CAL_HOME@/servo-cal-launcher.sh
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
