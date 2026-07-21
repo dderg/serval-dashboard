@@ -772,7 +772,8 @@ pub fn compute_verdict(
         }),
         "dynamics_refine" => Ok(Verdict {
             recommended_step: None,
-            reason: "scale pick is computed host-side by SERVO_REFINE_DYNAMICS".to_string(),
+            reason: "scale pick was computed host-side by the retired SERVO_REFINE_DYNAMICS"
+                .to_string(),
             flags: Vec::new(),
             apply: None,
         }),
@@ -845,7 +846,7 @@ pub fn build_run(dir: &Path) -> Result<(Results, PlotSeries), String> {
 
 /// Load prior `results.json` / `plot_series.json` as a per-step-name cache so
 /// re-analyzing an append-only run only pays for the new steps. Sweeps that
-/// analyze after every eval (SERVO_REFINE_DYNAMICS, gain sweeps) otherwise go
+/// analyze after every eval (SERVO_TUNE_DYNAMICS, gain sweeps) otherwise go
 /// quadratic in run length — the growing between-eval stall starves the
 /// motion stream. Only sound while the analyzer parameters are unchanged, so
 /// it is opt-in (`servo-cal analyze --incremental`).

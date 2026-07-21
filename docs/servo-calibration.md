@@ -76,10 +76,11 @@ configured, and the `servo-cal` binary must be built once on the host with
    (iteratively, with the candidate feedforward live in the loop on
    `coupled_xy`) and point `dynamics_profile` at it to enable torque
    feedforward.
-5. **`SERVO_REFINE_DYNAMICS`** — empirically refine the fitted profile on the
-   running endpoint (mass first, then viscous, then coulomb) when the
-   regression fit varies with the excitation grid; point `dynamics_profile`
-   at the refined TOML it writes.
+5. **`SERVO_TUNE_DYNAMICS`** — empirically tune the fitted profile on the
+   running endpoint (closed-loop coordinate descent scored by the
+   transient-window ferr rms; `TERMS=MASS,VISCOUS,COULOMB,LEAD` by default)
+   when the regression fit varies with the excitation grid; point
+   `dynamics_profile` at the tuned TOML it writes.
 
 **`SERVO_MEASURE_TRACKING`** is the before/after check for any single change.
 **`SERVO_AUTOTUNE`** packages this exact order into one command — see
@@ -418,100 +419,63 @@ Both paths capture into a run directory and run
 `~/printer_data/config/servo_dynamics/dynamics_<name>_<stamp>.toml` and a new
 fit never overwrites an existing profile.
 
-#### SERVO_REFINE_DYNAMICS
-Empirical refinement of an existing dynamics profile, for when the
-`SERVO_FIT_DYNAMICS` regression differs run-to-run with the excitation
-grid. Golden-section search over a scale factor applied to the baseline
-profile's per-mode **mass** (`TERM=MASS`, default), **viscous**
-(`TERM=VISCOUS`) or **coulomb** (`TERM=COULOMB`) vector, or an additive signed
-per-pair **direction split** (`TERM=DIRECTION_SPLIT`): each candidate
-model is streamed into the *running*
-endpoint (no restart) and measured with one tracking capture of the full
-`SERVO_MEASURE_INERTIA` `ACCELS` × `SPEEDS` grid, then scored from
-`servo-cal analyze` — mean per-move **ferr_peak** for `MASS` and
-`COULOMB` (friction error peaks at breakaway, right at the start of the
-window), and mean per-move **ferr_rms** for `VISCOUS` (viscous error
-shows up as cruise following error). The analyzer's per-move error window starts
-the FF lead **before** the commanded move (torque feedforward is sent
-that far ahead, so its error signature lands ahead of the position
-command; the run manifest carries `ff_lead_us` and the analyzer scales
-it by the capture rate) and runs **through the settle duration**, so ferr_peak/ferr_rms
-cover FF lead-in, in-move tracking, and endpoint overshoot alike (for
-every command that reads these metrics, not just the refine);
-`overshoot` remains reported separately as the post-move-only peak. On
-`coupled_xy`, every vector term (`MASS`, `VISCOUS`, `COULOMB`) refines the
-two modes **sequentially** — first a
-search over the x-mode entry with X-only strokes, then, on top of the X
-winner, the y mode with Y-only strokes — because the two modes are
-independent physical quantities (the moved mass, the rail friction) and
-one shared scale cannot serve both; an axis stroke leaves the other
-mode's velocity at exactly zero, so each phase's score depends only on
-its own entry. The provenance keys are `refined_scale_x`/`refined_scale_y`.
-Scoring the mean over
-the whole grid keeps a scale that helps at one operating point but hurts
-at another from winning; every per-scale line also lists mean overshoot,
-ferr_rms, and ferr_peak so the non-scored metrics can be sanity-checked.
-The
-baseline is `PROFILE=` or the node-level `[ethercat_node]
-dynamics_profile`; per-motor profiles are not supported (point `PROFILE=`
-at an equivalent node-level TOML). The search brackets `[LO, HI]` around
-1.0 and stops when the bracket is narrower than `TOL` or `MAX_EVALS`
-candidates have been measured; an explicit baseline measurement at scale
-1.0 always competes, and the winner is the best *measured* candidate. A
-`torque_saturated` flag on any step aborts the run — clipped strokes
-cannot score a candidate. `resonance_detected` is ignored here: scaling
-a feedforward term does not move the loop's resonances, and the ratio
-metric is amplitude-blind (the strongest 20–450 Hz PSD peak over the
-mean 1–4 Hz power), so high-accel refine strokes — which put almost
-nothing in the low band — trip it on µm-level mechanical peaks the
-machine shows on every normal move.
+#### SERVO_TUNE_DYNAMICS
+Empirical closed-loop tuner for an existing dynamics profile
+(`coupled_xy` only), for when the `SERVO_FIT_DYNAMICS` regression
+differs run-to-run with the excitation grid. Where the retired
+golden-section refine scaled one term against a fitted correlation,
+the tuner is a coordinate descent that **measures** tracking error:
+each round streams the trial model into the *running* endpoint (no
+restart), captures one XY pattern run at `MAX_ACCEL`/`MAX_SPEED`, and
+scores each mode by the **transient-window rms** of its following
+error — the excursion in the short window right after each commanded
+transition, where feedforward has authority before the inner servo
+loop corrects it (whole-capture rms dilutes these transients ~10×).
+The ferr/accel regression is still fitted and reported per round, but
+only as a direction hint and diagnostic.
 
-`DIRECTION_SPLIT` runs one sequential phase per pair. For each candidate step,
-the profile frame defines `lambda`: `+1` for exactly equal pair columns and
-`-1` for exactly opposite columns. Analyzer moves are joined by `move`; both
-drives must have identical move sets and matching `start_ms`/`end_ms`, nonzero
-directions, and `direction_second = lambda * direction_first`. Each aligned
-move contributes the signed differential `q = ferr_mean_moving_first -
-lambda * ferr_mean_moving_second`. The scorer averages `q` separately as
-`q_plus` for first-drive direction `+1` and `q_minus` for direction `-1`,
-requires both bins, and minimizes `ferr_mean_direction_imbalance =
-abs(q_plus + q_minus) / 2`. Thus a persistent
-per-motor error that reverses with travel direction cancels, while an even
-pair-split error remains. Candidate output reports `q_plus`, `q_minus`, and
-`ferr_mean_direction_imbalance`; malformed alignment or direction data aborts
-refinement.
+Terms tune one at a time in `TERMS` order, both modes per capture,
+each as a 1-D line search. The mass probe's first direction follows
+the **onset bias** (mean `sign(accel)·ferr` right after each accel
+step — only the first excursion when torque lands carries clean
+command-path sign; positive = under-fed); other terms follow their
+regression coefficient's sign. A failed first probe flips once, the
+step grows while the rms clears a 2-sigma deadband measured from
+per-window scatter (relative change capped at 40% per probe), and the
+first non-improving probe triggers one parabolic refine through the
+bracket; ties go to the best measured value. Viscous/coulomb are
+floored at zero (a zero-valued term probes up by a fixed floor step),
+mass at 10% of its baseline.
 
-The candidate is an additive delta, not a scale, so delta `0` is the measured
-baseline and a profile with no `[[pair]]` records can be augmented without
-refitting the common dynamics. Missing pairs are taken from the current
-slot-ordered AWD kinematic layout when it agrees with the profile frame,
-otherwise from groups of exactly two equal or opposite frame columns; zero and
-unmatched columns are ignored, ambiguous larger exact-match groups fail, and a
-kinematically known pair with unequal parallel columns fails rather than
-guessing.
-The default delta bracket is `[-0.25, 0.25]`, reduced when needed to keep every
-candidate at `abs(direction_split) < 0.5`, with default `TOL=0.01`. Explicit
-`LO`/`HI` must contain zero and keep both bracket ends in range. The signed
-convention is solely `slots = [first, second]`, with differential
-`tau_first - lambda*tau_second`; swapping the slots requires
-`w' = -lambda*w` (equal columns negate `w`, opposite columns preserve it), and
-no motor orientation metadata participates.
-The live model is **always** restored to the baseline afterwards
-(also on failure; if klippy dies mid-run the endpoint keeps the last
-candidate until restart). When a candidate beats its baseline the refined
-profile is written to a new TOML under
-`~/printer_data/config/servo_dynamics/` (with
-`refined_source`/`refined_term`/`refined_scale`/`refined_run` provenance
-keys — `refined_scale_x`/`refined_scale_y` for the sequential corexy
-refines and `refined_delta_<first-slot>` for direction splits — never
-overwriting) and the `dynamics_profile` paste line is printed
-— config edit + restart is the only way to keep it; when the baseline
-wins, nothing is written. Refine `MASS` first, then `TERM=VISCOUS`
-against the refined profile, then `TERM=COULOMB` against
-that, and `TERM=DIRECTION_SPLIT` last on AWD. Params: `TERM` (MASS) `AXIS`
-(X) `SERVOS` `PROFILE` `LO` (0.7) `HI` (1.3) `TOL` (0.02) `MAX_EVALS` (10)
-`START` `END` `X_START` `X_END` `Y_START` `Y_END` `ACCELS` `SPEEDS`
-`ITERATIONS` `DWELL_MS` `TAG` (refdyn) `NAME` (refined_<term>).
+`TERMS=LEAD` tunes the feedforward **lead time** as one shared
+node-global value (seconds, continuous — the endpoint peeks the
+command ring at an arbitrary future nanosecond, so it is not
+quantized to whole cycles): scored on the mean of both modes'
+decel-to-stop window rms (corner exits, where timing error integrates
+into a direction-locked overshoot lobe), first direction from the
+summed onset bias (positive = FF lands late = probe up), floored at
+zero with a half-cycle floor step. The tuned lead stays live until
+`RESTART`; the written dynamics TOML always carries `ff_lead_us`
+(tuned when `LEAD` is in `TERMS`, else the baseline value passes
+through). `TERMS=DIRECTION_SPLIT` tunes the additive signed per-pair
+split on AWD with the same sign convention as the profile frame
+(`slots = [first, second]`, differential `tau_first −
+lambda·tau_second`).
+
+Passes over the terms repeat until a full pass improves nothing —
+there is no round budget; the search runs until it converges (kill it
+if it overstays). Then the best model is written as a dynamics TOML
+under `~/printer_data/config/servo_dynamics/` (never overwriting) and
+left **live** — point `[ethercat_node] dynamics_profile` at it and
+`RESTART` to keep it. `torque_saturated` aborts, restores the
+baseline and configured lead, and writes nothing; `resonance_detected`
+only warns. The baseline is `PROFILE=`, else the model left live by
+the previous tune this session, else the node-level `[ethercat_node]
+dynamics_profile` (per-motor profiles are not supported) — chained
+tunes refine each other's output, not the configured profile. Params:
+`MAX_ACCEL` `MAX_SPEED` `STEP` (0.15) `TERMS`
+(MASS,VISCOUS,COULOMB,LEAD) `NAME` (tune) `PROFILE` `SERVOS` `BOUND`
+`SMALL_SIZE`.
 
 #### SERVO_CALIBRATE_INERTIA_RATIO
 Step 2 of tuning: identify the load inertia and print the recommended C00.06.
@@ -647,7 +611,7 @@ Schemas: [servo-cal-contracts.md](servo-cal-contracts.md).
 | `SERVO_SWEEP_INERTIA` | `servo-cal analyze` | run dir + `results.json` (no automated pick, so `APPLY=1` always errors) |
 | `SERVO_SWEEP_ACCEL` | `servo-cal analyze` | run dir + `results.json` verdict (max non-railing accel); `APPLY=1` verifies at the recommended accel (no SDO write) |
 | `SERVO_FIT_DYNAMICS`, `SERVO_CALIBRATE_INERTIA_RATIO` | `servo-cal fit` | run dir + `~/printer_data/config/servo_dynamics/dynamics_<name>_<stamp>.toml` + C00.06 |
-| `SERVO_REFINE_DYNAMICS` | `servo-cal analyze` (per candidate) | run dir + refined `dynamics_<name>_<stamp>.toml` when a scale beats the baseline (pick is host-side; live model always reverted) |
+| `SERVO_TUNE_DYNAMICS` | `servo-cal fit --response ferr` (per capture) | run dir + tuned `dynamics_<name>_<stamp>.toml` when a pass beats the baseline (search is host-side; tuned model stays live until RESTART) |
 | `SERVO_MEASURE_INERTIA` | — | run dir + `.scap` capture only (the building block behind the fit commands) |
 | `SERVO_AUTOTUNE` | all of the above, in sequence | one run dir per stage; `APPLY=0` (default) is a dry rehearsal, `APPLY=1` runs and applies for real |
 
