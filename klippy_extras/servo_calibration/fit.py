@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 
 try:
     import tomllib
@@ -994,9 +995,14 @@ class DynamicsFitCommands(MeasureCommands):
         "by the previous tune this session, else the node-level "
         "[ethercat_node] dynamics_profile (per-motor profiles are not "
         "supported) - chained tunes refine each other's output, not the "
-        "configured profile. Params MAX_ACCEL MAX_SPEED STEP (0.15) TERMS "
-        "(mass,viscous,coulomb,lead) NAME (tune) PROFILE "
-        "SERVOS BOUND SMALL_SIZE"
+        "configured profile. RESUME=<run_dir> replays a crashed tune's "
+        "rounds from its ferr_r*.json fits instead of recapturing (the "
+        "search is deterministic, so round i reproduces the same trial); "
+        "it requires the identical command line and the same live "
+        "baseline model, and picks up with real captures at the first "
+        "round the old run is missing. Params MAX_ACCEL MAX_SPEED STEP "
+        "(0.15) TERMS (mass,viscous,coulomb,lead) NAME (tune) PROFILE "
+        "RESUME SERVOS BOUND SMALL_SIZE"
     )
 
     def cmd_SERVO_TUNE_DYNAMICS(self, gcmd: Any) -> None:
@@ -1049,6 +1055,7 @@ class DynamicsFitCommands(MeasureCommands):
         max_speed = gcmd.get_float("MAX_SPEED", max(self.speeds), above=0.0)
         step_frac = gcmd.get_float("STEP", 0.15, minval=0.02, maxval=0.5)
         name = gcmd.get("NAME", "tune")
+        resume_dir = gcmd.get("RESUME", None)
         dwell = self.dwell_ms
         iterations = self.iterations
         speeds = [max_speed / 2.0, max_speed]
@@ -1068,6 +1075,31 @@ class DynamicsFitCommands(MeasureCommands):
             "lead_us": configured_lead_s * 1e6 if lead_enabled else None,
         }
         stroke_plan.update(pattern_plan)
+        if resume_dir is not None:
+            resume_dir = os.path.expanduser(resume_dir)
+            manifest_path = os.path.join(resume_dir, "manifest.json")
+            if not os.path.isfile(manifest_path):
+                raise gcmd.error(
+                    "RESUME dir %s has no manifest.json" % (resume_dir,)
+                )
+            with open(manifest_path) as f:
+                prev_manifest = json.load(f)
+            if prev_manifest.get("experiment") != "dynamics_tune":
+                raise gcmd.error(
+                    "RESUME dir %s is a %r run, not dynamics_tune"
+                    % (resume_dir, prev_manifest.get("experiment"))
+                )
+            prev_plan = prev_manifest.get("stroke_plan") or {}
+            diff = sorted(
+                k for k in stroke_plan if prev_plan.get(k) != stroke_plan[k]
+            )
+            if diff:
+                raise gcmd.error(
+                    "RESUME run %s was made with different settings (%s "
+                    "differ) - the deterministic replay would misattribute "
+                    "its ferr fits; re-issue the identical command"
+                    % (resume_dir, ", ".join(diff))
+                )
         run = self._begin_run(
             gcmd,
             "dynamics_tune",
@@ -1117,9 +1149,39 @@ class DynamicsFitCommands(MeasureCommands):
             )
             return coeffs + splits + (round(lead_s * 1e9),)
 
+        def ferr_result(round_i: int, ferr: dict[str, Any]) -> dict[str, Any]:
+            if ferr.get("modes") != plan["modes"]:
+                raise gcmd.error(
+                    "servo-cal fit --response ferr modes %s do not "
+                    "match the requested modes %s"
+                    % (ferr.get("modes"), plan["modes"])
+                )
+            return {
+                "round": round_i,
+                "rms": [float(v) for v in ferr["ferr_rms_raw"]],
+                "ff": ferr["ferr_rms_ff"],
+                "coef": ferr["coef"],
+                "stderr": ferr["stderr"],
+                "onset": [float(v) for v in ferr["onset_bias"]],
+                "samples": ferr.get("samples"),
+            }
+
         def measure(
             round_i: int, trial: dict[str, Any], lead_s: float
         ) -> dict[str, Any]:
+            if resume_dir is not None:
+                src = os.path.join(resume_dir, "ferr_r%d.json" % (round_i,))
+                if os.path.isfile(src):
+                    ferr = self._load_ferr_fit(gcmd, src)
+                    result = ferr_result(round_i, ferr)
+                    shutil.copyfile(
+                        src,
+                        os.path.join(run.run_dir, "ferr_r%d.json" % (round_i,)),
+                    )
+                    gcmd.respond_info(
+                        "r%d replayed from %s (no capture)" % (round_i, src)
+                    )
+                    return result
             send_dynamics_model(engine, handle, trial)
             if lead_enabled:
                 send_ff_lead(engine, handle, node, plan["servos"], lead_s)
@@ -1151,21 +1213,7 @@ class DynamicsFitCommands(MeasureCommands):
             )
             self._run(gcmd, argv, 120.0)
             ferr = self._load_ferr_fit(gcmd, ferr_out)
-            if ferr.get("modes") != plan["modes"]:
-                raise gcmd.error(
-                    "servo-cal fit --response ferr modes %s do not "
-                    "match the requested modes %s"
-                    % (ferr.get("modes"), plan["modes"])
-                )
-            return {
-                "round": round_i,
-                "rms": [float(v) for v in ferr["ferr_rms_raw"]],
-                "ff": ferr["ferr_rms_ff"],
-                "coef": ferr["coef"],
-                "stderr": ferr["stderr"],
-                "onset": [float(v) for v in ferr["onset_bias"]],
-                "samples": ferr.get("samples"),
-            }
+            return ferr_result(round_i, ferr)
 
         def term_objective(
             cached: dict[str, Any], ff_key: str
