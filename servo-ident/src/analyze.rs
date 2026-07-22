@@ -1085,7 +1085,16 @@ fn build_run_reusing(
         return Err("manifest lists no steps".to_string());
     }
     let settle_band = DEFAULT_SETTLE_BAND_COUNTS;
-    let torque_limit = DEFAULT_TORQUE_LIMIT_PER_MILLE;
+    // Rail-detection threshold follows the drive: 90% of the smallest
+    // configured max_torque across the run's motors. Manifests predating
+    // max_torque_per_mille (or the CLI --scap path) fall back to the default.
+    let torque_limit = manifest
+        .motors
+        .iter()
+        .filter_map(|m| m.max_torque_per_mille)
+        .min()
+        .map(|min_tq| (min_tq as f64 * 0.9).floor() as i64)
+        .unwrap_or(DEFAULT_TORQUE_LIMIT_PER_MILLE);
     let plan_f64 = |key: &str| {
         manifest
             .stroke_plan

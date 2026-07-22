@@ -32,7 +32,7 @@ fn temp_run_dir() -> PathBuf {
     dir
 }
 
-fn build_manifest(dir: &Path) {
+fn build_manifest(dir: &Path, motors: Value) {
     gunzip_to(
         "cal_p880_s550_i2273_20260710_151516.scap",
         &dir.join("step_s550.scap"),
@@ -48,6 +48,7 @@ fn build_manifest(dir: &Path) {
         "axis": "X",
         "kinematics": "corexy",
         "belts": "motor_a:1+motor_a1:-1,motor_b:-1+motor_b1:-1",
+        "motors": motors,
         "steps": [
             {
                 "name": "s550",
@@ -73,7 +74,7 @@ fn build_manifest(dir: &Path) {
 #[test]
 fn gain_sweep_run_dir_analyzes_and_picks_a_step() {
     let dir = temp_run_dir();
-    build_manifest(&dir);
+    build_manifest(&dir, json!([]));
 
     let (results, plot) = build_run(&dir).unwrap();
     assert_eq!(results.steps.len(), 2);
@@ -139,4 +140,36 @@ fn gain_sweep_run_dir_analyzes_and_picks_a_step() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+fn torque_limit_for(motors: Value) -> i64 {
+    let dir = temp_run_dir();
+    build_manifest(&dir, motors);
+    let (results, _plot) = build_run(&dir).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    results.torque_limit_per_mille
+}
+
+#[test]
+fn torque_limit_follows_configured_max_torque() {
+    // Single motor carrying max_torque 300% -> 3000 per-mille; limit is 90%.
+    assert_eq!(
+        torque_limit_for(json!([{"name": "motor_a", "max_torque_per_mille": 3000}])),
+        2700
+    );
+    // No motor carries it -> fall back to the default constant.
+    assert_eq!(torque_limit_for(json!([])), 1400);
+    assert_eq!(
+        torque_limit_for(json!([{"name": "motor_a"}])),
+        1400,
+        "a motor entry without max_torque_per_mille must not lower the limit"
+    );
+    // Mixed motors -> the smallest ceiling wins (floor of 0.9 * 2000).
+    assert_eq!(
+        torque_limit_for(json!([
+            {"name": "motor_a", "max_torque_per_mille": 3000},
+            {"name": "motor_b", "max_torque_per_mille": 2000},
+        ])),
+        1800
+    );
 }

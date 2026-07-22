@@ -52,6 +52,7 @@ def _make_rail(motor, node_name, axis, invert=False):
     m.chain_index = 0
     m.rotation_distance = 40.0
     m.encoder_counts_per_rev = 131072
+    m.max_torque = 300.0
     rail = servo_axis.ServoRail.__new__(servo_axis.ServoRail)
     rail.name = "servo " + motor
     rail.axis = axis
@@ -211,6 +212,8 @@ def test_sweep_accel_step_naming_and_report_invocation():
         "accel_a10000",
         "accel_a20000",
     ]
+    for entry in manifest["motors"]:
+        assert entry["max_torque_per_mille"] == 3000
     argv = _analyze_argv(gcode)
     assert argv[1] == "analyze"
     assert argv[2] == os.path.dirname(_cap(sc).captures[0][0])
@@ -236,3 +239,17 @@ def test_sweep_accel_single_axis_x():
         if ln.startswith("G1 X")
     ]
     assert lines and all("Y" not in ln for ln in lines)
+
+
+def test_motor_manifest_omits_max_torque_when_unset():
+    sc, _ = make_calibration()
+    motor = servo_axis.ServoMotor.__new__(servo_axis.ServoMotor)
+    motor.motor_name = "motor_a"
+    motor.invert_direction = False
+    motor.rotation_distance = 40.0
+    motor.encoder_counts_per_rev = 131072
+    # Older nodes never set max_torque; the key must be absent, not null.
+    entry = sc._motor_manifest(motor)
+    assert "max_torque_per_mille" not in entry
+    motor.max_torque = 300.0
+    assert sc._motor_manifest(motor)["max_torque_per_mille"] == 3000

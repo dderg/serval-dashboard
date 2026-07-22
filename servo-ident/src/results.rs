@@ -57,6 +57,12 @@ pub struct ManifestSpatial {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ManifestMotor {
+    #[serde(default)]
+    pub max_torque_per_mille: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Manifest {
     #[serde(default)]
     pub version: i64,
@@ -79,6 +85,8 @@ pub struct Manifest {
     pub ff_lead_cycles: u64,
     #[serde(default)]
     pub spatial: Option<ManifestSpatial>,
+    #[serde(default)]
+    pub motors: Vec<ManifestMotor>,
     pub steps: Vec<Step>,
 }
 

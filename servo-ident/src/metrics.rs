@@ -10,6 +10,9 @@ use crate::scap::{Scap, FLAG_MOTION_ACTIVE};
 
 pub const SETTLE_HOLD_MS: f64 = 50.0;
 pub const DEFAULT_SETTLE_BAND_COUNTS: i64 = 50;
+// Fallback rail-detection threshold, per-mille of rated torque. Used only
+// for manifests predating the per-motor max_torque_per_mille field; runs
+// that carry it derive the limit from the drive's configured max_torque.
 pub const DEFAULT_TORQUE_LIMIT_PER_MILLE: i64 = 1400;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]

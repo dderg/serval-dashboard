@@ -132,12 +132,19 @@ class CalibrationHost:
         return motor
 
     def _motor_manifest(self, motor: Any) -> dict[str, Any]:
-        return {
+        entry: dict[str, Any] = {
             "name": motor.get_motor_name(),
             "invert": motor.get_invert_direction(),
             "rotation_distance": motor.get_rotation_distance(),
             "counts_per_mm": motor.get_counts_per_mm(),
         }
+        # Rail-detection threshold tracks the drive's configured torque
+        # ceiling: max_torque is % of rated, recorded here as per-mille
+        # (x10). Omitted for older nodes whose config never exposed it.
+        max_torque = getattr(motor, "max_torque", None)
+        if max_torque is not None:
+            entry["max_torque_per_mille"] = int(round(max_torque * 10.0))
+        return entry
 
     def _ff_lead_us(self, gcmd: Any, motors: list[Any]) -> float:
         leads = set()
