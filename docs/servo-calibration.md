@@ -570,6 +570,14 @@ the notch; the loop *is* the torque generator. `f_b` lands above the
 familiar coupled ringdown frequency and below the plant's two-mass
 peak, which is reported alongside as a sanity anchor.
 
+Re-measuring with a correction already applied stays honest either
+way: the position-lead (B) is suppressed for the buzz's duration, and
+a live pin (A) cannot bias the notch — the FRF is measured-torque →
+position, and plant zeros don't care who generated the torque. Pinned
+modes do run their predictor through buzz cycles, so accelerometer
+resonance tests (`TEST_RESONANCES`) measure the *pinned* machine —
+tune the input shaper from those with the pin in its print-time state.
+
 The estimator is validated in CI against a simulated closed-loop
 two-mass plant (`servo-ident/tests/compliance_frf.rs`): it recovers
 the analytic `f_b` within 2 Hz and refuses to be dragged onto the
