@@ -27,7 +27,6 @@ class MeasureCommands(CalibrationHost):
 
     MAX_DIFFERENTIAL_AMPLITUDE_MM = 0.5
     MAX_BUZZ_FREQ_HZ = 2000.0
-    MAX_BUZZ_DURATION_S = 300.0
 
     cmd_SERVO_MEASURE_DIFFERENTIAL_help = (
         "Anti-phase chirp on one AWD belt pair via the engine buzz "
@@ -70,12 +69,6 @@ class MeasureCommands(CalibrationHost):
         duration = gcmd.get_float("DURATION", 0.0, minval=0.0)
         if duration <= 0.0:
             duration = max(abs(freq_end - freq_start) / hz_per_sec, 0.5)
-        if duration > self.MAX_BUZZ_DURATION_S:
-            raise gcmd.error(
-                "sweep duration %.0f s exceeds the %.0f s buzz ceiling; "
-                "raise HZ_PER_SEC or narrow the frequency band"
-                % (duration, self.MAX_BUZZ_DURATION_S)
-            )
         ramp = gcmd.get_float(
             "RAMP",
             min(0.1 * duration, 3.0 / min(freq_start, freq_end)),

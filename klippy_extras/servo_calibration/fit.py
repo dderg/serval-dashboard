@@ -1845,12 +1845,6 @@ class DynamicsFitCommands(MeasureCommands):
         duration = gcmd.get_float("DURATION", 0.0, minval=0.0)
         if duration <= 0.0:
             duration = max((freq_end - freq_start) / hz_per_sec, 0.5)
-        if duration > self.MAX_BUZZ_DURATION_S:
-            raise gcmd.error(
-                "sweep duration %.0f s exceeds the %.0f s buzz ceiling; "
-                "raise HZ_PER_SEC or narrow the frequency band"
-                % (duration, self.MAX_BUZZ_DURATION_S)
-            )
         ramp = gcmd.get_float(
             "RAMP", min(0.1 * duration, 3.0 / freq_start), above=0.0
         )
