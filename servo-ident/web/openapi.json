@@ -582,6 +582,20 @@
             },
             "type": "array"
           },
+          "pin_phase_deg": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pin_residual_mm": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "samples": {
             "format": "uint",
             "minimum": 0,

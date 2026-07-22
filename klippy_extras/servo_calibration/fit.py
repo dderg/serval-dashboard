@@ -18,6 +18,8 @@ from ... import structured_log
 from .. import servo_axis, servo_strokes
 from .dynamics import (
     DYNAMICS_TERM_KEYS,
+    PIN_LEAD_US_MAX,
+    PIN_ZETA_MAX,
     TUNE_MASS_FLOOR_FRACTION,
     TUNE_ZERO_FLOOR_STEPS,
     _copy_dynamics,
@@ -31,6 +33,7 @@ from .dynamics import (
     send_ff_lead,
 )
 from .measure import MeasureCommands
+from .params import C00_06_INERTIA_RATIO_MAX
 from .search import RmsLineSearch
 from .search import Z as ACCEPT_Z
 from .sweep import ExperimentRun, SweepStep
@@ -1681,9 +1684,21 @@ class DynamicsFitCommands(MeasureCommands):
         "error) still rings at the coupled frequency - keep a light "
         "input shaper or the belt damper for that. Baseline profile "
         "resolution matches SERVO_TUNE_DYNAMICS (PROFILE=, else the "
-        "live-tuned model, else the configured node profile). Params "
-        "X_FREQ Y_FREQ (Hz, >= 20; 0 disables) NAME (compliance) "
-        "PROFILE SERVOS"
+        "live-tuned model, else the configured node profile). PIN "
+        "(XY|X|Y) pins the rotor for those modes: instead of the "
+        "position/velocity lead, the endpoint holds a predictive "
+        "torque against the modelled deflection, replacing the "
+        "compliance lead for that mode with an active hold. Pinning "
+        "needs RATIO (the C00.06 inertia ratio in %, run "
+        "SERVO_CALIBRATE_INERTIA_RATIO if unknown): the pinned mode "
+        "mass is m*R/(1+R), R=RATIO/100. ZETA (default 0.02) is the "
+        "hold damping and PIN_LEAD_US (default 0) advances the hold. "
+        "A pinned mode must have nonzero compliance (given now or in "
+        "the baseline). PIN=0 clears the pins but keeps compliance. "
+        "The profile is written v8 while any mode is pinned. Params "
+        "X_FREQ Y_FREQ (Hz, >= 20; 0 disables) PIN (XY|X|Y|0) RATIO "
+        "(%) ZETA (0.02) PIN_LEAD_US (us) NAME (compliance) PROFILE "
+        "SERVOS"
     )
 
     def cmd_SERVO_SET_COMPLIANCE(self, gcmd: Any) -> None:
@@ -1703,21 +1718,106 @@ class DynamicsFitCommands(MeasureCommands):
                     "softer modes as typos" % (param, freq)
                 )
             freq_by_mode[mode] = freq
-        if not freq_by_mode:
+        pin = self._parse_pin_request(gcmd)
+        if not freq_by_mode and pin is None:
             raise gcmd.error(
                 "give X_FREQ= and/or Y_FREQ= (Hz, locked-rotor belt "
-                "frequency; 0 disables)"
+                "frequency; 0 disables), or PIN= to pin the rotor"
             )
         self._apply_compliance(
-            gcmd, freq_by_mode, gcmd.get("NAME", "compliance")
+            gcmd, freq_by_mode, gcmd.get("NAME", "compliance"), pin
         )
 
-    def _apply_compliance(
-        self, gcmd: Any, freq_by_mode: dict[str, float], name: str
+    def _parse_pin_request(self, gcmd: Any) -> dict[str, Any] | None:
+        """Parse PIN/RATIO/ZETA/PIN_LEAD_US. Returns None when PIN is
+        absent (baseline pin state is preserved); otherwise a request
+        dict whose empty ``modes`` set means an explicit PIN=0 clear."""
+        raw = gcmd.get("PIN", None)
+        if raw is None:
+            return None
+        text = raw.strip().upper()
+        modes: set[str] = set()
+        if text not in ("0", ""):
+            mode_map = {"X": "x", "Y": "y"}
+            for ch in text:
+                if ch not in mode_map:
+                    raise gcmd.error(
+                        "PIN must be XY, X, Y, or 0 (got %r)" % (raw,)
+                    )
+                modes.add(mode_map[ch])
+        zeta = gcmd.get_float("ZETA", 0.02, above=0.0, maxval=PIN_ZETA_MAX)
+        pin_lead_us = gcmd.get_float(
+            "PIN_LEAD_US", 0.0, minval=0.0, maxval=PIN_LEAD_US_MAX
+        )
+        ratio = gcmd.get_float(
+            "RATIO", None, above=0.0, maxval=float(C00_06_INERTIA_RATIO_MAX)
+        )
+        if modes and ratio is None:
+            raise gcmd.error(
+                "PIN= requires RATIO= (C00.06 inertia ratio in %); run "
+                "SERVO_CALIBRATE_INERTIA_RATIO if you do not know it"
+            )
+        return {
+            "modes": modes,
+            "ratio": ratio,
+            "zeta": zeta,
+            "pin_lead_us": pin_lead_us,
+        }
+
+    def _apply_pin(
+        self,
+        gcmd: Any,
+        updated: dict[str, Any],
+        pin: dict[str, Any],
+        changed: list[str],
     ) -> None:
-        """Write freq_by_mode (Hz; 0 disables) into a new v7 dynamics
+        """Apply the pin request onto ``updated`` (already carrying the
+        baseline pin state), mutating pin_mass/pin_zeta/pin_lead_us."""
+        modes = pin["modes"]
+        if not modes:
+            # explicit PIN=0: clear every pin, keep compliance untouched
+            for i in range(len(updated["modes"])):
+                updated["pin_mass"][i] = 0.0
+                updated["pin_zeta"][i] = 0.0
+            updated["pin_lead_us"] = 0.0
+            changed.append("pin: cleared")
+            return
+        missing = sorted(modes - set(updated["modes"]))
+        if missing:
+            raise gcmd.error(
+                "PIN mode(s) %s not in profile (modes %s)"
+                % (", ".join(m.upper() for m in missing), updated["modes"])
+            )
+        updated["pin_lead_us"] = pin["pin_lead_us"]
+        r = pin["ratio"] / 100.0
+        for mode_i, mode in enumerate(updated["modes"]):
+            if mode not in modes:
+                continue
+            if not updated["compliance"][mode_i] > 0.0:
+                raise gcmd.error(
+                    "PIN=%s needs mode %s to have nonzero compliance - "
+                    "give %s_FREQ= now or set it in the baseline"
+                    % (mode.upper(), mode, mode.upper())
+                )
+            pin_mass = updated["mass"][mode_i] * r / (1.0 + r)
+            updated["pin_mass"][mode_i] = pin_mass
+            updated["pin_zeta"][mode_i] = pin["zeta"]
+            changed.append(
+                "%s: pinned m_L=%.3gkg zeta=%.3g lead=%.0fus"
+                % (mode, pin_mass, pin["zeta"], pin["pin_lead_us"])
+            )
+
+    def _apply_compliance(
+        self,
+        gcmd: Any,
+        freq_by_mode: dict[str, float],
+        name: str,
+        pin: dict[str, Any] | None = None,
+    ) -> None:
+        """Write freq_by_mode (Hz; 0 disables) into a new dynamics
         profile and stream it live. Modes absent from the dict keep
-        their current compliance."""
+        their current compliance; ``pin`` (when given) sets the pin-rotor
+        hold, otherwise the baseline pin state is preserved."""
         plan = self._fit_plan(gcmd)
         node = self._dynamics_node(gcmd, plan["servos"])
         handle = node.get_engine_handle()
@@ -1751,6 +1851,18 @@ class DynamicsFitCommands(MeasureCommands):
                 "%s: %.1f Hz -> %.3g s^2 (lead %.0f um at 50 m/s^2)"
                 % (mode, freq, c, c * 5.0e4 * 1e3)
             )
+        if pin is not None:
+            self._apply_pin(gcmd, updated, pin, changed)
+        # guard the model invariant: a pinned mode needs live compliance
+        for mode_i, mode in enumerate(updated["modes"]):
+            if updated["pin_mass"][mode_i] > 0.0 and not (
+                updated["compliance"][mode_i] > 0.0
+            ):
+                raise gcmd.error(
+                    "mode %s is pinned but its compliance is 0 - keep "
+                    "%s_FREQ nonzero or clear the pin with PIN=0"
+                    % (mode, mode.upper())
+                )
         os.makedirs(self.dynamics_dir, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         out_path = os.path.join(
@@ -1781,6 +1893,7 @@ class DynamicsFitCommands(MeasureCommands):
             "set_compliance",
             profile=out_path,
             compliance=updated["compliance"],
+            pin_mass=updated["pin_mass"],
         )
         gcmd.respond_info(
             "compliance %s | written %s | model live until RESTART - "

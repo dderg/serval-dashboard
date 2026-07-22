@@ -772,6 +772,10 @@ export interface components {
             /** Format: int64 */
             ff_velocity_offset_max?: number | null;
             moves: components["schemas"]["Move"][];
+            /** Format: double */
+            pin_phase_deg?: number | null;
+            /** Format: double */
+            pin_residual_mm?: number | null;
             /** Format: uint */
             samples: number;
             torque: components["schemas"]["TorqueSummary"];

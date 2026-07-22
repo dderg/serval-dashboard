@@ -299,7 +299,134 @@ def test_send_dynamics_model_passes_compliance():
     p = servo_calibration.parse_dynamics_profile(V7_TOML)
     engine = Engine()
     servo_calibration.send_dynamics_model(engine, 7, p)
-    handle, frame, mass, viscous, coulomb, compliance, ps, ds = engine.args
+    (
+        handle,
+        frame,
+        mass,
+        viscous,
+        coulomb,
+        compliance,
+        pin_mass,
+        pin_zeta,
+        pin_lead_us,
+        ps,
+        ds,
+    ) = engine.args
     assert handle == 7
     assert compliance == [1.76e-5, 7.0e-6]
     assert coulomb == [1.0, 1.5]
+    assert pin_mass == [0.0, 0.0]
+    assert pin_zeta == [0.0, 0.0]
+    assert pin_lead_us == 0.0
+
+
+V8_TOML = V7_TOML.replace("version = 7", "version = 8").replace(
+    "compliance = [1.76e-5, 7.0e-6]",
+    "compliance = [1.76e-5, 7.0e-6]\n"
+    "pin_mass = [0.5, 0.0]\npin_zeta = [0.02, 0.1]\npin_lead_us = 250.0",
+)
+
+
+def test_parse_v8_profile_carries_pin_fields():
+    p = servo_calibration.parse_dynamics_profile(V8_TOML)
+    assert p["pin_mass"] == [0.5, 0.0]
+    assert p["pin_zeta"] == [0.02, 0.1]
+    assert p["pin_lead_us"] == 250.0
+
+
+def test_parse_v7_profile_defaults_pin_fields():
+    p = servo_calibration.parse_dynamics_profile(V7_TOML)
+    assert p["pin_mass"] == [0.0, 0.0]
+    assert p["pin_zeta"] == [0.0, 0.0]
+    assert p["pin_lead_us"] == 0.0
+
+
+def test_pin_fields_on_v7_profile_are_rejected():
+    with pytest.raises(ValueError, match="requires version 8"):
+        servo_calibration.parse_dynamics_profile(
+            V8_TOML.replace("version = 8", "version = 7")
+        )
+
+
+def test_pin_mass_without_compliance_is_rejected():
+    text = V8_TOML.replace(
+        "compliance = [1.76e-5, 7.0e-6]", "compliance = [0.0, 7.0e-6]"
+    )
+    with pytest.raises(ValueError, match="mode 0 requires compliance"):
+        servo_calibration.parse_dynamics_profile(text)
+
+
+def test_pin_zeta_out_of_range_is_rejected():
+    text = V8_TOML.replace("pin_zeta = [0.02, 0.1]", "pin_zeta = [0.6, 0.1]")
+    with pytest.raises(ValueError, match="pin_zeta"):
+        servo_calibration.parse_dynamics_profile(text)
+
+
+def test_pin_mass_without_pin_zeta_is_rejected():
+    text = V8_TOML.replace("pin_zeta = [0.02, 0.1]\n", "")
+    with pytest.raises(ValueError, match="pin_mass and pin_zeta"):
+        servo_calibration.parse_dynamics_profile(text)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[0.5]",  # wrong length
+        "[-0.5, 0.0]",  # negative
+        "[nan, 0.0]",  # non-finite
+        "[true, 0.0]",  # non-numeric
+    ],
+)
+def test_parse_v8_profile_rejects_bad_pin_mass(value):
+    with pytest.raises(ValueError, match="pin_mass"):
+        servo_calibration.parse_dynamics_profile(
+            V8_TOML.replace("pin_mass = [0.5, 0.0]", "pin_mass = %s" % (value,))
+        )
+
+
+def test_rendered_toml_is_v8_and_round_trips_pin_fields():
+    p = servo_calibration.parse_dynamics_profile(V8_TOML)
+    text = servo_calibration.render_fit_dynamics_toml(
+        p, p, ["mass"], "run", 125.0
+    )
+    assert "version = 8" in text
+    again = servo_calibration.parse_dynamics_profile(text)
+    assert again["pin_mass"] == p["pin_mass"]
+    assert again["pin_zeta"] == p["pin_zeta"]
+    assert again["pin_lead_us"] == 250.0
+
+
+def test_rendered_toml_stays_v7_without_pin_terms():
+    p = servo_calibration.parse_dynamics_profile(V7_TOML)
+    text = servo_calibration.render_fit_dynamics_toml(
+        p, p, ["mass"], "run", 125.0
+    )
+    assert "version = 7" in text
+    assert "pin_mass" not in text
+    assert "pin_zeta" not in text
+    assert "pin_lead_us" not in text
+
+
+def test_rendered_toml_stays_v6_without_pin_terms():
+    p = servo_calibration.parse_dynamics_profile(BASELINE_TOML)
+    text = servo_calibration.render_fit_dynamics_toml(
+        p, p, ["mass"], "run", 0.0
+    )
+    assert "version = 7" in text
+    assert "pin_mass" not in text
+
+
+def test_send_dynamics_model_passes_pin_fields():
+    class Engine:
+        def set_dynamics_model(self, *args):
+            self.args = args
+
+    p = servo_calibration.parse_dynamics_profile(V8_TOML)
+    engine = Engine()
+    servo_calibration.send_dynamics_model(engine, 8, p)
+    pin_mass = engine.args[6]
+    pin_zeta = engine.args[7]
+    pin_lead_us = engine.args[8]
+    assert pin_mass == [0.5, 0.0]
+    assert pin_zeta == [0.02, 0.1]
+    assert pin_lead_us == 250.0

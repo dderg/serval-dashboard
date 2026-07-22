@@ -51,6 +51,10 @@ pub struct Metrics {
     pub ff_velocity_offset_max: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ff_torque_offset_max: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_residual_mm: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_phase_deg: Option<f64>,
 }
 
 pub struct DriveSeries {
@@ -62,6 +66,8 @@ pub struct DriveSeries {
     pub flags: Vec<i64>,
     pub velocity_offset: Option<Vec<i64>>,
     pub torque_offset: Option<Vec<i64>>,
+    pub pin_res_re: Option<Vec<f64>>,
+    pub pin_res_im: Option<Vec<f64>>,
 }
 
 pub fn drive_series(cap: &Scap, idx: usize) -> Result<DriveSeries, String> {
@@ -81,6 +87,16 @@ pub fn drive_series(cap: &Scap, idx: usize) -> Result<DriveSeries, String> {
         },
         torque_offset: if cap.has_channel("torque_offset") {
             Some(cap.read_i64(idx, "torque_offset")?)
+        } else {
+            None
+        },
+        pin_res_re: if cap.has_channel("pin_res_re") {
+            Some(cap.read_f64(idx, "pin_res_re")?)
+        } else {
+            None
+        },
+        pin_res_im: if cap.has_channel("pin_res_im") {
+            Some(cap.read_f64(idx, "pin_res_im")?)
         } else {
             None
         },
@@ -287,6 +303,8 @@ pub fn compute_metrics(
         ferr_crosscheck_max,
         ff_velocity_offset_max: None,
         ff_torque_offset_max: None,
+        pin_residual_mm: None,
+        pin_phase_deg: None,
     };
     if let Some(vel_off) = &d.velocity_offset {
         let moving: Vec<bool> = d
@@ -304,6 +322,18 @@ pub fn compute_metrics(
         metrics.ff_velocity_offset_max = Some(max_moving(vel_off));
         metrics.ff_torque_offset_max =
             Some(d.torque_offset.as_ref().map(|t| max_moving(t)).unwrap_or(0));
+    }
+    if let (Some(re), Some(im)) = (&d.pin_res_re, &d.pin_res_im) {
+        let any_nonzero = re.iter().chain(im.iter()).any(|&v| v != 0.0);
+        if any_nonzero {
+            let re_last = re.last().copied().unwrap_or(0.0);
+            let im_last = im.last().copied().unwrap_or(0.0);
+            let mag = (re_last * re_last + im_last * im_last).sqrt();
+            metrics.pin_residual_mm = Some(mag);
+            if mag > 1e-6 {
+                metrics.pin_phase_deg = Some(im_last.atan2(re_last).to_degrees());
+            }
+        }
     }
     Ok(metrics)
 }

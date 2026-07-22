@@ -162,13 +162,17 @@ const LAUNCHPAD_GROUPS: LpGroup[] = [
       },
       {
         name: "SERVO_SET_COMPLIANCE",
-        blurb: "write the belt-compliance FF term 1/ω_b² into the dynamics profile and stream it live",
+        blurb: "write the belt-compliance FF term 1/ω_b² into the dynamics profile and stream it live, or pin-rotor torque-hold the belt as the alternative mode",
         params: [
           { name: "X_FREQ", type: "float", unit: "Hz", hint: "locked-rotor belt frequency, ≥ 20; 0 disables; omit to keep" },
           { name: "Y_FREQ", type: "float", unit: "Hz", hint: "locked-rotor belt frequency, ≥ 20; 0 disables; omit to keep" },
           { name: "PROFILE", type: "string", hint: "baseline TOML; defaults to the live model, else the node's profile" },
           SERVOS,
           { name: "NAME", type: "string", dflt: "compliance" },
+          { name: "PIN", type: "string", dflt: "", hint: "XY, X or Y - switch mode(s) to pin-rotor torque hold (0 clears); replaces the position lead for that mode" },
+          { name: "RATIO", type: "float", unit: "%", hint: "load inertia ratio (C00.06 units) - required with PIN; from SERVO_CALIBRATE_INERTIA_RATIO" },
+          { name: "ZETA", type: "float", dflt: "0.02", hint: "predictor belt damping ratio" },
+          { name: "PIN_LEAD_US", type: "float", dflt: "0", unit: "us", hint: "pin torque phase lead (~47 deg/ms at 131 Hz)" },
         ],
       },
       {

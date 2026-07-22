@@ -515,12 +515,37 @@ run a `smooth_*` input-shaper kernel. Residual excitation the command
 didn't cause (cogging, reversals, model error) still rings at the old
 coupled frequency — keep a light shaper or the belt damper for that.
 
+`PIN=XY|X|Y|0` switches the named mode(s) to **pin-rotor** (mode A)
+instead of the position lead (mode B): the endpoint holds the rotor on
+the planner path and cancels the belt reaction with a predictive torque,
+so the toolhead rings at the locked-rotor `f_b` where a standard input
+shaper applies. Pin needs the mode's compliance as its frequency source,
+so set `X_FREQ`/`Y_FREQ` in the same call (or apply it to an existing v7
+profile). `RATIO` is the load/rotor inertia ratio in percent (C00.06
+units) and is **required** with `PIN` — read it from
+`SERVO_CALIBRATE_INERTIA_RATIO`; the pinned inertia is
+`pin_mass = mass·(RATIO/100)/(1 + RATIO/100)`. `ZETA` (default `0.02`)
+is the belt damping ratio for the predictor decay and `PIN_LEAD_US`
+(default `0`) the pin torque's phase lead in microseconds; because the
+pin term lives at `f_b`, the lead is tuned by minimizing the mode's line
+in the rotor following-error PSD (or the pin residual telemetry once it
+is captured).
+
+Choose pin-rotor (A) when you want the rotor held and the correction
+*measurable at the rotor encoder* — the belt reaction is cancelled at
+the source and what remains rings at `f_b`, which a shaper then handles.
+Choose position-lead (B) when you want the toolhead to follow the
+planner below `f_b`, with no shaper needed for the commanded content.
+Per mode the two are mutually exclusive.
+
 Baseline resolution matches `SERVO_TUNE_DYNAMICS` (`PROFILE=`, else
 the live-tuned model, else the configured node profile); the result
-is written as a new timestamped v7 TOML (never overwriting) and left
-live until `RESTART`. Requires the matching kalico build on both
-sides (profile v7 / wire schema v7). Params: `X_FREQ` `Y_FREQ` (Hz,
-≥ 20; 0 disables) `NAME` (compliance) `PROFILE` `SERVOS`.
+is written as a new timestamped v7 TOML (v8 when a `PIN` mode is set;
+never overwriting) and left live until `RESTART`. Requires the matching
+kalico build on both sides (profile / wire schema v7, v8 for pin).
+Params: `X_FREQ` `Y_FREQ` (Hz, ≥ 20; 0 disables) `PIN` (0) `RATIO`
+(percent, required with `PIN`) `ZETA` (0.02) `PIN_LEAD_US` (0) `NAME`
+(compliance) `PROFILE` `SERVOS`.
 
 #### SERVO_MEASURE_COMPLIANCE
 Measures the locked-rotor belt frequency `f_b` per Cartesian mode —

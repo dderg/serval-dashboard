@@ -306,9 +306,9 @@ def make_calibration(
                 payload = sc.fake_ferr_queue.pop(0)
             else:
                 engine = sc.printer.lookup_object("motion_engine")
-                _h, _frame, mass, viscous, coulomb, _comp, _ps, _ds = (
-                    engine.dynamics_calls[-1]
-                )
+                _call = engine.dynamics_calls[-1]
+                _h, _frame, mass, viscous, coulomb, _comp = _call[:6]
+                _ds = _call[-1]
                 lead_s = (
                     engine.ff_lead_calls[-1][2] * 1e-9
                     if engine.ff_lead_calls
@@ -509,7 +509,7 @@ def test_tune_dynamics_already_optimal_converges_and_writes_baseline():
     assert prof["viscous"] == pytest.approx(BASELINE_VISCOUS, rel=0.06)
     assert prof["coulomb"] == pytest.approx(BASELINE_COULOMB, rel=0.06)
     # winner is streamed and left live
-    _h, _f, mass, viscous, coulomb, _comp, _ps, _ds = engine.dynamics_calls[-1]
+    _h, _f, mass, viscous, coulomb, _comp = engine.dynamics_calls[-1][:6]
     assert mass == pytest.approx(prof["mass"])
     assert viscous == pytest.approx(prof["viscous"])
     assert coulomb == pytest.approx(prof["coulomb"])
@@ -574,7 +574,7 @@ def test_tune_dynamics_torque_rail_aborts_and_restores_baseline():
     sc.fake_flags_by_step["tune_r0"] = ["torque_saturated"]
     with pytest.raises(RuntimeError, match="torque rail"):
         sc.cmd_SERVO_TUNE_DYNAMICS(FakeGcmd())
-    _h, _f, mass, _v, _c, _comp, _ps, _ds = engine.dynamics_calls[-1]
+    _h, _f, mass, _v, _c, _comp = engine.dynamics_calls[-1][:6]
     assert mass == pytest.approx(BASELINE_MASS)
 
 
@@ -974,7 +974,7 @@ def test_set_compliance_writes_v7_profile_and_streams_it():
     sc.cmd_SERVO_SET_COMPLIANCE(gcmd)
     engine = sc.printer.lookup_object("motion_engine")
     assert len(engine.dynamics_calls) == 1
-    _h, _f, _m, _v, _c, compliance, _ps, _ds = engine.dynamics_calls[-1]
+    _h, _f, _m, _v, _c, compliance = engine.dynamics_calls[-1][:6]
     import math as _math
 
     cx = 1.0 / (2.0 * _math.pi * 190.0) ** 2
@@ -996,7 +996,7 @@ def test_set_compliance_partial_update_keeps_other_mode():
     sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"X_FREQ": 190.0, "Y_FREQ": 120.0}))
     sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"Y_FREQ": 0.0}))
     engine = sc.printer.lookup_object("motion_engine")
-    _h, _f, _m, _v, _c, compliance, _ps, _ds = engine.dynamics_calls[-1]
+    _h, _f, _m, _v, _c, compliance = engine.dynamics_calls[-1][:6]
     import math as _math
 
     cx = 1.0 / (2.0 * _math.pi * 190.0) ** 2
@@ -1012,6 +1012,114 @@ def test_set_compliance_rejects_soft_and_missing_frequencies():
         sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({}))
     engine = sc.printer.lookup_object("motion_engine")
     assert engine.dynamics_calls == []
+
+
+@requires_tomllib
+def test_set_compliance_pin_writes_v8_and_streams_pin_mass():
+    sc, _gcode, _path = make_calibration()
+    gcmd = FakeGcmd(
+        {
+            "Y_FREQ": 120.0,
+            "PIN": "Y",
+            "RATIO": 250.0,
+            "ZETA": 0.02,
+            "PIN_LEAD_US": 1100.0,
+        }
+    )
+    sc.cmd_SERVO_SET_COMPLIANCE(gcmd)
+    engine = sc.printer.lookup_object("motion_engine")
+    call = engine.dynamics_calls[-1]
+    # 11-wide: handle, frame, mass, viscous, coulomb, compliance,
+    # pin_mass, pin_zeta, pin_lead_us, pair_slots, direction_split
+    assert len(call) == 11
+    pin_mass, pin_zeta, pin_lead_us = call[6], call[7], call[8]
+    expected = BASELINE_MASS[1] * 2.5 / 3.5  # RATIO=250% -> R=2.5
+    assert pin_mass == pytest.approx([0.0, expected])
+    assert pin_zeta == pytest.approx([0.0, 0.02])
+    assert pin_lead_us == pytest.approx(1100.0)
+    assert any("y: pinned" in r for r in gcmd.responses)
+    node = sc.printer.lookup_object("ethercat_node xy_drives")
+    out_path = node.get_live_dynamics_profile()
+    with open(out_path) as f:
+        text = f.read()
+    assert "version = 8" in text
+    written = servo_calibration.parse_dynamics_profile(text)
+    assert written["pin_mass"] == pytest.approx([0.0, expected])
+    assert written["pin_zeta"] == pytest.approx([0.0, 0.02])
+    assert written["pin_lead_us"] == pytest.approx(1100.0)
+
+
+@requires_tomllib
+def test_set_compliance_pin_without_ratio_errors():
+    sc, _gcode, _path = make_calibration()
+    with pytest.raises(RuntimeError, match="RATIO"):
+        sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"Y_FREQ": 120.0, "PIN": "Y"}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == []
+
+
+@requires_tomllib
+def test_set_compliance_pin_without_compliance_errors():
+    sc, _gcode, _path = make_calibration()
+    with pytest.raises(RuntimeError, match="compliance"):
+        sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "Y", "RATIO": 250.0}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == []
+
+
+@requires_tomllib
+def test_set_compliance_pin_zero_clears_but_keeps_compliance():
+    sc, _gcode, _path = make_calibration()
+    sc.cmd_SERVO_SET_COMPLIANCE(
+        FakeGcmd(
+            {
+                "X_FREQ": 190.0,
+                "Y_FREQ": 120.0,
+                "PIN": "XY",
+                "RATIO": 250.0,
+            }
+        )
+    )
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "0"}))
+    engine = sc.printer.lookup_object("motion_engine")
+    call = engine.dynamics_calls[-1]
+    compliance, pin_mass, pin_zeta = call[5], call[6], call[7]
+    import math as _math
+
+    cx = 1.0 / (2.0 * _math.pi * 190.0) ** 2
+    cy = 1.0 / (2.0 * _math.pi * 120.0) ** 2
+    assert compliance == pytest.approx([cx, cy])
+    assert pin_mass == pytest.approx([0.0, 0.0])
+    assert pin_zeta == pytest.approx([0.0, 0.0])
+    node = sc.printer.lookup_object("ethercat_node xy_drives")
+    with open(node.get_live_dynamics_profile()) as f:
+        text = f.read()
+    assert "version = 7" in text  # no pins -> back to v7
+    written = servo_calibration.parse_dynamics_profile(text)
+    assert written["compliance"] == pytest.approx([cx, cy])
+    assert written["pin_mass"] == pytest.approx([0.0, 0.0])
+
+
+@requires_tomllib
+def test_set_compliance_pin_partial_update_keeps_other_mode_pin():
+    sc, _gcode, _path = make_calibration()
+    sc.cmd_SERVO_SET_COMPLIANCE(
+        FakeGcmd(
+            {
+                "X_FREQ": 190.0,
+                "Y_FREQ": 120.0,
+                "PIN": "XY",
+                "RATIO": 250.0,
+            }
+        )
+    )
+    # re-pin only Y at a different ratio; X's pin must persist
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "Y", "RATIO": 900.0}))
+    engine = sc.printer.lookup_object("motion_engine")
+    pin_mass = engine.dynamics_calls[-1][6]
+    pin_x = BASELINE_MASS[0] * 2.5 / 3.5  # preserved from the first call
+    pin_y = BASELINE_MASS[1] * 9.0 / 10.0  # RATIO=900% -> R=9.0
+    assert pin_mass == pytest.approx([pin_x, pin_y])
 
 
 # ---- SERVO_MEASURE_COMPLIANCE --------------------------------------------
