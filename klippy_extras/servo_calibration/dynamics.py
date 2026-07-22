@@ -20,6 +20,9 @@ TUNE_RELATIVE_CLAMP = 0.4
 TUNE_MASS_FLOOR_FRACTION = 0.10
 TUNE_ZERO_FLOOR_STEPS = {"VISCOUS": 0.05, "COULOMB": 5.0}
 FF_LEAD_US_MAX = 10_000.0
+# Endpoint ceiling for the belt-compliance term 1/omega_b^2: 1/(2*pi*20 Hz)^2.
+# A mode softer than 20 Hz is a typo, not a belt.
+COMPLIANCE_MAX_S2 = 6.4e-4
 
 
 def parse_dynamics_profile(text: str) -> dict[str, Any]:
@@ -28,11 +31,14 @@ def parse_dynamics_profile(text: str) -> dict[str, Any]:
             "parsing dynamics profiles requires Python 3.11+ (tomllib)"
         )
     data = tomllib.loads(text)
-    if data.get("version") != 6:
+    version = data.get("version")
+    if version not in (6, 7):
         raise ValueError(
-            "dynamics profile version must be 6 (got %r) - refit with "
-            "SERVO_FIT_DYNAMICS" % (data.get("version"),)
+            "dynamics profile version must be 6 or 7 (got %r) - refit with "
+            "SERVO_FIT_DYNAMICS" % (version,)
         )
+    if version == 6 and "compliance" in data:
+        raise ValueError("profile compliance requires version 7")
     for key in ("direction_split", "orientation"):
         if key in data:
             raise ValueError(
@@ -67,6 +73,22 @@ def parse_dynamics_profile(text: str) -> dict[str, Any]:
         if not isinstance(vec, list) or len(vec) != n_modes:
             raise ValueError(
                 "profile %s must list %d per-mode values" % (key, n_modes)
+            )
+    compliance = data.get("compliance", [0.0] * n_modes)
+    if not isinstance(compliance, list) or len(compliance) != n_modes:
+        raise ValueError(
+            "profile compliance must list %d per-mode values" % (n_modes,)
+        )
+    for v in compliance:
+        if (
+            isinstance(v, bool)
+            or not isinstance(v, (int, float))
+            or not math.isfinite(v)
+            or not (0.0 <= v <= COMPLIANCE_MAX_S2)
+        ):
+            raise ValueError(
+                "profile compliance values must be finite numbers in "
+                "[0, %g] s^2 (got %r)" % (COMPLIANCE_MAX_S2, v)
             )
     ff_lead_us = data.get("ff_lead_us", 0.0)
     if (
@@ -110,6 +132,7 @@ def parse_dynamics_profile(text: str) -> dict[str, Any]:
         "mass": [float(v) for v in data["mass"]],
         "viscous": [float(v) for v in data["viscous"]],
         "coulomb": [float(v) for v in data["coulomb"]],
+        "compliance": [float(v) for v in compliance],
         "ff_lead_us": float(ff_lead_us),
         "pairs": pairs,
     }
@@ -189,6 +212,8 @@ def _copy_dynamics(profile: dict[str, Any]) -> dict[str, Any]:
         "mass": list(profile["mass"]),
         "viscous": list(profile["viscous"]),
         "coulomb": list(profile["coulomb"]),
+        "compliance": [float(v) for v in profile.get("compliance", [])]
+        or [0.0] * len(profile["modes"]),
         "pairs": [
             {
                 "slots": list(pair["slots"]),
@@ -230,6 +255,10 @@ def send_dynamics_model(
         [float(v) for v in profile["mass"]],
         [float(v) for v in profile["viscous"]],
         [float(v) for v in profile["coulomb"]],
+        [
+            float(v)
+            for v in profile.get("compliance", [0.0] * len(profile["modes"]))
+        ],
         pair_slots,
         direction_split,
     )
@@ -344,14 +373,16 @@ def render_fit_dynamics_toml(
     def vec(values: list[float]) -> str:
         return "[%s]" % (", ".join(num(v) for v in values),)
 
+    compliance = applied.get("compliance", [0.0] * len(applied["modes"]))
     lines = [
-        "version = 6",
+        "version = 7",
         "axes = %s" % (json.dumps(applied["axes"]),),
         "modes = %s" % (json.dumps(applied["modes"]),),
         "frame = [%s]" % (", ".join(vec(row) for row in applied["frame"]),),
         "mass = %s" % (vec(applied["mass"]),),
         "viscous = %s" % (vec(applied["viscous"]),),
         "coulomb = %s" % (vec(applied["coulomb"]),),
+        "compliance = %s" % (vec(compliance),),
         "ff_lead_us = %s" % (num(lead_us),),
         "applied_terms = %s" % (json.dumps([t.lower() for t in terms]),),
     ]

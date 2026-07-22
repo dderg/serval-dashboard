@@ -477,6 +477,42 @@ tunes refine each other's output, not the configured profile. Params:
 (MASS,VISCOUS,COULOMB,LEAD) `NAME` (tune) `PROFILE` `SERVOS` `BOUND`
 `SMALL_SIZE`.
 
+#### SERVO_SET_COMPLIANCE
+Writes the per-mode **belt-compliance feedforward** term `1/ω_b²`
+into the dynamics profile (version 7) and streams it live (no
+restart). With a nonzero compliance the endpoint inverts the two-mass
+plant every DC cycle: the rotor is commanded to `x + a/ω_b²` — it
+deliberately leads the trajectory by exactly the belt stretch the
+commanded accel consumes — so the carriage follows the planner curve
+without ringing *from commanded motion*; the matching jerk term lands
+on the 60B1h velocity offset and the snap term in the 60B2h torque
+model automatically, evaluated analytically from the streamed
+trajectory pieces. On a coupled node the per-mode terms compose
+through the frame (`G = F⁺·diag(c)·F`), so per-axis frequencies map
+correctly onto CoreXY motors.
+
+`X_FREQ`/`Y_FREQ` are the **locked-rotor** belt frequencies in Hz —
+the frequency the carriage rings at when the rotor holds still. This
+sits *above* the coupled frequency a plain `SERVO_MEASURE_RINGDOWN`
+reports (there the rotor recoils on the position-loop spring in
+series with the belt, which reads low), so feeding the raw ringdown
+frequency over-corrects: start above the measured value and iterate.
+`0` disables a mode; an omitted mode keeps its current value. The
+correction is bounded by `max_accel/ω_b²` (tens of µm at print
+accels), lives in the same transient offset channel as the trim and
+strain compensation (never baked into the streamed anchor, exactly
+zero at cruise and rest), and needs an accel-smooth command stream —
+run a `smooth_*` input-shaper kernel. Residual excitation the command
+didn't cause (cogging, reversals, model error) still rings at the old
+coupled frequency — keep a light shaper or the belt damper for that.
+
+Baseline resolution matches `SERVO_TUNE_DYNAMICS` (`PROFILE=`, else
+the live-tuned model, else the configured node profile); the result
+is written as a new timestamped v7 TOML (never overwriting) and left
+live until `RESTART`. Requires the matching kalico build on both
+sides (profile v7 / wire schema v7). Params: `X_FREQ` `Y_FREQ` (Hz,
+≥ 20; 0 disables) `NAME` (compliance) `PROFILE` `SERVOS`.
+
 #### SERVO_CALIBRATE_INERTIA_RATIO
 Step 2 of tuning: identify the load inertia and print the recommended C00.06.
 `TORQUE_NM` and `INERTIA_KGM2` are **required** (config or param). On

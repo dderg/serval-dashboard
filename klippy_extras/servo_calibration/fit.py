@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 
 try:
     import tomllib
@@ -1608,3 +1609,126 @@ class DynamicsFitCommands(MeasureCommands):
             finally:
                 self._restore()
                 self._active_run = None
+
+    cmd_SERVO_SET_COMPLIANCE_help = (
+        "Write the per-mode belt-compliance feedforward term 1/omega_b^2 "
+        "into the dynamics profile and stream it live (no restart). With "
+        "a nonzero compliance the endpoint inverts the two-mass plant: "
+        "the rotor leads the commanded trajectory by accel/omega_b^2 - "
+        "exactly the belt stretch the accel consumes - so the carriage "
+        "follows the planner curve without ringing from commanded "
+        "motion (jerk and snap terms land on the 60B1h/60B2h streams "
+        "automatically). X_FREQ/Y_FREQ are the LOCKED-ROTOR belt "
+        "frequencies in Hz per Cartesian mode - the frequency the "
+        "carriage rings at when the rotor holds still. This sits ABOVE "
+        "the coupled frequency a plain ringdown measures (there the "
+        "rotor recoils on the position-loop spring in series with the "
+        "belt), so feeding the raw ringdown frequency OVER-corrects: "
+        "start above the measured value and tune down, or 0 to disable "
+        "a mode. An omitted mode keeps its current profile value. The "
+        "profile is written as a new timestamped v7 TOML (never "
+        "overwritten) and left LIVE until RESTART - point "
+        "[ethercat_node] dynamics_profile at it to keep it. Residual "
+        "excitation the command didn't cause (cogging, reversals, model "
+        "error) still rings at the coupled frequency - keep a light "
+        "input shaper or the belt damper for that. Baseline profile "
+        "resolution matches SERVO_TUNE_DYNAMICS (PROFILE=, else the "
+        "live-tuned model, else the configured node profile). Params "
+        "X_FREQ Y_FREQ (Hz, >= 20; 0 disables) NAME (compliance) "
+        "PROFILE SERVOS"
+    )
+
+    def cmd_SERVO_SET_COMPLIANCE(self, gcmd: Any) -> None:
+        if tomllib is None:
+            raise gcmd.error(
+                "SERVO_SET_COMPLIANCE requires Python 3.11+ (tomllib)"
+            )
+        plan = self._fit_plan(gcmd)
+        node = self._dynamics_node(gcmd, plan["servos"])
+        handle = node.get_engine_handle()
+        if handle is None:
+            raise gcmd.error(
+                "ethercat_node %s has no engine handle" % (node.name,)
+            )
+        engine = self.printer.lookup_object("motion_engine")
+        profile_path, baseline = self._load_baseline_dynamics(gcmd, node)
+        freq_params = {"x": "X_FREQ", "y": "Y_FREQ"}
+        updated = _copy_dynamics(baseline)
+        updated["ff_lead_us"] = baseline.get("ff_lead_us", 0.0)
+        changed = []
+        for mode_i, mode in enumerate(updated["modes"]):
+            param = freq_params.get(mode)
+            if param is None:
+                continue
+            freq = gcmd.get_float(param, None)
+            if freq is None:
+                continue
+            if freq == 0.0:
+                updated["compliance"][mode_i] = 0.0
+                changed.append("%s: off" % (mode,))
+                continue
+            if freq < 20.0:
+                raise gcmd.error(
+                    "%s must be >= 20 Hz (got %g) - the endpoint rejects "
+                    "softer modes as typos" % (param, freq)
+                )
+            c = 1.0 / (2.0 * math.pi * freq) ** 2
+            updated["compliance"][mode_i] = c
+            # lead per commanded accel: c mm per mm/s^2 = c*1e9 um per m/s^2
+            changed.append(
+                "%s: %.1f Hz -> %.3g s^2 (lead %.0f um at 50 m/s^2)"
+                % (mode, freq, c, c * 5.0e4 * 1e3)
+            )
+        unmatched = [
+            p
+            for m, p in freq_params.items()
+            if gcmd.get_float(p, None) is not None and m not in updated["modes"]
+        ]
+        if unmatched:
+            raise gcmd.error(
+                "%s given but profile %s has modes %s"
+                % (", ".join(unmatched), profile_path, updated["modes"])
+            )
+        if not changed:
+            raise gcmd.error(
+                "give X_FREQ= and/or Y_FREQ= (Hz, locked-rotor belt "
+                "frequency; 0 disables) - profile %s currently carries "
+                "compliance %s" % (profile_path, updated["compliance"])
+            )
+        name = gcmd.get("NAME", "compliance")
+        os.makedirs(self.dynamics_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(
+            self.dynamics_dir, "dynamics_%s_%s.toml" % (name, stamp)
+        )
+        suffix = 1
+        while os.path.exists(out_path):
+            # never overwrite; same-second re-issues get a counter suffix
+            out_path = os.path.join(
+                self.dynamics_dir,
+                "dynamics_%s_%s-%d.toml" % (name, stamp, suffix),
+            )
+            suffix += 1
+        with open(out_path, "w") as f:
+            f.write(
+                render_fit_dynamics_toml(
+                    updated,
+                    updated,
+                    [],
+                    "servo_set_compliance",
+                    baseline.get("ff_lead_us", 0.0),
+                )
+            )
+        send_dynamics_model(engine, handle, updated)
+        node.set_live_dynamics_profile(out_path)
+        structured_log.event(
+            "calibration",
+            "set_compliance",
+            profile=out_path,
+            compliance=updated["compliance"],
+        )
+        gcmd.respond_info(
+            "compliance %s | written %s | model live until RESTART - "
+            "point [ethercat_node %s] dynamics_profile at it to keep it"
+            % (" | ".join(changed), out_path, node.name)
+        )

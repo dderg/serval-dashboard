@@ -236,3 +236,70 @@ def test_add_dynamics_direction_split_applies_delta_and_guards():
         servo_calibration.add_dynamics_direction_split(p, 0, 0.45)
     with pytest.raises(ValueError, match=r"abs\(value\) < 0.5"):
         servo_calibration.add_dynamics_direction_split(p, 1, -0.45)
+
+
+V7_TOML = BASELINE_TOML.replace("version = 6", "version = 7").replace(
+    "coulomb = [1.0, 1.5]",
+    "coulomb = [1.0, 1.5]\ncompliance = [1.76e-5, 7.0e-6]",
+)
+
+
+def test_parse_v7_profile_carries_compliance():
+    p = servo_calibration.parse_dynamics_profile(V7_TOML)
+    assert p["compliance"] == [1.76e-5, 7.0e-6]
+
+
+def test_parse_v6_profile_defaults_compliance_to_zeros():
+    p = servo_calibration.parse_dynamics_profile(BASELINE_TOML)
+    assert p["compliance"] == [0.0, 0.0]
+
+
+def test_compliance_on_v6_profile_is_rejected():
+    with pytest.raises(ValueError, match="requires version 7"):
+        servo_calibration.parse_dynamics_profile(
+            V7_TOML.replace("version = 7", "version = 6")
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[1.76e-5]",  # wrong length
+        "[-1.0e-6, 7.0e-6]",  # negative
+        "[nan, 7.0e-6]",  # non-finite
+        "[1.0e-2, 7.0e-6]",  # softer than the 20 Hz endpoint floor
+        "[true, 7.0e-6]",  # non-numeric
+    ],
+)
+def test_parse_v7_profile_rejects_bad_compliance(value):
+    with pytest.raises(ValueError, match="compliance"):
+        servo_calibration.parse_dynamics_profile(
+            V7_TOML.replace(
+                "compliance = [1.76e-5, 7.0e-6]", "compliance = %s" % (value,)
+            )
+        )
+
+
+def test_rendered_toml_is_v7_and_round_trips_compliance():
+    p = servo_calibration.parse_dynamics_profile(V7_TOML)
+    text = servo_calibration.render_fit_dynamics_toml(
+        p, p, ["mass"], "run", 125.0
+    )
+    assert "version = 7" in text
+    again = servo_calibration.parse_dynamics_profile(text)
+    assert again["compliance"] == p["compliance"]
+    assert again["ff_lead_us"] == 125.0
+
+
+def test_send_dynamics_model_passes_compliance():
+    class Engine:
+        def set_dynamics_model(self, *args):
+            self.args = args
+
+    p = servo_calibration.parse_dynamics_profile(V7_TOML)
+    engine = Engine()
+    servo_calibration.send_dynamics_model(engine, 7, p)
+    handle, frame, mass, viscous, coulomb, compliance, ps, ds = engine.args
+    assert handle == 7
+    assert compliance == [1.76e-5, 7.0e-6]
+    assert coulomb == [1.0, 1.5]

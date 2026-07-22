@@ -161,6 +161,17 @@ const LAUNCHPAD_GROUPS: LpGroup[] = [
         ],
       },
       {
+        name: "SERVO_SET_COMPLIANCE",
+        blurb: "write the belt-compliance FF term 1/ω_b² into the dynamics profile and stream it live",
+        params: [
+          { name: "X_FREQ", type: "float", unit: "Hz", hint: "locked-rotor belt frequency, ≥ 20; 0 disables; omit to keep" },
+          { name: "Y_FREQ", type: "float", unit: "Hz", hint: "locked-rotor belt frequency, ≥ 20; 0 disables; omit to keep" },
+          { name: "PROFILE", type: "string", hint: "baseline TOML; defaults to the live model, else the node's profile" },
+          SERVOS,
+          { name: "NAME", type: "string", dflt: "compliance" },
+        ],
+      },
+      {
         name: "SERVO_CALIBRATE_INERTIA_RATIO",
         blurb: "identify the load inertia and print the recommended C00.06",
         params: [

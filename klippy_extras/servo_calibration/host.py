@@ -79,6 +79,7 @@ class CalibrationHost:
             "SERVO_APPLY_GAINS",
             "SERVO_CALIBRATE_GAINS",
             "SERVO_TUNE_DYNAMICS",
+            "SERVO_SET_COMPLIANCE",
             "SERVO_SWEEP_INERTIA",
             "SERVO_SWEEP_ACCEL",
             "SERVO_AUTOTUNE",

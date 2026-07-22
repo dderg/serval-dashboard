@@ -300,7 +300,7 @@ def make_calibration(
                 payload = sc.fake_ferr_queue.pop(0)
             else:
                 engine = sc.printer.lookup_object("motion_engine")
-                _h, _frame, mass, viscous, coulomb, _ps, _ds = (
+                _h, _frame, mass, viscous, coulomb, _comp, _ps, _ds = (
                     engine.dynamics_calls[-1]
                 )
                 lead_s = (
@@ -503,7 +503,7 @@ def test_tune_dynamics_already_optimal_converges_and_writes_baseline():
     assert prof["viscous"] == pytest.approx(BASELINE_VISCOUS, rel=0.06)
     assert prof["coulomb"] == pytest.approx(BASELINE_COULOMB, rel=0.06)
     # winner is streamed and left live
-    _h, _f, mass, viscous, coulomb, _ps, _ds = engine.dynamics_calls[-1]
+    _h, _f, mass, viscous, coulomb, _comp, _ps, _ds = engine.dynamics_calls[-1]
     assert mass == pytest.approx(prof["mass"])
     assert viscous == pytest.approx(prof["viscous"])
     assert coulomb == pytest.approx(prof["coulomb"])
@@ -568,7 +568,7 @@ def test_tune_dynamics_torque_rail_aborts_and_restores_baseline():
     sc.fake_flags_by_step["tune_r0"] = ["torque_saturated"]
     with pytest.raises(RuntimeError, match="torque rail"):
         sc.cmd_SERVO_TUNE_DYNAMICS(FakeGcmd())
-    _h, _f, mass, _v, _c, _ps, _ds = engine.dynamics_calls[-1]
+    _h, _f, mass, _v, _c, _comp, _ps, _ds = engine.dynamics_calls[-1]
     assert mass == pytest.approx(BASELINE_MASS)
 
 
@@ -956,3 +956,53 @@ def test_servo_refine_dynamics_command_is_removed():
     assert "SERVO_REFINE_DYNAMICS" not in gcode.commands
     assert "SERVO_TUNE_DYNAMICS" in gcode.commands
     assert not hasattr(sc, "cmd_SERVO_REFINE_DYNAMICS")
+
+
+# ---- SERVO_SET_COMPLIANCE ------------------------------------------------
+
+
+@requires_tomllib
+def test_set_compliance_writes_v7_profile_and_streams_it():
+    sc, _gcode, _path = make_calibration()
+    gcmd = FakeGcmd({"X_FREQ": 190.0, "Y_FREQ": 120.0})
+    sc.cmd_SERVO_SET_COMPLIANCE(gcmd)
+    engine = sc.printer.lookup_object("motion_engine")
+    assert len(engine.dynamics_calls) == 1
+    _h, _f, _m, _v, _c, compliance, _ps, _ds = engine.dynamics_calls[-1]
+    import math as _math
+
+    cx = 1.0 / (2.0 * _math.pi * 190.0) ** 2
+    cy = 1.0 / (2.0 * _math.pi * 120.0) ** 2
+    assert compliance == pytest.approx([cx, cy])
+    node = sc.printer.lookup_object("ethercat_node xy_drives")
+    out_path = node.get_live_dynamics_profile()
+    assert out_path and os.path.exists(out_path)
+    with open(out_path) as f:
+        written = servo_calibration.parse_dynamics_profile(f.read())
+    assert written["compliance"] == pytest.approx([cx, cy])
+    assert written["ff_lead_us"] == 250.0  # baseline lead passes through
+    assert written["mass"] == BASELINE_MASS
+
+
+@requires_tomllib
+def test_set_compliance_partial_update_keeps_other_mode():
+    sc, _gcode, _path = make_calibration()
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"X_FREQ": 190.0, "Y_FREQ": 120.0}))
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"Y_FREQ": 0.0}))
+    engine = sc.printer.lookup_object("motion_engine")
+    _h, _f, _m, _v, _c, compliance, _ps, _ds = engine.dynamics_calls[-1]
+    import math as _math
+
+    cx = 1.0 / (2.0 * _math.pi * 190.0) ** 2
+    assert compliance == pytest.approx([cx, 0.0])
+
+
+@requires_tomllib
+def test_set_compliance_rejects_soft_and_missing_frequencies():
+    sc, _gcode, _path = make_calibration()
+    with pytest.raises(RuntimeError, match=">= 20 Hz"):
+        sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"X_FREQ": 10.0}))
+    with pytest.raises(RuntimeError, match="X_FREQ"):
+        sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == []
