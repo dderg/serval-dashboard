@@ -84,12 +84,16 @@ class FakeEngine(_FakeEngine):
         super().__init__(sdo_read=(2, 7))
         self.dynamics_calls = []
         self.ff_lead_calls = []
+        self.buzzes = []
 
     def set_dynamics_model(self, *args):
         self.dynamics_calls.append(args)
 
     def set_ff_lead(self, handle, slot, lead_ns):
         self.ff_lead_calls.append((handle, slot, lead_ns))
+
+    def resonance_buzz(self, *args):
+        self.buzzes.append(args)
 
 
 def _motor(name, node_name, chain_index, invert=False):
@@ -264,6 +268,7 @@ def make_calibration(
 
     sc.fake_ferr_queue = []
     sc.fake_flags_by_step = {}
+    sc.fake_compliance_by_step = {}
     sc.fake_rms_fn = quadratic_rms()
     sc.fake_coef_hints = {
         "mass": (0.0, 0.0),
@@ -285,6 +290,7 @@ def make_calibration(
                 {
                     "name": s["name"],
                     "flags": sc.fake_flags_by_step.get(s["name"], []),
+                    "compliance": sc.fake_compliance_by_step.get(s["name"]),
                 }
                 for s in manifest["steps"]
             ]
@@ -1006,3 +1012,92 @@ def test_set_compliance_rejects_soft_and_missing_frequencies():
         sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({}))
     engine = sc.printer.lookup_object("motion_engine")
     assert engine.dynamics_calls == []
+
+
+# ---- SERVO_MEASURE_COMPLIANCE --------------------------------------------
+
+
+def _fake_notch(mode, f_notch, f_peak):
+    import math as _math
+
+    return {
+        "mode": mode,
+        "segments": 12,
+        "f_notch_hz": f_notch,
+        "notch_depth_db": 22.0,
+        "flank_coherence": 0.97,
+        "compliance_s2": 1.0 / (2.0 * _math.pi * f_notch) ** 2,
+        "f_peak_hz": f_peak,
+    }
+
+
+@requires_tomllib
+def test_measure_compliance_buzzes_each_mode_and_applies():
+    sc, _gcode, _path = make_calibration()
+    sc.fake_compliance_by_step = {
+        "x": _fake_notch("x", 214.0, 260.0),
+        "y": _fake_notch("y", 141.0, 175.0),
+    }
+    sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({"APPLY": 1}))
+    engine = sc.printer.lookup_object("motion_engine")
+    # One sweep per mode; both slots participate on CoreXY.
+    assert len(engine.buzzes) == 2
+    (_h1, mask_x, sign_x, fs1, fe1, amp, _dur, _ramp) = engine.buzzes[0]
+    (_h2, mask_y, sign_y, *_rest) = engine.buzzes[1]
+    assert mask_x == 0b11 and mask_y == 0b11
+    # x mode: both frame entries positive -> in-phase; y mode: motor_b
+    # column is negative -> anti-phase on slot 1.
+    assert sign_x == 0
+    assert sign_y == 0b10
+    assert fs1 == 60_000 and fe1 == 320_000
+    assert amp == 20_000  # 0.02 mm in nm
+    # APPLY streamed a model carrying the measured compliance.
+    assert len(engine.dynamics_calls) == 1
+    _h, _f, _m, _v, _c, compliance, _ps, _ds = engine.dynamics_calls[-1]
+    import math as _math
+
+    cx = 1.0 / (2.0 * _math.pi * 214.0) ** 2
+    cy = 1.0 / (2.0 * _math.pi * 141.0) ** 2
+    assert compliance == pytest.approx([cx, cy])
+    manifest = _manifest_for(sc)
+    assert manifest["experiment"] == "compliance"
+    assert manifest["stroke_plan"]["modes"] == ["x", "y"]
+    assert [s["name"] for s in manifest["steps"]] == ["x", "y"]
+
+
+@requires_tomllib
+def test_measure_compliance_without_apply_streams_nothing():
+    sc, _gcode, _path = make_calibration()
+    sc.fake_compliance_by_step = {
+        "x": _fake_notch("x", 214.0, 260.0),
+        "y": _fake_notch("y", 141.0, 175.0),
+    }
+    sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert len(engine.buzzes) == 2
+    assert engine.dynamics_calls == []
+
+
+@requires_tomllib
+def test_measure_compliance_apply_refuses_flagged_steps():
+    sc, _gcode, _path = make_calibration()
+    sc.fake_compliance_by_step = {
+        "x": _fake_notch("x", 214.0, 260.0),
+        "y": _fake_notch("y", 141.0, 175.0),
+    }
+    sc.fake_flags_by_step = {"y": ["compliance_notch_shallow"]}
+    with pytest.raises(RuntimeError, match="APPLY=1 refused"):
+        sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({"APPLY": 1}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == []
+
+
+@requires_tomllib
+def test_measure_compliance_single_mode():
+    sc, _gcode, _path = make_calibration()
+    sc.fake_compliance_by_step = {"y": _fake_notch("y", 141.0, 175.0)}
+    sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({"MODE": "Y"}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert len(engine.buzzes) == 1
+    manifest = _manifest_for(sc)
+    assert [s["name"] for s in manifest["steps"]] == ["y"]

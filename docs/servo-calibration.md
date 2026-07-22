@@ -513,6 +513,38 @@ live until `RESTART`. Requires the matching kalico build on both
 sides (profile v7 / wire schema v7). Params: `X_FREQ` `Y_FREQ` (Hz,
 ≥ 20; 0 disables) `NAME` (compliance) `PROFILE` `SERVOS`.
 
+#### SERVO_MEASURE_COMPLIANCE
+Measures the locked-rotor belt frequency `f_b` per Cartesian mode —
+the exact number `SERVO_SET_COMPLIANCE` wants — with the machine at
+standstill. For each selected mode it runs the engine's swept
+**position buzz** in the mode's frame pattern (in-phase for X,
+anti-phase for Y on CoreXY, invert signs unfolded automatically) and
+captures per-cycle command, encoder position, and measured torque
+(6077h). The analysis is an **instrumental-variable FRF** from
+measured torque to rotor position with the commanded buzz as the
+instrument (immune to the closed-loop bias a direct estimate picks
+up): its anti-resonance notch is exactly `sqrt(k_belt/m_load)/2π` —
+at that frequency the load is a perfectly tuned absorber and no
+applied torque can move the rotor. Plant zeros are invariant under
+feedback, so the position loop fighting the excitation doesn't shift
+the notch; the loop *is* the torque generator. `f_b` lands above the
+familiar coupled ringdown frequency and below the plant's two-mass
+peak, which is reported alongside as a sanity anchor.
+
+The estimator is validated in CI against a simulated closed-loop
+two-mass plant (`servo-ident/tests/compliance_frf.rs`): it recovers
+the analytic `f_b` within 2 Hz and refuses to be dragged onto the
+coupled peak. Quality gates surface as step flags:
+`compliance_notch_shallow` (< 6 dB — raise `AMPLITUDE` or narrow the
+band), `compliance_flanks_incoherent`, and
+`compliance_peak_below_notch` (model violation — don't apply).
+
+`APPLY=1` chains the measured frequencies straight into the
+`SERVO_SET_COMPLIANCE` write-and-stream; it refuses when any step
+carries a flag. Params: `MODE=XY|X|Y` `FREQ_START` (60) `FREQ_END`
+(320) `HZ_PER_SEC` (10) `DURATION` `AMPLITUDE` (0.02 mm) `RAMP`
+`DWELL_MS` `NAME` (compliance) `APPLY` (0) `PROFILE` (used by APPLY).
+
 #### SERVO_CALIBRATE_INERTIA_RATIO
 Step 2 of tuning: identify the load inertia and print the recommended C00.06.
 `TORQUE_NM` and `INERTIA_KGM2` are **required** (config or param). On

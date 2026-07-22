@@ -13,6 +13,7 @@ fn step_result(name: &str, flags: &[&str]) -> StepResult {
         accel: None,
         differential: None,
         ringdown: None,
+        compliance: None,
         flags: flags.iter().map(|s| s.to_string()).collect(),
     }
 }

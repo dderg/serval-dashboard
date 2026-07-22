@@ -1643,6 +1643,33 @@ class DynamicsFitCommands(MeasureCommands):
             raise gcmd.error(
                 "SERVO_SET_COMPLIANCE requires Python 3.11+ (tomllib)"
             )
+        freq_params = {"x": "X_FREQ", "y": "Y_FREQ"}
+        freq_by_mode = {}
+        for mode, param in freq_params.items():
+            freq = gcmd.get_float(param, None)
+            if freq is None:
+                continue
+            if freq != 0.0 and freq < 20.0:
+                raise gcmd.error(
+                    "%s must be >= 20 Hz (got %g) - the endpoint rejects "
+                    "softer modes as typos" % (param, freq)
+                )
+            freq_by_mode[mode] = freq
+        if not freq_by_mode:
+            raise gcmd.error(
+                "give X_FREQ= and/or Y_FREQ= (Hz, locked-rotor belt "
+                "frequency; 0 disables)"
+            )
+        self._apply_compliance(
+            gcmd, freq_by_mode, gcmd.get("NAME", "compliance")
+        )
+
+    def _apply_compliance(
+        self, gcmd: Any, freq_by_mode: dict[str, float], name: str
+    ) -> None:
+        """Write freq_by_mode (Hz; 0 disables) into a new v7 dynamics
+        profile and stream it live. Modes absent from the dict keep
+        their current compliance."""
         plan = self._fit_plan(gcmd)
         node = self._dynamics_node(gcmd, plan["servos"])
         handle = node.get_engine_handle()
@@ -1652,26 +1679,23 @@ class DynamicsFitCommands(MeasureCommands):
             )
         engine = self.printer.lookup_object("motion_engine")
         profile_path, baseline = self._load_baseline_dynamics(gcmd, node)
-        freq_params = {"x": "X_FREQ", "y": "Y_FREQ"}
+        unmatched = sorted(set(freq_by_mode) - set(baseline["modes"]))
+        if unmatched:
+            raise gcmd.error(
+                "mode(s) %s not in profile %s (modes %s)"
+                % (", ".join(unmatched), profile_path, baseline["modes"])
+            )
         updated = _copy_dynamics(baseline)
         updated["ff_lead_us"] = baseline.get("ff_lead_us", 0.0)
         changed = []
         for mode_i, mode in enumerate(updated["modes"]):
-            param = freq_params.get(mode)
-            if param is None:
+            if mode not in freq_by_mode:
                 continue
-            freq = gcmd.get_float(param, None)
-            if freq is None:
-                continue
+            freq = freq_by_mode[mode]
             if freq == 0.0:
                 updated["compliance"][mode_i] = 0.0
                 changed.append("%s: off" % (mode,))
                 continue
-            if freq < 20.0:
-                raise gcmd.error(
-                    "%s must be >= 20 Hz (got %g) - the endpoint rejects "
-                    "softer modes as typos" % (param, freq)
-                )
             c = 1.0 / (2.0 * math.pi * freq) ** 2
             updated["compliance"][mode_i] = c
             # lead per commanded accel: c mm per mm/s^2 = c*1e9 um per m/s^2
@@ -1679,23 +1703,6 @@ class DynamicsFitCommands(MeasureCommands):
                 "%s: %.1f Hz -> %.3g s^2 (lead %.0f um at 50 m/s^2)"
                 % (mode, freq, c, c * 5.0e4 * 1e3)
             )
-        unmatched = [
-            p
-            for m, p in freq_params.items()
-            if gcmd.get_float(p, None) is not None and m not in updated["modes"]
-        ]
-        if unmatched:
-            raise gcmd.error(
-                "%s given but profile %s has modes %s"
-                % (", ".join(unmatched), profile_path, updated["modes"])
-            )
-        if not changed:
-            raise gcmd.error(
-                "give X_FREQ= and/or Y_FREQ= (Hz, locked-rotor belt "
-                "frequency; 0 disables) - profile %s currently carries "
-                "compliance %s" % (profile_path, updated["compliance"])
-            )
-        name = gcmd.get("NAME", "compliance")
         os.makedirs(self.dynamics_dir, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         out_path = os.path.join(
@@ -1732,3 +1739,183 @@ class DynamicsFitCommands(MeasureCommands):
             "point [ethercat_node %s] dynamics_profile at it to keep it"
             % (" | ".join(changed), out_path, node.name)
         )
+
+    cmd_SERVO_MEASURE_COMPLIANCE_help = (
+        "Measure the LOCKED-ROTOR belt frequency f_b per Cartesian mode "
+        "- the number SERVO_SET_COMPLIANCE wants - from a mode-patterned "
+        "swept position buzz at standstill. The analysis is the "
+        "instrumental-variable FRF from measured torque (6077h) to rotor "
+        "position with the commanded buzz as instrument: its "
+        "anti-resonance notch is exactly sqrt(k_belt/m_load)/2pi and is "
+        "invariant under the position loop (plant zeros cannot be moved "
+        "by feedback). f_b sits above the familiar coupled ringdown "
+        "frequency and below the plant's two-mass peak, which is "
+        "reported alongside as a sanity anchor. Excitation is gentle by "
+        "construction: at the notch the rotor barely moves. Flags: "
+        "compliance_notch_shallow (< 6 dB - raise AMPLITUDE or narrow "
+        "the band), compliance_flanks_incoherent, "
+        "compliance_peak_below_notch (model violation - do not apply). "
+        "APPLY=1 chains the measured frequencies straight into the "
+        "SERVO_SET_COMPLIANCE write-and-stream (skipped if any step "
+        "flags). Params MODE=XY|X|Y FREQ_START (60) FREQ_END (320) "
+        "HZ_PER_SEC (10) DURATION AMPLITUDE (0.02) RAMP DWELL_MS NAME "
+        "(compliance) APPLY (0) PROFILE"
+    )
+
+    def cmd_SERVO_MEASURE_COMPLIANCE(self, gcmd: Any) -> None:
+        kin = self._kin()
+        spatial = servo_strokes.spatial_frame(kin)
+        if spatial is None:
+            raise gcmd.error(
+                "SERVO_MEASURE_COMPLIANCE needs servo rails on X/Y - no "
+                "spatial frame available"
+            )
+        mode_req = gcmd.get("MODE", "XY").upper()
+        wanted = [m for m in ("x", "y") if m.upper() in mode_req]
+        modes = [m for m in spatial["modes"] if m in wanted]
+        if not modes:
+            raise gcmd.error(
+                "MODE=%s selects none of the spatial modes %s"
+                % (mode_req, spatial["modes"])
+            )
+        freq_start = gcmd.get_float("FREQ_START", 60.0, above=0.0)
+        freq_end = gcmd.get_float("FREQ_END", 320.0, above=freq_start)
+        if freq_end > self.MAX_BUZZ_FREQ_HZ:
+            raise gcmd.error(
+                "buzz frequencies must stay at or below %.0f Hz"
+                % (self.MAX_BUZZ_FREQ_HZ,)
+            )
+        amplitude = gcmd.get_float("AMPLITUDE", 0.02, above=0.0)
+        if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
+            raise gcmd.error(
+                "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
+                % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
+            )
+        hz_per_sec = gcmd.get_float("HZ_PER_SEC", 10.0, above=0.0)
+        duration = gcmd.get_float("DURATION", 0.0, minval=0.0)
+        if duration <= 0.0:
+            duration = max((freq_end - freq_start) / hz_per_sec, 0.5)
+        if duration > self.MAX_BUZZ_DURATION_S:
+            raise gcmd.error(
+                "sweep duration %.0f s exceeds the %.0f s buzz ceiling; "
+                "raise HZ_PER_SEC or narrow the frequency band"
+                % (duration, self.MAX_BUZZ_DURATION_S)
+            )
+        ramp = gcmd.get_float(
+            "RAMP", min(0.1 * duration, 3.0 / freq_start), above=0.0
+        )
+        dwell = gcmd.get_int("DWELL_MS", self.dwell_ms, minval=0)
+        apply = gcmd.get_int("APPLY", 0) != 0
+        name = gcmd.get("NAME", "compliance")
+        servos = list(spatial["axes"])
+        node = self._dynamics_node(gcmd, servos)
+        handle = node.get_engine_handle()
+        if handle is None:
+            raise gcmd.error(
+                "ethercat_node %s has no engine handle" % (node.name,)
+            )
+        engine = self.printer.lookup_object("motion_engine")
+        slot_for = {}
+        invert_for = {}
+        for servo in servos:
+            slot = node.get_slot_for_motor(servo)
+            if slot is None:
+                raise gcmd.error(
+                    "motor %r is not on node %s" % (servo, node.name)
+                )
+            slot_for[servo] = slot
+            invert_for[servo] = bool(
+                getattr(self._resolve_motor(servo), "invert_direction", False)
+            )
+        stroke_plan = {
+            "freq_start": freq_start,
+            "freq_end": freq_end,
+            "hz_per_sec": hz_per_sec,
+            "duration": duration,
+            "ramp": ramp,
+            "amplitude": amplitude,
+            "dwell_ms": dwell,
+            "modes": modes,
+        }
+        run = self._begin_run(
+            gcmd, "compliance", name, "XY", servos, stroke_plan
+        )
+        try:
+            self._prep("X", dwell)
+            self._prep("Y", dwell)
+            reactor = self.printer.get_reactor()
+            for mode in modes:
+                row = spatial["frame"][spatial["modes"].index(mode)]
+                slot_mask = 0
+                sign_mask = 0
+                step_servos = []
+                for servo, weight in zip(servos, row):
+                    if weight == 0.0:
+                        continue
+                    slot = slot_for[servo]
+                    slot_mask |= 1 << slot
+                    step_servos.append(servo)
+                    # The buzz sign acts in command mm (before the signed
+                    # counts-per-mm); the spatial frame is in RAW drive mm
+                    # with invert folded in - unfold it for the mask.
+                    sign_cmd = (1.0 if weight > 0.0 else -1.0) * (
+                        -1.0 if invert_for[servo] else 1.0
+                    )
+                    if sign_cmd < 0.0:
+                        sign_mask |= 1 << slot
+                gcmd.respond_info(
+                    "compliance sweep, mode %s: %.0f->%.0f Hz over %.1f s, "
+                    "amplitude %.3f mm on %s"
+                    % (
+                        mode,
+                        freq_start,
+                        freq_end,
+                        duration,
+                        amplitude,
+                        "+".join(step_servos),
+                    )
+                )
+                self._start_capture(mode, step_servos)
+                try:
+                    engine.resonance_buzz(
+                        handle,
+                        slot_mask,
+                        sign_mask,
+                        int(round(freq_start * 1000.0)),
+                        int(round(freq_end * 1000.0)),
+                        int(round(amplitude * 1e6)),
+                        int(round(duration * 1000.0)),
+                        int(round(ramp * 1000.0)),
+                    )
+                    reactor.pause(reactor.monotonic() + duration + 0.2)
+                finally:
+                    self._stop_capture()
+                run.record_step(SweepStep(mode, {}, []))
+                if dwell:
+                    reactor.pause(reactor.monotonic() + dwell / 1000.0)
+            results = self._analyze_and_report(gcmd, run)
+        finally:
+            self._active_run = None
+        freq_by_mode = {}
+        flagged = []
+        for step in results.get("steps", []):
+            comp = step.get("compliance")
+            if comp is None:
+                continue
+            if step.get("flags"):
+                flagged.append(
+                    "%s: %s" % (step["name"], ",".join(step["flags"]))
+                )
+            freq_by_mode[comp["mode"]] = comp["f_notch_hz"]
+        if not apply:
+            return
+        if flagged:
+            raise gcmd.error(
+                "APPLY=1 refused - flagged steps: %s (re-measure or apply "
+                "manually with SERVO_SET_COMPLIANCE)" % ("; ".join(flagged),)
+            )
+        if not freq_by_mode:
+            raise gcmd.error(
+                "APPLY=1 but the analysis produced no compliance results"
+            )
+        self._apply_compliance(gcmd, freq_by_mode, name)

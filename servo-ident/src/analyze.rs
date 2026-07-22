@@ -9,7 +9,8 @@ use serde_json::Value;
 
 use crate::combine::{compute_corexy_combine, peak_abs, rms};
 use crate::frf::{
-    active_slice, differential_series, find_modes, welch_frf, COHERENCE_MIN, DEFAULT_NPERSEG,
+    active_slice, complex_ratio, differential_series, find_modes, find_notch, mode_series,
+    welch_frf, COHERENCE_MIN, DEFAULT_NPERSEG,
 };
 use crate::metrics::{
     compute_metrics, drive_series, motion_segments, DriveSeries, DEFAULT_SETTLE_BAND_COUNTS,
@@ -18,9 +19,9 @@ use crate::metrics::{
 use crate::psd::{moving_psd, segments_welch_psd, top_peaks, welch_psd};
 use crate::resonance::{detect_resonance, recommend_accel};
 use crate::results::{
-    AccelResult, Combined, DifferentialResult, DriveResult, Manifest, ManifestSpatial, PlotAccel,
-    PlotCombined, PlotDifferential, PlotDrive, PlotPath, PlotPsd, PlotPsdAccel, PlotSeries,
-    PlotStep, Results, Step, StepResult, Verdict,
+    AccelResult, Combined, ComplianceResult, DifferentialResult, DriveResult, Manifest,
+    ManifestSpatial, PlotAccel, PlotCombined, PlotCompliance, PlotDifferential, PlotDrive,
+    PlotPath, PlotPsd, PlotPsdAccel, PlotSeries, PlotStep, Results, Step, StepResult, Verdict,
 };
 use crate::ringdown::{
     compute_step_ringdown, ringdown_verdict_reason, RingdownOptions, DEFAULT_GUARD_MS,
@@ -536,6 +537,7 @@ pub fn analyze_capture(
         accel: accel.map(|a| a.result),
         differential: None,
         ringdown: None,
+        compliance: None,
         flags,
     };
     let plot_step = PlotStep {
@@ -549,6 +551,7 @@ pub fn analyze_capture(
         accel: plot_accel,
         differential: None,
         ringdown: None,
+        compliance: None,
         path,
         psd: PlotPsd {
             freq_hz: psd_freq_hz,
@@ -652,6 +655,7 @@ pub fn analyze_differential_capture(
             modes,
         }),
         ringdown: None,
+        compliance: None,
         flags: Vec::new(),
     };
     let plot_step = PlotStep {
@@ -665,6 +669,171 @@ pub fn analyze_differential_capture(
         accel: None,
         differential: Some(plot_differential),
         ringdown: None,
+        compliance: None,
+        path: None,
+        psd: PlotPsd {
+            freq_hz: psd_freq_hz,
+            per_drive: per_drive_psd,
+            cartesian: None,
+            accel: None,
+        },
+    };
+    Ok((step_result, plot_step))
+}
+
+/// Locked-rotor belt frequency per Cartesian mode from a swept position
+/// buzz: instrumental-variable FRF from measured torque (6077h) to rotor
+/// position with the commanded buzz as instrument, then the
+/// anti-resonance notch = `f_b` and `compliance_s2 = 1/(2*pi*f_b)^2`.
+/// The buzz is a mode-patterned wiggle; the series are frame-row
+/// projections so per-motor noise that is orthogonal to the mode
+/// cancels before the spectra are formed.
+pub fn analyze_compliance_capture(
+    cap: &Scap,
+    name: &str,
+    freq_start: f64,
+    freq_end: f64,
+    spatial: &ManifestSpatial,
+) -> Result<(StepResult, PlotStep), String> {
+    let fs = cap.fs();
+    let n = cap.n_records;
+    let row = spatial
+        .modes
+        .iter()
+        .position(|m| m == name)
+        .ok_or_else(|| {
+            format!(
+                "compliance step {name:?} names no spatial mode (have: [{}])",
+                spatial.modes.join(", ")
+            )
+        })?;
+    let series = mode_series(cap, &spatial.axes, &spatial.frame[row])?;
+    let span = active_slice(&series.cmd_mm)?;
+    let cmd = &series.cmd_mm[span.clone()];
+    // Both legs against the commanded reference, then the ratio: the
+    // closed loop generates the torque, so a direct torque->position
+    // estimate would be biased by the feedback path.
+    let cmd_to_act = welch_frf(cmd, &series.act_mm[span.clone()], fs, DEFAULT_NPERSEG)?;
+    let cmd_to_torque = welch_frf(cmd, &series.torque[span.clone()], fs, DEFAULT_NPERSEG)?;
+    let g = complex_ratio(&cmd_to_act, &cmd_to_torque)?;
+    let notch = find_notch(&g, freq_start, freq_end)?;
+    // The coupled resonance sits above the notch; report it as a sanity
+    // anchor (it should match the familiar ringdown frequency).
+    let peak = find_modes(&g, notch.freq_hz * 1.02, freq_end)
+        .ok()
+        .and_then(|modes| {
+            modes
+                .into_iter()
+                .max_by(|a, b| {
+                    a.gain
+                        .partial_cmp(&b.gain)
+                        .unwrap_or(core::cmp::Ordering::Equal)
+                })
+                .map(|m| m.freq_hz)
+        });
+    let omega = 2.0 * core::f64::consts::PI * notch.freq_hz;
+    let mut flags = Vec::new();
+    if notch.depth_db < 6.0 {
+        flags.push("compliance_notch_shallow".to_string());
+    }
+    if notch.flank_coherence < COHERENCE_MIN {
+        flags.push("compliance_flanks_incoherent".to_string());
+    }
+    if let Some(p) = peak {
+        if p <= notch.freq_hz {
+            flags.push("compliance_peak_below_notch".to_string());
+        }
+    }
+
+    let display_lo = (freq_start * 0.5).max(g.freqs[1]);
+    let display_hi = freq_end * 1.2;
+    let band: Vec<usize> = (0..g.freqs.len())
+        .filter(|&i| g.freqs[i] >= display_lo && g.freqs[i] <= display_hi)
+        .collect();
+    let bidx: Vec<usize> = band
+        .iter()
+        .copied()
+        .step_by(stride_for(band.len()))
+        .collect();
+    let mag = g.magnitude();
+    let db = |v: f64| 20.0 * libm::log10(v.max(1e-12));
+    let plot_compliance = PlotCompliance {
+        freq_hz: bidx.iter().map(|&i| g.freqs[i]).collect(),
+        mag_db: bidx.iter().map(|&i| db(mag[i])).collect(),
+        phase_deg: bidx
+            .iter()
+            .map(|&i| libm::atan2(g.im[i], g.re[i]).to_degrees())
+            .collect(),
+        coherence: bidx.iter().map(|&i| g.coherence[i]).collect(),
+        coherence_min: COHERENCE_MIN,
+        band: (freq_start, freq_end),
+        notch_hz: notch.freq_hz,
+        peak_hz: peak,
+    };
+
+    let stride = stride_for(n);
+    let idxs: Vec<usize> = (0..n).step_by(stride).collect();
+    let t_s: Vec<f64> = idxs.iter().map(|&k| k as f64 / fs).collect();
+    let moving = vec![(span.start as f64 / fs, span.end as f64 / fs)];
+    let mut plot_drives = BTreeMap::new();
+    let mut psd_freq_hz: Option<Vec<f64>> = None;
+    let mut per_drive_psd: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for (idx, dname) in cap.drive_names().into_iter().enumerate() {
+        let s = drive_series(cap, idx)?;
+        let (freq_hz, psd) = welch_psd(&s.following_error[span.clone()], fs)?;
+        match &psd_freq_hz {
+            Some(existing) if existing.len() != freq_hz.len() => {
+                return Err(format!(
+                    "step {name:?}: drive {dname:?} psd grid has {} bins, expected {} \
+                     (drives must share the Welch grid)",
+                    freq_hz.len(),
+                    existing.len()
+                ));
+            }
+            Some(_) => {}
+            None => psd_freq_hz = Some(freq_hz),
+        }
+        per_drive_psd.insert(dname.clone(), psd);
+        plot_drives.insert(
+            dname,
+            PlotDrive {
+                ferr_counts: idxs.iter().map(|&k| s.following_error[k]).collect(),
+                torque_per_mille: idxs.iter().map(|&k| s.torque[k] as f64).collect(),
+            },
+        );
+    }
+    let psd_freq_hz = psd_freq_hz.ok_or_else(|| format!("step {name:?} has no drives"))?;
+
+    let step_result = StepResult {
+        name: name.to_string(),
+        drives: BTreeMap::new(),
+        combined: None,
+        accel: None,
+        differential: None,
+        ringdown: None,
+        compliance: Some(ComplianceResult {
+            mode: name.to_string(),
+            segments: g.segments,
+            f_notch_hz: notch.freq_hz,
+            notch_depth_db: notch.depth_db,
+            flank_coherence: notch.flank_coherence,
+            compliance_s2: 1.0 / (omega * omega),
+            f_peak_hz: peak,
+        }),
+        flags,
+    };
+    let plot_step = PlotStep {
+        name: name.to_string(),
+        fs_hz: fs,
+        stride,
+        t_s,
+        moving,
+        drives: plot_drives,
+        combined: None,
+        accel: None,
+        differential: None,
+        ringdown: None,
+        compliance: Some(plot_compliance),
         path: None,
         psd: PlotPsd {
             freq_hz: psd_freq_hz,
@@ -814,6 +983,28 @@ pub fn compute_verdict(
                 apply: None,
             })
         }
+        "compliance" => {
+            let mut lines = Vec::new();
+            for sr in steps {
+                let c = sr.compliance.as_ref().ok_or_else(|| {
+                    format!("compliance step {:?} carries no compliance result", sr.name)
+                })?;
+                let peak = c
+                    .f_peak_hz
+                    .map(|p| format!("{p:.1}"))
+                    .unwrap_or_else(|| "-".to_string());
+                lines.push(format!(
+                    "{}: f_b {:.1} Hz (c {:.3e} s^2, notch {:.1} dB, coupled {} Hz)",
+                    c.mode, c.f_notch_hz, c.compliance_s2, c.notch_depth_db, peak
+                ));
+            }
+            Ok(Verdict {
+                recommended_step: None,
+                reason: lines.join("; "),
+                flags: Vec::new(),
+                apply: None,
+            })
+        }
         "ringdown" => {
             let per_step: Vec<_> = steps
                 .iter()
@@ -912,6 +1103,11 @@ fn build_run_reusing(
     } else {
         None
     };
+    let compliance_band = if manifest.experiment == "compliance" {
+        Some((plan_f64("freq_start")?, plan_f64("freq_end")?))
+    } else {
+        None
+    };
     let ringdown_plan = if manifest.experiment == "ringdown" {
         let dwell_ms = plan_f64("dwell_ms")?;
         let iterations = plan_f64("iterations")?;
@@ -944,24 +1140,28 @@ fn build_run_reusing(
         }
         let cap = Scap::load(dir.join(&step.capture).to_str().unwrap())?;
         fs_hz = cap.fs();
-        let (mut sr, mut ps) = match differential_band {
-            Some((freq_start, freq_end)) => {
-                analyze_differential_capture(&cap, &step.name, freq_start, freq_end)?
-            }
-            None => {
-                let accel_path = step.accel.as_ref().map(|a| dir.join(a));
-                analyze_capture(
-                    &cap,
-                    &step.name,
-                    settle_band,
-                    torque_limit,
-                    manifest.belts.as_deref(),
-                    manifest.axis.as_deref(),
-                    accel_path.as_deref(),
-                    manifest.ff_lead_samples(cap.fs()),
-                    manifest.spatial.as_ref(),
-                )?
-            }
+        let (mut sr, mut ps) = if let Some((freq_start, freq_end)) = differential_band {
+            analyze_differential_capture(&cap, &step.name, freq_start, freq_end)?
+        } else if let Some((freq_start, freq_end)) = compliance_band {
+            let spatial = manifest.spatial.as_ref().ok_or_else(|| {
+                "compliance manifest carries no spatial frame - the mode \
+                 projection needs modes/axes/frame"
+                    .to_string()
+            })?;
+            analyze_compliance_capture(&cap, &step.name, freq_start, freq_end, spatial)?
+        } else {
+            let accel_path = step.accel.as_ref().map(|a| dir.join(a));
+            analyze_capture(
+                &cap,
+                &step.name,
+                settle_band,
+                torque_limit,
+                manifest.belts.as_deref(),
+                manifest.axis.as_deref(),
+                accel_path.as_deref(),
+                manifest.ff_lead_samples(cap.fs()),
+                manifest.spatial.as_ref(),
+            )?
         };
         if let Some((opts, expected_strokes)) = &ringdown_plan {
             let accel_path = step.accel.as_ref().map(|a| dir.join(a));
