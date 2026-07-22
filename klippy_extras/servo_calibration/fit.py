@@ -1806,7 +1806,7 @@ class DynamicsFitCommands(MeasureCommands):
         "APPLY=1 chains the measured frequencies straight into the "
         "SERVO_SET_COMPLIANCE write-and-stream (skipped if any step "
         "flags). Params MODE=XY|X|Y FREQ_START (60) FREQ_END (320) "
-        "HZ_PER_SEC (5) DURATION AMPLITUDE (0.02) RAMP DWELL_MS NAME "
+        "HZ_PER_SEC (1) DURATION AMPLITUDE (0.02) RAMP DWELL_MS NAME "
         "(compliance) APPLY (0) PROFILE"
     )
 
@@ -1841,7 +1841,7 @@ class DynamicsFitCommands(MeasureCommands):
             )
         # Slow default: more dwell per bin right where the response is
         # smallest (the notch) and more Welch segments per band.
-        hz_per_sec = gcmd.get_float("HZ_PER_SEC", 5.0, above=0.0)
+        hz_per_sec = gcmd.get_float("HZ_PER_SEC", 1.0, above=0.0)
         duration = gcmd.get_float("DURATION", 0.0, minval=0.0)
         if duration <= 0.0:
             duration = max((freq_end - freq_start) / hz_per_sec, 0.5)

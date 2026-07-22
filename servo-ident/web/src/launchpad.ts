@@ -178,7 +178,7 @@ const LAUNCHPAD_GROUPS: LpGroup[] = [
           { name: "MODE", type: "string", dflt: "XY", hint: "XY, X or Y" },
           { name: "FREQ_START", type: "float", dflt: "60", unit: "Hz" },
           { name: "FREQ_END", type: "float", dflt: "320", unit: "Hz" },
-          { name: "HZ_PER_SEC", type: "float", dflt: "5", unit: "Hz/s" },
+          { name: "HZ_PER_SEC", type: "float", dflt: "1", unit: "Hz/s" },
           { name: "AMPLITUDE", type: "float", dflt: "0.02", unit: "mm" },
           { name: "APPLY", type: "int", dflt: "0", hint: "1 = chain measured f_b into SERVO_SET_COMPLIANCE (refused on flags)" },
           { name: "NAME", type: "string", dflt: "compliance" },
