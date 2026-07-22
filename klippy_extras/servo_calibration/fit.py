@@ -1803,11 +1803,12 @@ class DynamicsFitCommands(MeasureCommands):
         "compliance_notch_shallow (< 6 dB - raise AMPLITUDE or narrow "
         "the band), compliance_flanks_incoherent, "
         "compliance_peak_below_notch (model violation - do not apply). "
-        "APPLY=1 chains the measured frequencies straight into the "
-        "SERVO_SET_COMPLIANCE write-and-stream (skipped if any step "
-        "flags). Params MODE=XY|X|Y FREQ_START (60) FREQ_END (320) "
-        "HZ_PER_SEC (1) DURATION AMPLITUDE (0.02) RAMP DWELL_MS NAME "
-        "(compliance) APPLY (0) PROFILE"
+        "Measurement only: it changes nothing on the drives - it prints "
+        "the ready-to-run SERVO_SET_COMPLIANCE line, which writes the v7 "
+        "profile and streams it live; point [ethercat_node] "
+        "dynamics_profile at the written TOML to survive RESTART. Params "
+        "MODE=XY|X|Y FREQ_START (60) FREQ_END (320) HZ_PER_SEC (1) "
+        "DURATION AMPLITUDE (0.02) RAMP DWELL_MS NAME (compliance)"
     )
 
     def cmd_SERVO_MEASURE_COMPLIANCE(self, gcmd: Any) -> None:
@@ -1849,7 +1850,6 @@ class DynamicsFitCommands(MeasureCommands):
             "RAMP", min(0.1 * duration, 3.0 / freq_start), above=0.0
         )
         dwell = gcmd.get_int("DWELL_MS", self.dwell_ms, minval=0)
-        apply = gcmd.get_int("APPLY", 0) != 0
         name = gcmd.get("NAME", "compliance")
         servos = list(spatial["axes"])
         node = self._dynamics_node(gcmd, servos)
@@ -1951,15 +1951,23 @@ class DynamicsFitCommands(MeasureCommands):
                     "%s: %s" % (step["name"], ",".join(step["flags"]))
                 )
             freq_by_mode[comp["mode"]] = comp["f_notch_hz"]
-        if not apply:
-            return
-        if flagged:
-            raise gcmd.error(
-                "APPLY=1 refused - flagged steps: %s (re-measure or apply "
-                "manually with SERVO_SET_COMPLIANCE)" % ("; ".join(flagged),)
-            )
         if not freq_by_mode:
             raise gcmd.error(
-                "APPLY=1 but the analysis produced no compliance results"
+                "the analysis produced no compliance results - is servo-cal "
+                "up to date? (rebuild with ./install.sh)"
             )
-        self._apply_compliance(gcmd, freq_by_mode, name)
+        apply_line = "SERVO_SET_COMPLIANCE " + " ".join(
+            "%s_FREQ=%.1f" % (m.upper(), f)
+            for m, f in sorted(freq_by_mode.items())
+        )
+        if flagged:
+            gcmd.respond_info(
+                "flagged steps: %s - re-measure before applying; to "
+                "override anyway: %s" % ("; ".join(flagged), apply_line)
+            )
+            return
+        gcmd.respond_info(
+            "to apply (streams live, writes a v7 profile): %s | then "
+            "point [ethercat_node %s] dynamics_profile at the written "
+            "TOML to keep it across RESTART" % (apply_line, node.name)
+        )

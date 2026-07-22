@@ -1032,13 +1032,14 @@ def _fake_notch(mode, f_notch, f_peak):
 
 
 @requires_tomllib
-def test_measure_compliance_buzzes_each_mode_and_applies():
+def test_measure_compliance_buzzes_each_mode_and_prints_the_apply_line():
     sc, _gcode, _path = make_calibration()
     sc.fake_compliance_by_step = {
         "x": _fake_notch("x", 214.0, 260.0),
         "y": _fake_notch("y", 141.0, 175.0),
     }
-    sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({"APPLY": 1}))
+    gcmd = FakeGcmd({})
+    sc.cmd_SERVO_MEASURE_COMPLIANCE(gcmd)
     engine = sc.printer.lookup_object("motion_engine")
     # One sweep per mode; both slots participate on CoreXY.
     assert len(engine.buzzes) == 2
@@ -1051,14 +1052,15 @@ def test_measure_compliance_buzzes_each_mode_and_applies():
     assert sign_y == 0b10
     assert fs1 == 60_000 and fe1 == 320_000
     assert amp == 20_000  # 0.02 mm in nm
-    # APPLY streamed a model carrying the measured compliance.
-    assert len(engine.dynamics_calls) == 1
-    _h, _f, _m, _v, _c, compliance, _ps, _ds = engine.dynamics_calls[-1]
-    import math as _math
-
-    cx = 1.0 / (2.0 * _math.pi * 214.0) ** 2
-    cy = 1.0 / (2.0 * _math.pi * 141.0) ** 2
-    assert compliance == pytest.approx([cx, cy])
+    # Measurement only: nothing streamed, the apply line is printed.
+    assert engine.dynamics_calls == []
+    apply_lines = [
+        r
+        for r in gcmd.responses
+        if "SERVO_SET_COMPLIANCE X_FREQ=214.0 Y_FREQ=141.0" in r
+    ]
+    assert apply_lines, gcmd.responses
+    assert "dynamics_profile" in apply_lines[-1]  # persistence hint
     manifest = _manifest_for(sc)
     assert manifest["experiment"] == "compliance"
     assert manifest["stroke_plan"]["modes"] == ["x", "y"]
@@ -1066,30 +1068,20 @@ def test_measure_compliance_buzzes_each_mode_and_applies():
 
 
 @requires_tomllib
-def test_measure_compliance_without_apply_streams_nothing():
-    sc, _gcode, _path = make_calibration()
-    sc.fake_compliance_by_step = {
-        "x": _fake_notch("x", 214.0, 260.0),
-        "y": _fake_notch("y", 141.0, 175.0),
-    }
-    sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({}))
-    engine = sc.printer.lookup_object("motion_engine")
-    assert len(engine.buzzes) == 2
-    assert engine.dynamics_calls == []
-
-
-@requires_tomllib
-def test_measure_compliance_apply_refuses_flagged_steps():
+def test_measure_compliance_flagged_steps_warn_instead_of_recommending():
     sc, _gcode, _path = make_calibration()
     sc.fake_compliance_by_step = {
         "x": _fake_notch("x", 214.0, 260.0),
         "y": _fake_notch("y", 141.0, 175.0),
     }
     sc.fake_flags_by_step = {"y": ["compliance_notch_shallow"]}
-    with pytest.raises(RuntimeError, match="APPLY=1 refused"):
-        sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({"APPLY": 1}))
+    gcmd = FakeGcmd({})
+    sc.cmd_SERVO_MEASURE_COMPLIANCE(gcmd)
     engine = sc.printer.lookup_object("motion_engine")
     assert engine.dynamics_calls == []
+    warn = [r for r in gcmd.responses if "flagged steps" in r]
+    assert warn and "compliance_notch_shallow" in warn[-1]
+    assert "re-measure before applying" in warn[-1]
 
 
 @requires_tomllib

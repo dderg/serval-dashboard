@@ -548,11 +548,13 @@ coupled peak. Quality gates surface as step flags:
 band), `compliance_flanks_incoherent`, and
 `compliance_peak_below_notch` (model violation — don't apply).
 
-`APPLY=1` chains the measured frequencies straight into the
-`SERVO_SET_COMPLIANCE` write-and-stream; it refuses when any step
-carries a flag. Params: `MODE=XY|X|Y` `FREQ_START` (60) `FREQ_END`
-(320) `HZ_PER_SEC` (1) `DURATION` `AMPLITUDE` (0.02 mm) `RAMP`
-`DWELL_MS` `NAME` (compliance) `APPLY` (0) `PROFILE` (used by APPLY).
+Measurement only — it changes nothing on the drives. The verdict
+carries `f_b` and the implied compliance per mode, and the command
+prints the ready-to-run `SERVO_SET_COMPLIANCE X_FREQ=… Y_FREQ=…` line
+(with the persistence reminder); when any step is flagged it prints a
+re-measure warning instead of a recommendation. Params: `MODE=XY|X|Y`
+`FREQ_START` (60) `FREQ_END` (320) `HZ_PER_SEC` (1) `DURATION`
+`AMPLITUDE` (0.02 mm) `RAMP` `DWELL_MS` `NAME` (compliance).
 
 #### SERVO_CALIBRATE_INERTIA_RATIO
 Step 2 of tuning: identify the load inertia and print the recommended C00.06.

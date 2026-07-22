@@ -173,16 +173,14 @@ const LAUNCHPAD_GROUPS: LpGroup[] = [
       },
       {
         name: "SERVO_MEASURE_COMPLIANCE",
-        blurb: "measure the locked-rotor belt frequency f_b per mode from the IV torque→position FRF anti-resonance",
+        blurb: "measure the locked-rotor belt frequency f_b per mode (IV torque→position FRF anti-resonance); prints the SERVO_SET_COMPLIANCE line to apply",
         params: [
           { name: "MODE", type: "string", dflt: "XY", hint: "XY, X or Y" },
           { name: "FREQ_START", type: "float", dflt: "60", unit: "Hz" },
           { name: "FREQ_END", type: "float", dflt: "320", unit: "Hz" },
           { name: "HZ_PER_SEC", type: "float", dflt: "1", unit: "Hz/s" },
           { name: "AMPLITUDE", type: "float", dflt: "0.02", unit: "mm" },
-          { name: "APPLY", type: "int", dflt: "0", hint: "1 = chain measured f_b into SERVO_SET_COMPLIANCE (refused on flags)" },
           { name: "NAME", type: "string", dflt: "compliance" },
-          { name: "PROFILE", type: "string", hint: "APPLY baseline; defaults to the live model, else the node's profile" },
         ],
       },
       {
