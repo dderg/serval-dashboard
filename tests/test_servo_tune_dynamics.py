@@ -1019,9 +1019,9 @@ def test_set_compliance_pin_writes_v8_and_streams_pin_mass():
     sc, _gcode, _path = make_calibration()
     gcmd = FakeGcmd(
         {
-            "Y_FREQ": 120.0,
+            "Y_FREQ": 131.5,
             "PIN": "Y",
-            "RATIO": 250.0,
+            "Y_PEAK": 215.8,
             "ZETA": 0.02,
             "PIN_LEAD_US": 1100.0,
         }
@@ -1033,7 +1033,8 @@ def test_set_compliance_pin_writes_v8_and_streams_pin_mass():
     # pin_mass, pin_zeta, pin_lead_us, pair_slots, direction_split
     assert len(call) == 11
     pin_mass, pin_zeta, pin_lead_us = call[6], call[7], call[8]
-    expected = BASELINE_MASS[1] * 2.5 / 3.5  # RATIO=250% -> R=2.5
+    fraction = 1.0 - (131.5 / 215.8) ** 2
+    expected = BASELINE_MASS[1] * fraction
     assert pin_mass == pytest.approx([0.0, expected])
     assert pin_zeta == pytest.approx([0.0, 0.02])
     assert pin_lead_us == pytest.approx(1100.0)
@@ -1050,9 +1051,9 @@ def test_set_compliance_pin_writes_v8_and_streams_pin_mass():
 
 
 @requires_tomllib
-def test_set_compliance_pin_without_ratio_errors():
+def test_set_compliance_pin_without_peak_errors():
     sc, _gcode, _path = make_calibration()
-    with pytest.raises(RuntimeError, match="RATIO"):
+    with pytest.raises(RuntimeError, match="SERVO_MEASURE_COMPLIANCE"):
         sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"Y_FREQ": 120.0, "PIN": "Y"}))
     engine = sc.printer.lookup_object("motion_engine")
     assert engine.dynamics_calls == []
@@ -1062,7 +1063,18 @@ def test_set_compliance_pin_without_ratio_errors():
 def test_set_compliance_pin_without_compliance_errors():
     sc, _gcode, _path = make_calibration()
     with pytest.raises(RuntimeError, match="compliance"):
-        sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "Y", "RATIO": 250.0}))
+        sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "Y", "Y_PEAK": 215.8}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == []
+
+
+@requires_tomllib
+def test_set_compliance_pin_peak_below_notch_errors():
+    sc, _gcode, _path = make_calibration()
+    with pytest.raises(RuntimeError, match="must sit above the notch"):
+        sc.cmd_SERVO_SET_COMPLIANCE(
+            FakeGcmd({"Y_FREQ": 131.5, "PIN": "Y", "Y_PEAK": 120.0})
+        )
     engine = sc.printer.lookup_object("motion_engine")
     assert engine.dynamics_calls == []
 
@@ -1076,7 +1088,8 @@ def test_set_compliance_pin_zero_clears_but_keeps_compliance():
                 "X_FREQ": 190.0,
                 "Y_FREQ": 120.0,
                 "PIN": "XY",
-                "RATIO": 250.0,
+                "X_PEAK": 260.0,
+                "Y_PEAK": 175.0,
             }
         )
     )
@@ -1109,16 +1122,19 @@ def test_set_compliance_pin_partial_update_keeps_other_mode_pin():
                 "X_FREQ": 190.0,
                 "Y_FREQ": 120.0,
                 "PIN": "XY",
-                "RATIO": 250.0,
+                "X_PEAK": 260.0,
+                "Y_PEAK": 175.0,
             }
         )
     )
-    # re-pin only Y at a different ratio; X's pin must persist
-    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "Y", "RATIO": 900.0}))
+    # re-pin only Y at a different peak; X's pin must persist
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "Y", "Y_PEAK": 200.0}))
     engine = sc.printer.lookup_object("motion_engine")
     pin_mass = engine.dynamics_calls[-1][6]
-    pin_x = BASELINE_MASS[0] * 2.5 / 3.5  # preserved from the first call
-    pin_y = BASELINE_MASS[1] * 9.0 / 10.0  # RATIO=900% -> R=9.0
+    # preserved from the first call (X_FREQ=190, X_PEAK=260)
+    pin_x = BASELINE_MASS[0] * (1.0 - (190.0 / 260.0) ** 2)
+    # re-pinned Y (baseline f_b=120, new peak 200)
+    pin_y = BASELINE_MASS[1] * (1.0 - (120.0 / 200.0) ** 2)
     assert pin_mass == pytest.approx([pin_x, pin_y])
 
 
@@ -1165,7 +1181,11 @@ def test_measure_compliance_buzzes_each_mode_and_prints_the_apply_line():
     apply_lines = [
         r
         for r in gcmd.responses
-        if "SERVO_SET_COMPLIANCE X_FREQ=214.0 Y_FREQ=141.0" in r
+        if (
+            "SERVO_SET_COMPLIANCE X_FREQ=214.0 X_PEAK=260.0 "
+            "Y_FREQ=141.0 Y_PEAK=175.0"
+        )
+        in r
     ]
     assert apply_lines, gcmd.responses
     assert "dynamics_profile" in apply_lines[-1]  # persistence hint

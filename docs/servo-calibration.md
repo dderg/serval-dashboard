@@ -521,10 +521,15 @@ the planner path and cancels the belt reaction with a predictive torque,
 so the toolhead rings at the locked-rotor `f_b` where a standard input
 shaper applies. Pin needs the mode's compliance as its frequency source,
 so set `X_FREQ`/`Y_FREQ` in the same call (or apply it to an existing v7
-profile). `RATIO` is the load/rotor inertia ratio in percent (C00.06
-units) and is **required** with `PIN` — read it from
-`SERVO_CALIBRATE_INERTIA_RATIO`; the pinned inertia is
-`pin_mass = mass·(RATIO/100)/(1 + RATIO/100)`. `ZETA` (default `0.02`)
+profile). Each pinned mode also needs its FRF **peak** frequency —
+`X_PEAK`/`Y_PEAK` in Hz, reported per mode by
+`SERVO_MEASURE_COMPLIANCE`. With the mode's notch `f_b` and peak
+`f_peak` the per-mode load fraction is `1 − (f_b/f_peak)²` and the
+pinned inertia is `pin_mass = mass·(1 − (f_b/f_peak)²)`. This replaces
+the old `RATIO`/C00.06 source: C00.06 is a per-drive gain-scheduling
+number, not per-mode physics, whereas the IV FRF's peak/notch ratio
+recovers the open-loop plant and gives the load fraction per mode.
+`ZETA` (default `0.02`)
 is the belt damping ratio for the predictor decay and `PIN_LEAD_US`
 (default `0`) the pin torque's phase lead in microseconds; because the
 pin term lives at `f_b`, the lead is tuned by minimizing the mode's line
@@ -543,9 +548,9 @@ the live-tuned model, else the configured node profile); the result
 is written as a new timestamped v7 TOML (v8 when a `PIN` mode is set;
 never overwriting) and left live until `RESTART`. Requires the matching
 kalico build on both sides (profile / wire schema v7, v8 for pin).
-Params: `X_FREQ` `Y_FREQ` (Hz, ≥ 20; 0 disables) `PIN` (0) `RATIO`
-(percent, required with `PIN`) `ZETA` (0.02) `PIN_LEAD_US` (0) `NAME`
-(compliance) `PROFILE` `SERVOS`.
+Params: `X_FREQ` `Y_FREQ` (Hz, ≥ 20; 0 disables) `PIN` (0)
+`X_PEAK` `Y_PEAK` (Hz, FRF peak, required per pinned mode) `ZETA`
+(0.02) `PIN_LEAD_US` (0) `NAME` (compliance) `PROFILE` `SERVOS`.
 
 #### SERVO_MEASURE_COMPLIANCE
 Measures the locked-rotor belt frequency `f_b` per Cartesian mode —
@@ -574,9 +579,11 @@ band), `compliance_flanks_incoherent`, and
 `compliance_peak_below_notch` (model violation — don't apply).
 
 Measurement only — it changes nothing on the drives. The verdict
-carries `f_b` and the implied compliance per mode, and the command
-prints the ready-to-run `SERVO_SET_COMPLIANCE X_FREQ=… Y_FREQ=…` line
-(with the persistence reminder); when any step is flagged it prints a
+carries `f_b`, `f_peak` and the implied compliance per mode, and the
+command prints the ready-to-run
+`SERVO_SET_COMPLIANCE X_FREQ=… X_PEAK=… Y_FREQ=… Y_PEAK=…` line (the
+peaks make it pin-complete, with the persistence reminder); when any
+step is flagged it prints a
 re-measure warning instead of a recommendation. Params: `MODE=XY|X|Y`
 `FREQ_START` (60) `FREQ_END` (320) `HZ_PER_SEC` (1) `DURATION`
 `AMPLITUDE` (0.02 mm) `RAMP` `DWELL_MS` `NAME` (compliance).

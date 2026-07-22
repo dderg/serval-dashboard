@@ -33,7 +33,6 @@ from .dynamics import (
     send_ff_lead,
 )
 from .measure import MeasureCommands
-from .params import C00_06_INERTIA_RATIO_MAX
 from .search import RmsLineSearch
 from .search import Z as ACCEPT_Z
 from .sweep import ExperimentRun, SweepStep
@@ -1689,16 +1688,18 @@ class DynamicsFitCommands(MeasureCommands):
         "position/velocity lead, the endpoint holds a predictive "
         "torque against the modelled deflection, replacing the "
         "compliance lead for that mode with an active hold. Pinning "
-        "needs RATIO (the C00.06 inertia ratio in %, run "
-        "SERVO_CALIBRATE_INERTIA_RATIO if unknown): the pinned mode "
-        "mass is m*R/(1+R), R=RATIO/100. ZETA (default 0.02) is the "
+        "needs the mode's FRF peak X_PEAK/Y_PEAK (Hz) alongside its "
+        "notch f_b (X_FREQ/Y_FREQ now or nonzero baseline compliance): "
+        "the per-mode load fraction is 1-(f_b/f_peak)^2 and the pinned "
+        "mass is mass*fraction (run SERVO_MEASURE_COMPLIANCE, which "
+        "reports f_peak per mode). ZETA (default 0.02) is the "
         "hold damping and PIN_LEAD_US (default 0) advances the hold. "
         "A pinned mode must have nonzero compliance (given now or in "
         "the baseline). PIN=0 clears the pins but keeps compliance. "
         "The profile is written v8 while any mode is pinned. Params "
-        "X_FREQ Y_FREQ (Hz, >= 20; 0 disables) PIN (XY|X|Y|0) RATIO "
-        "(%) ZETA (0.02) PIN_LEAD_US (us) NAME (compliance) PROFILE "
-        "SERVOS"
+        "X_FREQ Y_FREQ (Hz, >= 20; 0 disables) PIN (XY|X|Y|0) "
+        "X_PEAK Y_PEAK (Hz, FRF peak) ZETA (0.02) PIN_LEAD_US (us) "
+        "NAME (compliance) PROFILE SERVOS"
     )
 
     def cmd_SERVO_SET_COMPLIANCE(self, gcmd: Any) -> None:
@@ -1729,9 +1730,10 @@ class DynamicsFitCommands(MeasureCommands):
         )
 
     def _parse_pin_request(self, gcmd: Any) -> dict[str, Any] | None:
-        """Parse PIN/RATIO/ZETA/PIN_LEAD_US. Returns None when PIN is
-        absent (baseline pin state is preserved); otherwise a request
-        dict whose empty ``modes`` set means an explicit PIN=0 clear."""
+        """Parse PIN/X_PEAK/Y_PEAK/ZETA/PIN_LEAD_US. Returns None when
+        PIN is absent (baseline pin state is preserved); otherwise a
+        request dict whose empty ``modes`` set means an explicit PIN=0
+        clear."""
         raw = gcmd.get("PIN", None)
         if raw is None:
             return None
@@ -1749,17 +1751,25 @@ class DynamicsFitCommands(MeasureCommands):
         pin_lead_us = gcmd.get_float(
             "PIN_LEAD_US", 0.0, minval=0.0, maxval=PIN_LEAD_US_MAX
         )
-        ratio = gcmd.get_float(
-            "RATIO", None, above=0.0, maxval=float(C00_06_INERTIA_RATIO_MAX)
-        )
-        if modes and ratio is None:
+        peak_params = {"x": "X_PEAK", "y": "Y_PEAK"}
+        peaks: dict[str, float] = {}
+        for mode, param in peak_params.items():
+            val = gcmd.get_float(param, None, above=0.0)
+            if val is not None:
+                peaks[mode] = val
+        missing_peak = sorted(m for m in modes if m not in peaks)
+        if missing_peak:
             raise gcmd.error(
-                "PIN= requires RATIO= (C00.06 inertia ratio in %); run "
-                "SERVO_CALIBRATE_INERTIA_RATIO if you do not know it"
+                "PIN=%s requires %s (the FRF peak in Hz per mode); run "
+                "SERVO_MEASURE_COMPLIANCE, which reports f_peak per mode"
+                % (
+                    "".join(m.upper() for m in sorted(modes)),
+                    ", ".join(peak_params[m] for m in missing_peak),
+                )
             )
         return {
             "modes": modes,
-            "ratio": ratio,
+            "peaks": peaks,
             "zeta": zeta,
             "pin_lead_us": pin_lead_us,
         }
@@ -1789,7 +1799,6 @@ class DynamicsFitCommands(MeasureCommands):
                 % (", ".join(m.upper() for m in missing), updated["modes"])
             )
         updated["pin_lead_us"] = pin["pin_lead_us"]
-        r = pin["ratio"] / 100.0
         for mode_i, mode in enumerate(updated["modes"]):
             if mode not in modes:
                 continue
@@ -1799,12 +1808,31 @@ class DynamicsFitCommands(MeasureCommands):
                     "give %s_FREQ= now or set it in the baseline"
                     % (mode.upper(), mode, mode.upper())
                 )
-            pin_mass = updated["mass"][mode_i] * r / (1.0 + r)
+            f_b = 1.0 / (
+                2.0 * math.pi * math.sqrt(updated["compliance"][mode_i])
+            )
+            f_peak = pin["peaks"][mode]
+            if not f_peak > f_b:
+                raise gcmd.error(
+                    "PIN=%s peak %.1f Hz must sit above the notch f_b "
+                    "%.1f Hz" % (mode.upper(), f_peak, f_b)
+                )
+            fraction = 1.0 - (f_b / f_peak) ** 2
+            pin_mass = updated["mass"][mode_i] * fraction
             updated["pin_mass"][mode_i] = pin_mass
             updated["pin_zeta"][mode_i] = pin["zeta"]
             changed.append(
-                "%s: pinned m_L=%.3gkg zeta=%.3g lead=%.0fus"
-                % (mode, pin_mass, pin["zeta"], pin["pin_lead_us"])
+                "%s: pinned m_L=%.2f*mass=%.3gkg (f_b %.1f / peak %.1f) "
+                "zeta=%.3g lead=%.0fus"
+                % (
+                    mode,
+                    fraction,
+                    pin_mass,
+                    f_b,
+                    f_peak,
+                    pin["zeta"],
+                    pin["pin_lead_us"],
+                )
             )
 
     def _apply_compliance(
@@ -1917,7 +1945,8 @@ class DynamicsFitCommands(MeasureCommands):
         "the band), compliance_flanks_incoherent, "
         "compliance_peak_below_notch (model violation - do not apply). "
         "Measurement only: it changes nothing on the drives - it prints "
-        "the ready-to-run SERVO_SET_COMPLIANCE line, which writes the v7 "
+        "the ready-to-run SERVO_SET_COMPLIANCE line (with X_PEAK/Y_PEAK "
+        "so it is pin-complete), which writes the v7 "
         "profile and streams it live; point [ethercat_node] "
         "dynamics_profile at the written TOML to survive RESTART. Params "
         "MODE=XY|X|Y FREQ_START (60) FREQ_END (320) HZ_PER_SEC (1) "
@@ -2054,6 +2083,7 @@ class DynamicsFitCommands(MeasureCommands):
         finally:
             self._active_run = None
         freq_by_mode = {}
+        peak_by_mode = {}
         flagged = []
         for step in results.get("steps", []):
             comp = step.get("compliance")
@@ -2064,15 +2094,20 @@ class DynamicsFitCommands(MeasureCommands):
                     "%s: %s" % (step["name"], ",".join(step["flags"]))
                 )
             freq_by_mode[comp["mode"]] = comp["f_notch_hz"]
+            peak = comp.get("f_peak_hz")
+            if peak is not None:
+                peak_by_mode[comp["mode"]] = peak
         if not freq_by_mode:
             raise gcmd.error(
                 "the analysis produced no compliance results - is servo-cal "
                 "up to date? (rebuild with ./install.sh)"
             )
-        apply_line = "SERVO_SET_COMPLIANCE " + " ".join(
-            "%s_FREQ=%.1f" % (m.upper(), f)
-            for m, f in sorted(freq_by_mode.items())
-        )
+        parts = []
+        for m, f in sorted(freq_by_mode.items()):
+            parts.append("%s_FREQ=%.1f" % (m.upper(), f))
+            if m in peak_by_mode:
+                parts.append("%s_PEAK=%.1f" % (m.upper(), peak_by_mode[m]))
+        apply_line = "SERVO_SET_COMPLIANCE " + " ".join(parts)
         if flagged:
             gcmd.respond_info(
                 "flagged steps: %s - re-measure before applying; to "
