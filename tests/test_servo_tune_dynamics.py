@@ -1101,3 +1101,83 @@ def test_measure_compliance_single_mode():
     assert len(engine.buzzes) == 1
     manifest = _manifest_for(sc)
     assert [s["name"] for s in manifest["steps"]] == ["y"]
+
+def _run_dir_for(sc):
+    return os.path.dirname(
+        sc.printer.lookup_object("servo_capture").starts[0][0]
+    )
+
+
+@requires_tomllib
+def test_tune_dynamics_resume_replays_all_rounds_without_capturing():
+    sc1, _gcode, _path = make_calibration()
+    sc1.fake_rms_fn = quadratic_rms(mass_opt=[0.030, 0.045])
+    sc1.cmd_SERVO_TUNE_DYNAMICS(FakeGcmd(TERMS="MASS"))
+    old_dir = _run_dir_for(sc1)
+    tune1 = _manifest_for(sc1)["dynamics_tune"]
+    with open(tune1["profile"], "rb") as f:
+        prof1 = tomllib.load(f)
+
+    sc2, _gcode2, _path2 = make_calibration()
+    # deliberately DIFFERENT fake bench: a full replay must never capture,
+    # so the resumed tune has to land on the exact same profile anyway
+    sc2.fake_rms_fn = quadratic_rms(mass_opt=[0.014, 0.022])
+    gcmd = FakeGcmd(TERMS="MASS", RESUME=old_dir)
+    sc2.cmd_SERVO_TUNE_DYNAMICS(gcmd)
+    assert sc2.printer.lookup_object("servo_capture").starts == []
+    assert any("replayed from" in r for r in gcmd.responses)
+    profiles = [
+        os.path.join(sc2.dynamics_dir, n) for n in os.listdir(sc2.dynamics_dir)
+    ]
+    assert len(profiles) == 1
+    with open(profiles[0], "rb") as f:
+        prof2 = tomllib.load(f)
+    assert prof2["mass"] == pytest.approx(prof1["mass"])
+
+
+@requires_tomllib
+def test_tune_dynamics_resume_continues_capturing_after_the_crash_point():
+    sc1, _gcode, _path = make_calibration()
+    sc1.fake_rms_fn = quadratic_rms(mass_opt=[0.030, 0.045])
+    sc1.cmd_SERVO_TUNE_DYNAMICS(FakeGcmd(TERMS="MASS"))
+    old_dir = _run_dir_for(sc1)
+    tune1 = _manifest_for(sc1)["dynamics_tune"]
+    n_rounds = len(tune1["rounds"])
+    assert n_rounds >= 3
+    # simulate the crash: the last two rounds' fits never made it to disk
+    for i in (n_rounds - 1, n_rounds - 2):
+        os.remove(os.path.join(old_dir, "ferr_r%d.json" % i))
+
+    sc2, _gcode2, _path2 = make_calibration()
+    sc2.fake_rms_fn = quadratic_rms(mass_opt=[0.030, 0.045])
+    sc2.cmd_SERVO_TUNE_DYNAMICS(FakeGcmd(TERMS="MASS", RESUME=old_dir))
+    starts = sc2.printer.lookup_object("servo_capture").starts
+    assert len(starts) == 2, "only the missing rounds may be recaptured"
+    tune2 = _manifest_for(sc2)["dynamics_tune"]
+    with open(tune2["profile"], "rb") as f:
+        prof2 = tomllib.load(f)
+    with open(tune1["profile"], "rb") as f:
+        prof1 = tomllib.load(f)
+    assert prof2["mass"] == pytest.approx(prof1["mass"])
+
+
+@requires_tomllib
+def test_tune_dynamics_resume_rejects_mismatched_settings():
+    sc1, _gcode, _path = make_calibration()
+    sc1.fake_rms_fn = quadratic_rms(mass_opt=[0.030, 0.045])
+    sc1.cmd_SERVO_TUNE_DYNAMICS(FakeGcmd(TERMS="MASS"))
+    old_dir = _run_dir_for(sc1)
+
+    sc2, _gcode2, _path2 = make_calibration()
+    with pytest.raises(RuntimeError, match="differ"):
+        sc2.cmd_SERVO_TUNE_DYNAMICS(
+            FakeGcmd(TERMS="MASS", STEP="0.3", RESUME=old_dir)
+        )
+
+
+@requires_tomllib
+def test_tune_dynamics_resume_rejects_non_tune_run_dir():
+    sc, _gcode, _path = make_calibration()
+    bogus = tempfile.mkdtemp()
+    with pytest.raises(RuntimeError, match="manifest.json"):
+        sc.cmd_SERVO_TUNE_DYNAMICS(FakeGcmd(TERMS="MASS", RESUME=bogus))

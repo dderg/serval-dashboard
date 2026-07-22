@@ -472,10 +472,19 @@ baseline and configured lead, and writes nothing; `resonance_detected`
 only warns. The baseline is `PROFILE=`, else the model left live by
 the previous tune this session, else the node-level `[ethercat_node]
 dynamics_profile` (per-motor profiles are not supported) — chained
-tunes refine each other's output, not the configured profile. Params:
-`MAX_ACCEL` `MAX_SPEED` `STEP` (0.15) `TERMS`
-(MASS,VISCOUS,COULOMB,LEAD) `NAME` (tune) `PROFILE` `SERVOS` `BOUND`
-`SMALL_SIZE`.
+tunes refine each other's output, not the configured profile.
+
+A crashed or killed tune can be **resumed** without repeating its
+captures: `RESUME=<old run dir>` replays each round from the old run's
+`ferr_r<i>.json` fit instead of capturing (the coordinate descent is
+deterministic, so round *i* reproduces the same trial), then picks up
+with real captures at the first round the old run is missing. It
+requires the identical command line (the old run's `stroke_plan` is
+checked and mismatches abort) and the same live baseline model — do
+not change the profile, gains, or geometry between the crash and the
+resume. Params: `MAX_ACCEL` `MAX_SPEED` `STEP` (0.15) `TERMS`
+(MASS,VISCOUS,COULOMB,LEAD) `NAME` (tune) `PROFILE` `RESUME` `SERVOS`
+`BOUND` `SMALL_SIZE`.
 
 #### SERVO_SET_COMPLIANCE
 Writes the per-mode **belt-compliance feedforward** term `1/ω_b²`
