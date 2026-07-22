@@ -25,8 +25,44 @@ const FRF_BOXES: { key: "mag_db" | "phase_deg" | "coherence" | "torque_db"; titl
   { key: "torque_db", title: "torque FRF", yTitle: "torque (dB)" },
 ];
 
+/// A compliance step reuses the differential FRF boxes: same
+/// magnitude/phase/coherence payload, no torque leg (the FRF *is*
+/// torque→position), and the notch/peak stand in for the mode markers.
+function complianceAsDifferential(step: PlotStep): DifferentialPlot | null {
+  const c = step.compliance;
+  if (!c) return null;
+  const modes: FrfMode[] = [
+    {
+      freq_hz: c.notch_hz,
+      gain: 0,
+      gain_db: 0,
+      damping: null,
+      coherence: c.coherence_min,
+    },
+  ];
+  if (c.peak_hz != null) {
+    modes.push({
+      freq_hz: c.peak_hz,
+      gain: 0,
+      gain_db: 0,
+      damping: null,
+      coherence: c.coherence_min,
+    });
+  }
+  return {
+    freq_hz: c.freq_hz,
+    mag_db: c.mag_db,
+    phase_deg: c.phase_deg,
+    coherence: c.coherence,
+    torque_db: c.freq_hz.map(() => 0),
+    coherence_min: c.coherence_min,
+    band: c.band,
+    modes,
+  };
+}
+
 function differentialSeries(step: PlotStep): DifferentialPlot | null {
-  const d = step.differential;
+  const d = step.differential ?? complianceAsDifferential(step);
   if (!d) return null;
   const n = d.freq_hz.length;
   for (const spec of FRF_BOXES) {
@@ -89,6 +125,14 @@ function differentialResultStep(runName: string | null, stepName: string): Diffe
   return (step && step.differential) || null;
 }
 
+function complianceResultStep(runName: string | null, stepName: string) {
+  if (runName === null) return null;
+  const detail = detailData(runName);
+  const step =
+    detail && detail.results && detail.results.steps.find((s) => s.name === stepName);
+  return (step && step.compliance) || null;
+}
+
 /// The newest selected run with a differential step drives the mode markers,
 /// the coherence threshold, and the mode table; every selected run's traces
 /// overlay on the four shared-x boxes.
@@ -103,7 +147,11 @@ function renderFrfCharts(names: string[], plots: PlotSeries[]) {
   modesEl.innerHTML = "";
   meta.textContent = "";
   const stepNames = [
-    ...new Set(plots.flatMap((p) => p.steps.filter((s) => s.differential).map((s) => s.name))),
+    ...new Set(
+      plots.flatMap((p) =>
+        p.steps.filter((s) => s.differential || s.compliance).map((s) => s.name)
+      )
+    ),
   ];
   if (!stepNames.length) {
     section.hidden = true;
@@ -124,7 +172,12 @@ function renderFrfCharts(names: string[], plots: PlotSeries[]) {
       }
     }
     if (!ref) throw new Error(`${stepName}: no plot carries a differential series`);
+    const result = differentialResultStep(refName, stepName);
+    const compliance = complianceResultStep(refName, stepName);
     for (const spec of FRF_BOXES) {
+      // A compliance step's FRF *is* torque→position; there is no
+      // separate torque leg to chart.
+      if (compliance && spec.key === "torque_db") continue;
       const opts: PsdBoxOpts = { linear: true };
       if (spec.key === "mag_db") opts.markers = frfModeMarkers(ref.modes);
       if (spec.key === "coherence") {
@@ -141,10 +194,13 @@ function renderFrfCharts(names: string[], plots: PlotSeries[]) {
         )
       );
     }
-    const result = differentialResultStep(refName, stepName);
     const label = result
       ? `${result.pair.join(" vs ")} — ${result.segments} Welch segments`
-      : refName ?? "?";
+      : compliance
+        ? `f_b ${compliance.f_notch_hz.toFixed(1)} Hz — notch ` +
+          `${compliance.notch_depth_db.toFixed(1)} dB — ` +
+          `${compliance.segments} Welch segments`
+        : (refName ?? "?");
     modesEl.innerHTML += `<h3>${stepName} modes — ${label}</h3>${frfModeTableHtml(ref.modes)}`;
     metaParts.push(label);
   }

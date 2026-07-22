@@ -551,7 +551,7 @@ band), `compliance_flanks_incoherent`, and
 `APPLY=1` chains the measured frequencies straight into the
 `SERVO_SET_COMPLIANCE` write-and-stream; it refuses when any step
 carries a flag. Params: `MODE=XY|X|Y` `FREQ_START` (60) `FREQ_END`
-(320) `HZ_PER_SEC` (10) `DURATION` `AMPLITUDE` (0.02 mm) `RAMP`
+(320) `HZ_PER_SEC` (5) `DURATION` `AMPLITUDE` (0.02 mm) `RAMP`
 `DWELL_MS` `NAME` (compliance) `APPLY` (0) `PROFILE` (used by APPLY).
 
 #### SERVO_CALIBRATE_INERTIA_RATIO

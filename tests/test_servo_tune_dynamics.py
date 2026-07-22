@@ -1102,6 +1102,7 @@ def test_measure_compliance_single_mode():
     manifest = _manifest_for(sc)
     assert [s["name"] for s in manifest["steps"]] == ["y"]
 
+
 def _run_dir_for(sc):
     return os.path.dirname(
         sc.printer.lookup_object("servo_capture").starts[0][0]
