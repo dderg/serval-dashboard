@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import tempfile
 
@@ -13,6 +14,48 @@ from test_servo_calibration_awd import (
     requires_tomllib,
     single_drive_rails,
 )
+
+
+class FakeAccelClient:
+    def __init__(self, samples):
+        self.samples = samples
+
+    def finish_measurements(self):
+        pass
+
+    def has_valid_samples(self):
+        return bool(self.samples)
+
+    def get_samples(self):
+        return self.samples
+
+
+class FakeAccelChip:
+    """Emits a pure tone at ``freq`` per started client; the per-step
+    amplitude is popped from ``amps`` (None -> empty capture -> n/a). The
+    three axes split the amplitude equally so the vector-magnitude bin the
+    scorer computes recovers the requested amplitude."""
+
+    def __init__(self, amps, freq, fs=1000.0, n=600):
+        self.amps = list(amps)
+        self.freq = freq
+        self.fs = fs
+        self.n = n
+        self.clients = []
+        self._i = 0
+
+    def start_internal_client(self):
+        amp = self.amps[self._i] if self._i < len(self.amps) else None
+        self._i += 1
+        samples = []
+        if amp is not None:
+            a = amp / math.sqrt(3.0)
+            for k in range(self.n):
+                x = a * math.sin(2.0 * math.pi * self.freq * (k / self.fs))
+                samples.append((100.0 + k / self.fs, x, x, x))
+        client = FakeAccelClient(samples)
+        self.clients.append(client)
+        return client
 
 
 def _pinned_profile(pin_zeta=0.05, pin_lead_us=100.0, pin_mass_x=0.3):
@@ -36,12 +79,26 @@ def _pinned_profile(pin_zeta=0.05, pin_lead_us=100.0, pin_mass_x=0.3):
     )
 
 
-def _setup(pin_mass_x=0.3, residuals=None, **profile_kw):
+def _setup(
+    pin_mass_x=0.3,
+    residuals=None,
+    accel_amps=None,
+    accel_freq=130.0,
+    **profile_kw,
+):
     """Cartesian single-drive calibration with a baseline that pins mode x,
     and a fake `analyze` that stamps each recorded step with a residual from
-    ``residuals`` (mm, aligned to step order) onto the mode's drive block."""
+    ``residuals`` (mm, aligned to step order) onto the mode's drive block.
+    When ``accel_amps`` is given, an ``adxl345 tool`` accel chip emitting a
+    per-step tone of that amplitude at ``accel_freq`` is registered."""
+    extra_objs = None
+    if accel_amps is not None:
+        extra_objs = {"adxl345 tool": FakeAccelChip(accel_amps, accel_freq)}
     sc, gcode = make_calibration(
-        single_drive_rails(), coupled=False, reactor=FakeReactor(tick=0.0)
+        single_drive_rails(),
+        coupled=False,
+        reactor=FakeReactor(tick=0.0),
+        extra_objs=extra_objs,
     )
     node = sc.printer.lookup_object("ethercat_node xy_drives")
     path = os.path.join(tempfile.mkdtemp(), "baseline.toml")
@@ -262,3 +319,82 @@ def test_pin_sweep_amplitude_config_default_drives_the_tone():
     engine = sc.printer.lookup_object("motion_engine")
     amps = {b[5] for b in engine.buzzes}
     assert amps == {25000}, amps
+
+
+@requires_tomllib
+def test_pin_sweep_reports_accel_column_and_minimum():
+    # residual minimum at ZETA=0.06 (idx 2); accel minimum also there, so
+    # the two agree and no disagreement note is printed.
+    sc, _gcode, _node, _path = _setup(
+        residuals=[5.0e-3, 2.0e-3, 1.0e-3, 3.0e-3],
+        accel_amps=[3.0, 2.0, 1.0, 4.0],
+        accel_freq=130.0,
+    )
+    gcmd = FakeGcmd(
+        MODE="X",
+        FREQ="130",
+        PARAM="ZETA",
+        VALUES="0.02,0.04,0.06,0.08",
+        DWELL="1",
+        ACCEL_CHIP="adxl345 tool",
+    )
+    sc.cmd_SERVO_SWEEP_PIN(gcmd)
+    report = " ".join(gcmd.responses)
+    # per-step accel values flow into the table (mm/s^2 at the tone)
+    assert "3.0 mm/s^2" in report
+    assert "1.0 mm/s^2" in report
+    # residual verdict unchanged, plus an accel-minimum line that agrees
+    assert "minimum at ZETA=0.06" in report
+    assert "accel minimum at ZETA=0.06" in report
+    assert "1.0 mm/s^2" in report
+    assert "disagrees" not in report
+
+
+@requires_tomllib
+def test_pin_sweep_accel_disagreement_is_flagged():
+    # residual minimum at ZETA=0.06 (idx 2) but accel minimum at ZETA=0.02
+    # (idx 0): the disagreement is stated and the residual still applies.
+    sc, _gcode, node, path = _setup(
+        residuals=[5.0e-3, 2.0e-3, 1.0e-3, 3.0e-3],
+        accel_amps=[1.0, 3.0, 4.0, 5.0],
+        accel_freq=130.0,
+    )
+    gcmd = FakeGcmd(
+        MODE="X",
+        FREQ="130",
+        PARAM="ZETA",
+        VALUES="0.02,0.04,0.06,0.08",
+        DWELL="1",
+        ACCEL_CHIP="adxl345 tool",
+    )
+    sc.cmd_SERVO_SWEEP_PIN(gcmd)
+    report = " ".join(gcmd.responses)
+    assert "accel minimum at ZETA=0.02" in report
+    assert "disagrees" in report
+    assert "residual still picks" in report
+    # the applied value is still the residual winner (X_ZETA=0.06)
+    assert "X_ZETA=0.06" in report
+
+
+@requires_tomllib
+def test_pin_sweep_accel_empty_capture_reports_na():
+    # the middle step's accel capture yields no samples -> n/a, never a
+    # fake zero; the other steps still report real accel values.
+    sc, _gcode, _node, _path = _setup(
+        residuals=[5.0e-3, 1.0e-3, 3.0e-3],
+        accel_amps=[3.0, None, 2.0],
+        accel_freq=130.0,
+    )
+    gcmd = FakeGcmd(
+        MODE="X",
+        FREQ="130",
+        PARAM="ZETA",
+        VALUES="0.02,0.04,0.06",
+        DWELL="1",
+        ACCEL_CHIP="adxl345 tool",
+    )
+    sc.cmd_SERVO_SWEEP_PIN(gcmd)
+    report = " ".join(gcmd.responses)
+    assert "/ n/a" in report
+    assert "3.0 mm/s^2" in report
+    assert "2.0 mm/s^2" in report

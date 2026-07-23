@@ -36,6 +36,12 @@ from .search import RmsLineSearch
 from .search import Z as ACCEPT_Z
 from .sweep import ExperimentRun, SweepStep
 
+# Fraction of a pin-staircase dwell capture treated as the settled tail when
+# scoring the toolhead accelerometer at the tone - mirrors the pin_residual
+# scorer's settled-tail window so the residual and accel columns are
+# comparable (both drop the leading transient and score the tail).
+_PIN_ACCEL_SETTLE_TAIL = 0.5
+
 
 class DynamicsFitCommands(MeasureCommands):
     cmd_SERVO_FIT_DYNAMICS_help = (
@@ -2277,6 +2283,9 @@ class DynamicsFitCommands(MeasureCommands):
         "restored at the end (also on failure). Params MODE=X|Y FREQ (Hz) "
         "PARAM (ZETA|LEAD, ZETA) VALUES (comma list) DWELL (s, 3) "
         "AMPLITUDE (mm; config pin_sweep_amplitude, 0.01) NAME (pin_sweep) "
+        "ACCEL_CHIP (accelerometer scoring the toolhead directly; config "
+        "accel_chip, else off - measures the real spike at the tone as an "
+        "extra column and its own flagged minimum, residual still applied) "
         "PROFILE"
     )
 
@@ -2394,6 +2403,43 @@ class DynamicsFitCommands(MeasureCommands):
             )
         return rows
 
+    def _pin_accel_amplitude(
+        self, samples: list[tuple[float, float, float, float]], freq: float
+    ) -> float | None:
+        """Single-bin toolhead-accelerometer amplitude at ``freq`` (mm/s^2)
+        over the settled tail of a step capture. Mirrors the pin_residual
+        scorer's settled-tail window (drop the leading transient, score the
+        tail) so the accel and residual columns are comparable. The three
+        axes are combined as vector magnitude at the bin. Returns None when
+        the capture yielded no usable samples - never a fake zero (the same
+        honesty rule the residual scorer follows)."""
+        if not samples:
+            return None
+        start = int(len(samples) * (1.0 - _PIN_ACCEL_SETTLE_TAIL))
+        tail = samples[start:]
+        if len(tail) < 2:
+            return None
+        t0 = tail[0][0]
+        if tail[-1][0] - t0 <= 0.0:
+            return None
+        n = len(tail)
+        w = 2.0 * math.pi * freq
+        # Direct single-frequency DFT bin at the exact tone (Goertzel-style
+        # sum over the real timestamps - robust to nonuniform sampling and a
+        # non-integer bin); amplitude = 2/N * |sum x_k e^{-j w t_k}|.
+        total_sq = 0.0
+        for axis in range(3):
+            re = 0.0
+            im = 0.0
+            for sample in tail:
+                val = sample[1 + axis]
+                dt = sample[0] - t0
+                re += val * math.cos(w * dt)
+                im += val * math.sin(w * dt)
+            amp = 2.0 / n * math.hypot(re, im)
+            total_sq += amp * amp
+        return math.sqrt(total_sq)
+
     def _run_pin_staircase(
         self,
         gcmd: Any,
@@ -2414,13 +2460,21 @@ class DynamicsFitCommands(MeasureCommands):
         dwell_s: float,
         amplitude: float,
         name: str,
-    ) -> tuple[list[tuple[float, float | None]], float, float, str]:
+        accel_chip: Any = None,
+    ) -> tuple[
+        list[tuple[float, float | None, float | None]], float, float, str
+    ]:
         """Dwell a fixed tone at FREQ in the mode's frame while stepping one
         pin parameter through VALUES, re-streaming the model live per step,
-        and read each step's settled pin-residual magnitude. Restores the
-        passed ``baseline`` model at the end (also on failure), matching the
-        gain-sweep restore discipline. Returns (rows, best_value, best_res,
-        run_dir) where rows are (value, residual_mm|None). Shared by
+        and read each step's settled pin-residual magnitude. When
+        ``accel_chip`` is given, a toolhead-accelerometer capture runs over
+        each scored dwell window and the single-bin accel amplitude at the
+        tone is scored alongside the residual (an extra reported column and
+        its own flagged minimum; the residual still picks the applied
+        value). Restores the passed ``baseline`` model at the end (also on
+        failure), matching the gain-sweep restore discipline. Returns
+        (rows, best_value, best_res, run_dir) where rows are
+        (value, residual_mm|None, accel_mm_s2|None). Shared by
         SERVO_SWEEP_PIN and SERVO_TUNE_PIN."""
         row = spatial["frame"][spatial["modes"].index(mode)]
         slot_mask = 0
@@ -2473,6 +2527,7 @@ class DynamicsFitCommands(MeasureCommands):
         self._prep("X", 0)
         self._prep("Y", 0)
         tone_end = 0.0
+        accels: list[float | None] = []
         try:
             for i, value in enumerate(values):
                 # The endpoint refuses a new buzz while one is armed: wait
@@ -2502,11 +2557,30 @@ class DynamicsFitCommands(MeasureCommands):
                 # scored window opens.
                 reactor.pause(reactor.monotonic() + ramp)
                 t_start = round(reactor.monotonic(), 3)
+                # The toolhead accelerometer captures the same scored dwell
+                # window as the pin-residual capture, so its settled-tail
+                # bin lines up with the residual's.
+                aclient = (
+                    None
+                    if accel_chip is None
+                    else accel_chip.start_internal_client()
+                )
                 self._start_capture(step_name, step_servos)
                 try:
                     reactor.pause(reactor.monotonic() + dwell_s)
                 finally:
                     self._stop_capture()
+                    if aclient is not None:
+                        aclient.finish_measurements()
+                if aclient is None:
+                    accels.append(None)
+                else:
+                    samples = (
+                        list(aclient.get_samples())
+                        if aclient.has_valid_samples()
+                        else []
+                    )
+                    accels.append(self._pin_accel_amplitude(samples, freq))
                 run.record_step(
                     SweepStep(
                         step_name,
@@ -2526,10 +2600,27 @@ class DynamicsFitCommands(MeasureCommands):
                 node.set_live_dynamics_profile(profile_path)
             finally:
                 self._active_run = None
-        rows = self._pin_sweep_scores(gcmd, results, values)
+        scored = self._pin_sweep_scores(gcmd, results, values)
+        rows = [(v, r, a) for (v, r), a in zip(scored, accels)]
         best_value, best_res = min(
-            ((v, r) for v, r in rows if r is not None), key=lambda t: t[1]
+            ((v, r) for v, r in scored if r is not None), key=lambda t: t[1]
         )
+        accel_scored = [(v, a) for v, _r, a in rows if a is not None]
+        if accel_scored:
+            best_accel_value, best_accel = min(accel_scored, key=lambda t: t[1])
+            note = ""
+            if best_accel_value != best_value:
+                note = (
+                    " | NOTE: accel minimum (%s=%g) disagrees with the "
+                    "residual verdict (%s=%g); residual still picks the "
+                    "applied value"
+                    % (param, best_accel_value, param, best_value)
+                )
+            gcmd.respond_info(
+                "pin sweep accel (mode %s): accel minimum at %s=%g "
+                "(%.1f mm/s^2)%s"
+                % (mode, param, best_accel_value, best_accel, note)
+            )
         return rows, best_value, best_res, run.run_dir
 
     def cmd_SERVO_SWEEP_PIN(self, gcmd: Any) -> None:
@@ -2581,6 +2672,7 @@ class DynamicsFitCommands(MeasureCommands):
                 "ethercat_node %s has no engine handle" % (node.name,)
             )
         engine = self.printer.lookup_object("motion_engine")
+        accel_chip, _accel_name = self._accel_chip(gcmd)
         profile_path, baseline = self._load_baseline_dynamics(gcmd, node)
         if mode not in baseline["modes"]:
             raise gcmd.error(
@@ -2625,11 +2717,25 @@ class DynamicsFitCommands(MeasureCommands):
             dwell_s,
             amplitude,
             name,
+            accel_chip,
         )
-        table = ", ".join(
-            "%g -> %s" % (v, "%.2f um" % (r * 1e3,) if r is not None else "n/a")
-            for v, r in rows
-        )
+        accel_on = any(a is not None for _v, _r, a in rows)
+
+        def _fmt_res(r: float | None) -> str:
+            return "n/a" if r is None else "%.2f um" % (r * 1e3,)
+
+        def _fmt_acc(a: float | None) -> str:
+            return "n/a" if a is None else "%.1f mm/s^2" % (a,)
+
+        if accel_on:
+            table = ", ".join(
+                "%g -> %s / %s" % (v, _fmt_res(r), _fmt_acc(a))
+                for v, r, a in rows
+            )
+        else:
+            table = ", ".join(
+                "%g -> %s" % (v, _fmt_res(r)) for v, r, _a in rows
+            )
         # Reconstruct the FRF peak the baseline pin encodes so the printed
         # line is fully specified: pin_mass = mass*(1-(f_b/f_peak)^2).
         comp = baseline["compliance"][mode_i]
@@ -2661,7 +2767,10 @@ class DynamicsFitCommands(MeasureCommands):
             param=param,
             values=values,
             residuals_um=[
-                None if r is None else round(r * 1e3, 4) for _v, r in rows
+                None if r is None else round(r * 1e3, 4) for _v, r, _a in rows
+            ],
+            accel_mm_s2=[
+                None if a is None else round(a, 4) for _v, _r, a in rows
             ],
             best_value=best_value,
             run_dir=run_dir,
@@ -2710,7 +2819,8 @@ class DynamicsFitCommands(MeasureCommands):
         "LEAD_VALUES (0,150,300,450,600) "
         "ZETA_COARSE (0.02,0.035,0.05,0.08,0.12,0.2,0.3) "
         "X_FREQ Y_FREQ X_PEAK Y_PEAK (Hz, skip a mode's measurement) "
-        "NAME (pin_tune) PROFILE"
+        "ACCEL_CHIP (toolhead accel scoring on every ladder stage; config "
+        "accel_chip, else off) NAME (pin_tune) PROFILE"
     )
 
     def cmd_SERVO_TUNE_PIN(self, gcmd: Any) -> None:
@@ -2757,6 +2867,7 @@ class DynamicsFitCommands(MeasureCommands):
                 "ethercat_node %s has no engine handle" % (node.name,)
             )
         engine = self.printer.lookup_object("motion_engine")
+        accel_chip, _accel_name = self._accel_chip(gcmd)
         profile_path, baseline = self._load_baseline_dynamics(gcmd, node)
         missing = [m for m in modes if m not in baseline["modes"]]
         if missing:
@@ -2873,6 +2984,7 @@ class DynamicsFitCommands(MeasureCommands):
                     dwell_s,
                     amplitude,
                     name,
+                    accel_chip,
                 )
                 working["pin_zeta"][mode_i] = coarse_win
                 fine_lo = coarse_win / 1.6
@@ -2899,6 +3011,7 @@ class DynamicsFitCommands(MeasureCommands):
                     dwell_s,
                     amplitude,
                     name,
+                    accel_chip,
                 )
                 working["pin_zeta"][mode_i] = fine_win
                 summary[mode] = {
@@ -2932,6 +3045,7 @@ class DynamicsFitCommands(MeasureCommands):
                 dwell_s,
                 amplitude,
                 name,
+                accel_chip,
             )
             working["pin_lead_us"] = lead_win
             out_path = self._write_dynamics_toml(

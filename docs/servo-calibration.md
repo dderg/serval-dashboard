@@ -52,7 +52,7 @@ they are configured or passed.
 | `travel_speed` | `100` | CoreXY centering moves between grid points |
 | `compliance_amplitude` | `0.02` | default buzz amplitude (mm) for the compliance identification sweep (`SERVO_MEASURE_COMPLIANCE AMPLITUDE=`, `SERVO_TUNE_PIN MEASURE_AMPLITUDE=`) |
 | `pin_sweep_amplitude` | `0.01` | default dwell-tone amplitude (mm) for the pin staircases (`SERVO_SWEEP_PIN`/`SERVO_TUNE_PIN` `AMPLITUDE=`) |
-| `accel_chip` | — | accelerometer section name (e.g. `adxl345`); when set, `SERVO_CALIBRATE_GAINS` also records vibration per step (`ACCEL_CHIP=`) |
+| `accel_chip` | — | accelerometer section name (e.g. `adxl345`); when set, `SERVO_CALIBRATE_GAINS` records vibration per step and the pin staircases (`SERVO_SWEEP_PIN`/`SERVO_TUNE_PIN`) score the toolhead accel at the tone (`ACCEL_CHIP=`) |
 | `captures_root` | `~/printer_data/logs/servo_captures` | parent directory for experiment run directories |
 | `journal_params` | — | comma list of drive SDO addresses (`addr[:type]`, e.g. `0x2001.0x31:u16`) read back from every captured drive at run start and recorded under `ambient.journal_params` in the manifest — the campaign's varied registers (notch mode, etc.) |
 | `servo_cal_binary` | `target/snapshot/servo-cal` | path to the `servo-cal` analysis binary |
@@ -677,7 +677,23 @@ the swept mode must be actively pinned (`pin_mass > 0`; pin it first with
 current. Params: `MODE=X|Y` `FREQ` (Hz) `PARAM` (`ZETA`|`LEAD`, default
 `ZETA`) `VALUES` (comma list, 2..12, each validated by the
 `SERVO_SET_COMPLIANCE` `ZETA`/`PIN_LEAD_US` rules) `DWELL` (s, default 3,
-min 1) `AMPLITUDE` (mm, 0.01; config `pin_sweep_amplitude`) `NAME` (pin_sweep) `PROFILE`.
+min 1) `AMPLITUDE` (mm, 0.01; config `pin_sweep_amplitude`) `NAME` (pin_sweep) `ACCEL_CHIP` `PROFILE`.
+
+**Toolhead accelerometer scoring (optional).** With `ACCEL_CHIP=` (or the
+`[servo_calibration] accel_chip` config default; omit both to leave it off)
+each step also runs an accelerometer capture over the same scored dwell
+window and reports an extra `mm/s²` column: the single-bin accel amplitude
+at the tone frequency (a direct DFT bin over the settled tail, windowed the
+same way as the pin-residual scorer so the two columns are comparable), the
+three axes combined as vector magnitude. The pin-residual verdict is
+unchanged — it still picks the applied value — but the command additionally
+prints the accel-minimum step and, when it disagrees with the residual
+minimum, says so explicitly. The residual is what the drive *thinks* it left
+behind; the accelerometer measures the real toolhead, so this scores the
+physical spike directly. Suggested use: set `FREQ` to the old coupled peak
+(or the mode's `f_b`) and pick the `ZETA`/`LEAD` that minimizes the measured
+toolhead accel there. Steps whose capture yields no samples report `n/a`,
+never a fake zero (the same honesty rule as the residual column).
 
 #### SERVO_TUNE_PIN
 The full measured pin-rotor tuning campaign, chaining the identification

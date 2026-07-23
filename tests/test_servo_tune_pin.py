@@ -10,6 +10,7 @@ from test_servo_calibration_awd import (
     requires_tomllib,
     single_drive_rails,
 )
+from test_servo_sweep_pin import FakeAccelChip
 
 
 def _pinned_profile():
@@ -42,9 +43,15 @@ ZETA_TARGET = {"x": 0.06, "y": 0.15}
 LEAD_TARGET = 300.0
 
 
-def _setup():
+def _setup(accel_amps=None, accel_freq=131.5):
+    extra_objs = None
+    if accel_amps is not None:
+        extra_objs = {"adxl345 tool": FakeAccelChip(accel_amps, accel_freq)}
     sc, gcode = make_calibration(
-        single_drive_rails(), coupled=False, reactor=FakeReactor(tick=0.0)
+        single_drive_rails(),
+        coupled=False,
+        reactor=FakeReactor(tick=0.0),
+        extra_objs=extra_objs,
     )
     node = sc.printer.lookup_object("ethercat_node xy_drives")
     path = os.path.join(tempfile.mkdtemp(), "baseline.toml")
@@ -285,3 +292,53 @@ def _make_set_calibration():
         )
     node.dynamics_profile = path
     return sc, gcode, path
+
+
+@requires_tomllib
+def test_tune_pin_scores_accel_on_every_ladder_stage():
+    # MODES=X keeps every staircase (coarse 7, fine 5, lead 5) at the same
+    # tone f_b, so the chip's fixed-frequency tone lines up. The accel
+    # minimum line surfaces once per stage and the pin verdict is unchanged.
+    n_steps = 7 + 5 + 5
+    amps = [1.0 + 0.1 * i for i in range(n_steps)]
+    sc, _gcode, node, path = _setup(accel_amps=amps, accel_freq=131.5)
+    gcmd = FakeGcmd(
+        MODES="X",
+        DWELL="1",
+        X_FREQ="131.5",
+        X_PEAK="200",
+        ACCEL_CHIP="adxl345 tool",
+    )
+    sc.cmd_SERVO_TUNE_PIN(gcmd)
+    report = " ".join(gcmd.responses)
+    # one accel-minimum line per staircase stage (coarse, fine, lead)
+    assert report.count("pin sweep accel (mode x)") == 3
+    assert "accel minimum at ZETA=" in report
+    assert "accel minimum at LEAD=" in report
+    # a client was started for every scored step across all stages
+    chip = sc.printer.lookup_object("adxl345 tool")
+    assert len(chip.clients) == n_steps
+    # residual verdict still drives the applied model + written profile
+    assert node.live_dynamics_profile != path
+    assert "X_ZETA=" in report
+
+
+@requires_tomllib
+def test_tune_pin_accel_empty_capture_scores_nothing():
+    # Every step's accel capture is empty: no accel-minimum line is printed
+    # (no fake zero wins) while the residual tune proceeds normally.
+    n_steps = 7 + 5 + 5
+    sc, _gcode, node, path = _setup(
+        accel_amps=[None] * n_steps, accel_freq=131.5
+    )
+    gcmd = FakeGcmd(
+        MODES="X",
+        DWELL="1",
+        X_FREQ="131.5",
+        X_PEAK="200",
+        ACCEL_CHIP="adxl345 tool",
+    )
+    sc.cmd_SERVO_TUNE_PIN(gcmd)
+    report = " ".join(gcmd.responses)
+    assert "pin sweep accel" not in report
+    assert node.live_dynamics_profile != path
