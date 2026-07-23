@@ -529,8 +529,10 @@ pinned inertia is `pin_mass = mass·(1 − (f_b/f_peak)²)`. This replaces
 the old `RATIO`/C00.06 source: C00.06 is a per-drive gain-scheduling
 number, not per-mode physics, whereas the IV FRF's peak/notch ratio
 recovers the open-loop plant and gives the load fraction per mode.
-`ZETA` (default `0.02`)
-is the belt damping ratio for the predictor decay and `PIN_LEAD_US`
+`X_ZETA`/`Y_ZETA` (default `0.02`)
+set the per-mode belt damping ratio for the predictor decay — `ZETA`
+is the shared fallback for a pinned mode that omits its own — and
+`PIN_LEAD_US`
 (default `0`) the pin torque's phase lead in microseconds; because the
 pin term lives at `f_b`, the lead is tuned by minimizing the mode's line
 in the rotor following-error PSD (or the pin residual telemetry once it
@@ -549,8 +551,9 @@ is written as a new timestamped v7 TOML (v8 when a `PIN` mode is set;
 never overwriting) and left live until `RESTART`. Requires the matching
 kalico build on both sides (profile / wire schema v7, v8 for pin).
 Params: `X_FREQ` `Y_FREQ` (Hz, ≥ 20; 0 disables) `PIN` (0)
-`X_PEAK` `Y_PEAK` (Hz, FRF peak, required per pinned mode) `ZETA`
-(0.02) `PIN_LEAD_US` (0) `NAME` (compliance) `PROFILE` `SERVOS`.
+`X_PEAK` `Y_PEAK` (Hz, FRF peak, required per pinned mode) `X_ZETA`
+`Y_ZETA` (per-mode damping) `ZETA` (0.02, shared fallback)
+`PIN_LEAD_US` (0) `NAME` (compliance) `PROFILE` `SERVOS`.
 
 #### SERVO_MEASURE_COMPLIANCE
 Measures the locked-rotor belt frequency `f_b` per Cartesian mode —
@@ -577,6 +580,11 @@ position, and plant zeros don't care who generated the torque. Pinned
 modes do run their predictor through buzz cycles, so accelerometer
 resonance tests (`TEST_RESONANCES`) measure the *pinned* machine —
 tune the input shaper from those with the pin in its print-time state.
+Keep the two roles distinct: `SERVO_MEASURE_COMPLIANCE` is the
+*identification* tool (it recovers `f_b`/`f_peak` and changes nothing),
+while `TEST_RESONANCES` with the pin active is the *print-facing
+verification* that the shaped, pinned machine actually rings where the
+model predicts.
 
 The estimator is validated in CI against a simulated closed-loop
 two-mass plant (`servo-ident/tests/compliance_frf.rs`): it recovers
@@ -624,7 +632,7 @@ Measurement only — nothing is left applied. The pre-sweep model is
 restored at the end (also on any failure mid-sweep, the same
 restore discipline `SERVO_CALIBRATE_GAINS` uses for drive params), and
 the command prints the ready-to-run
-`SERVO_SET_COMPLIANCE PIN=… …_PEAK=… ZETA=… PIN_LEAD_US=…` line with the
+`SERVO_SET_COMPLIANCE PIN=… …_PEAK=… …_ZETA=… PIN_LEAD_US=…` line with the
 winning value substituted (measure prints, [`SERVO_SET_COMPLIANCE`](#servo_set_compliance)
 applies; the peak is reconstructed from the baseline pin so the line is
 complete, and the un-swept parameter is carried through unchanged). If
@@ -635,6 +643,45 @@ current. Params: `MODE=X|Y` `FREQ` (Hz) `PARAM` (`ZETA`|`LEAD`, default
 `ZETA`) `VALUES` (comma list, 2..12, each validated by the
 `SERVO_SET_COMPLIANCE` `ZETA`/`PIN_LEAD_US` rules) `DWELL` (s, default 3,
 min 1) `AMPLITUDE` (mm, 0.01) `NAME` (pin_sweep) `PROFILE`.
+
+#### SERVO_TUNE_PIN
+The full measured pin-rotor tuning campaign, chaining the identification
+and staircase primitives into one command so a bench operator gets a
+ready-to-keep profile in a single run. For each mode in `MODES` (XY|X|Y):
+
+1. **Identify** — unless `X_FREQ`/`X_PEAK` (resp. `Y_FREQ`/`Y_PEAK`) are
+   supplied, it runs the [`SERVO_MEASURE_COMPLIANCE`](#servo_measure_compliance)
+   machinery to get the locked-rotor notch `f_b` and the FRF peak
+   `f_peak` for that mode; pass both override params to skip the (slow)
+   measurement for a mode whose numbers you already trust.
+2. **Pin** — applies the same math as
+   [`SERVO_SET_COMPLIANCE`](#servo_set_compliance) `PIN=`
+   (`pin_mass = mass·(1 − (f_b/f_peak)²)`), seeding the mode's damping
+   at the first `ZETA_COARSE` value.
+3. **Coarse `ZETA` staircase** — dwells a constant tone at `f_b` and
+   steps `ZETA_COARSE` via the [`SERVO_SWEEP_PIN`](#servo_sweep_pin)
+   machinery, picking the settled pin-residual minimum.
+4. **Fine `ZETA` staircase** — 5 log-spaced values spanning
+   `winner/1.6 … winner·1.6` refine it; the fine winner is applied to
+   that mode's `pin_zeta`.
+
+After every mode a **single `LEAD` staircase** (`LEAD_VALUES`) runs on
+the **lowest-frequency tuned mode** and its winner is applied globally:
+`pin_lead_us` is a whole-model scalar, and the slowest mode advances the
+most degrees per microsecond, so it resolves the phase lead the finest.
+
+The tuned model is written as a fresh timestamped profile (the same
+writer [`SERVO_SET_COMPLIANCE`](#servo_set_compliance) uses) and left
+live until `RESTART`; any failure restores the pre-tune model and
+reports the partial results. The summary prints a per-mode table (`f_b`,
+`f_peak`, `zeta`, residual µm), the lead and its residual, and the
+ready-to-run `SERVO_SET_COMPLIANCE … X_ZETA=… Y_ZETA=… PIN_LEAD_US=…`
+line (per-mode `X_ZETA`/`Y_ZETA` spelling) plus the reminder to point
+`[ethercat_node] dynamics_profile` at the written TOML to keep it. Params:
+`MODES` (XY|X|Y) `DWELL` (s, 3) `AMPLITUDE` (mm, 0.01) `LEAD_VALUES`
+(`0,150,300,450,600`) `ZETA_COARSE` (`0.02,0.035,0.05,0.08,0.12,0.2,0.3`)
+`X_FREQ` `Y_FREQ` `X_PEAK` `Y_PEAK` (Hz, skip a mode's measurement)
+`NAME` (pin_tune) `PROFILE`.
 
 #### SERVO_CALIBRATE_INERTIA_RATIO
 Step 2 of tuning: identify the load inertia and print the recommended C00.06.
@@ -770,6 +817,7 @@ Schemas: [servo-cal-contracts.md](servo-cal-contracts.md).
 | `SERVO_SWEEP_INERTIA` | `servo-cal analyze` | run dir + `results.json` (no automated pick, so `APPLY=1` always errors) |
 | `SERVO_SWEEP_ACCEL` | `servo-cal analyze` | run dir + `results.json` verdict (max non-railing accel); `APPLY=1` verifies at the recommended accel (no SDO write) |
 | `SERVO_SWEEP_PIN` | `servo-cal analyze` | run dir + `results.json` (per-step settled pin-residual magnitude; prints the `value → µm` table + winning `SERVO_SET_COMPLIANCE` line; nothing applied) |
+| `SERVO_TUNE_PIN` | `servo-cal analyze` (per staircase) | run dir(s) + tuned `dynamics_<name>_<stamp>.toml` (per-mode coarse→fine `ZETA` + shared `LEAD` staircases; model stays live until RESTART; restores pre-tune model on failure) |
 | `SERVO_FIT_DYNAMICS`, `SERVO_CALIBRATE_INERTIA_RATIO` | `servo-cal fit` | run dir + `~/printer_data/config/servo_dynamics/dynamics_<name>_<stamp>.toml` + C00.06 |
 | `SERVO_TUNE_DYNAMICS` | `servo-cal fit --response ferr` (per capture) | run dir + tuned `dynamics_<name>_<stamp>.toml` when a pass beats the baseline (search is host-side; tuned model stays live until RESTART) |
 | `SERVO_MEASURE_INERTIA` | — | run dir + `.scap` capture only (the building block behind the fit commands) |

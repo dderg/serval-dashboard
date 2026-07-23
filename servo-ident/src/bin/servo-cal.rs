@@ -166,6 +166,7 @@ fn cmd_analyze(args: &[String]) {
             None,
             ff_lead,
             None,
+            true,
         )
         .unwrap_or_else(|e| die(&e));
         println!("file: {scap_path}");

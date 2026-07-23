@@ -88,7 +88,7 @@ def test_pin_sweep_picks_the_minimum_residual():
     sc.cmd_SERVO_SWEEP_PIN(gcmd)
     report = " ".join(gcmd.responses)
     assert "minimum at ZETA=0.06" in report
-    assert "ZETA=0.06" in report
+    assert "X_ZETA=0.06" in report
     # the ready-to-run line carries the reconstructed FRF peak and preserves
     # the un-swept pin lead (baseline pin_lead_us=100)
     assert "SERVO_SET_COMPLIANCE PIN=X" in report
@@ -120,7 +120,7 @@ def test_pin_sweep_sweeps_lead_and_keeps_zeta():
     ]
     assert engine.dynamics_calls[0][7][0] == 0.05
     assert "PIN_LEAD_US=150" in report
-    assert "ZETA=0.05" in report
+    assert "X_ZETA=0.05" in report
 
 
 @requires_tomllib

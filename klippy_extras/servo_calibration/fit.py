@@ -1691,13 +1691,15 @@ class DynamicsFitCommands(MeasureCommands):
         "notch f_b (X_FREQ/Y_FREQ now or nonzero baseline compliance): "
         "the per-mode load fraction is 1-(f_b/f_peak)^2 and the pinned "
         "mass is mass*fraction (run SERVO_MEASURE_COMPLIANCE, which "
-        "reports f_peak per mode). ZETA (default 0.02) is the "
-        "hold damping and PIN_LEAD_US (default 0) advances the hold. "
+        "reports f_peak per mode). X_ZETA/Y_ZETA (default 0.02) set the "
+        "per-mode hold damping (ZETA is the shared fallback for modes "
+        "without their own); PIN_LEAD_US (default 0) advances the hold. "
         "A pinned mode must have nonzero compliance (given now or in "
         "the baseline). PIN=0 clears the pins but keeps compliance. "
         "The profile is written v8 while any mode is pinned. Params "
         "X_FREQ Y_FREQ (Hz, >= 20; 0 disables) PIN (XY|X|Y|0) "
-        "X_PEAK Y_PEAK (Hz, FRF peak) ZETA (0.02) PIN_LEAD_US (us) "
+        "X_PEAK Y_PEAK (Hz, FRF peak) X_ZETA Y_ZETA ZETA (0.02) "
+        "PIN_LEAD_US (us) "
         "NAME (compliance) PROFILE SERVOS"
     )
 
@@ -1746,10 +1748,6 @@ class DynamicsFitCommands(MeasureCommands):
                         "PIN must be XY, X, Y, or 0 (got %r)" % (raw,)
                     )
                 modes.add(mode_map[ch])
-        # No upper cap: zeta >= 1 is a legitimate overdamped predictor.
-        zeta = gcmd.get_float("ZETA", 0.02, above=0.0)
-        if not math.isfinite(zeta):
-            raise gcmd.error("ZETA must be finite (got %r)" % (zeta,))
         pin_lead_us = gcmd.get_float(
             "PIN_LEAD_US", 0.0, minval=0.0, maxval=PIN_LEAD_US_MAX
         )
@@ -1769,10 +1767,27 @@ class DynamicsFitCommands(MeasureCommands):
                     ", ".join(peak_params[m] for m in missing_peak),
                 )
             )
+        # Per-mode X_ZETA/Y_ZETA override the shared ZETA fallback (kept
+        # for compat). No upper cap: zeta >= 1 is a legitimate overdamped
+        # predictor. Hard rule (matching SERVO_SET_COMPLIANCE): finite, > 0.
+        zeta_params = {"x": "X_ZETA", "y": "Y_ZETA"}
+        zeta_fallback = gcmd.get_float("ZETA", 0.02)
+        zetas: dict[str, float] = {}
+        for mode in sorted(modes):
+            raw = gcmd.get_float(zeta_params[mode], None)
+            if raw is None:
+                value, param = zeta_fallback, "ZETA"
+            else:
+                value, param = raw, zeta_params[mode]
+            if not (math.isfinite(value) and value > 0.0):
+                raise gcmd.error(
+                    "%s must be a finite number > 0 (got %r)" % (param, value)
+                )
+            zetas[mode] = value
         return {
             "modes": modes,
             "peaks": peaks,
-            "zeta": zeta,
+            "zetas": zetas,
             "pin_lead_us": pin_lead_us,
         }
 
@@ -1822,7 +1837,7 @@ class DynamicsFitCommands(MeasureCommands):
             fraction = 1.0 - (f_b / f_peak) ** 2
             pin_mass = updated["mass"][mode_i] * fraction
             updated["pin_mass"][mode_i] = pin_mass
-            updated["pin_zeta"][mode_i] = pin["zeta"]
+            updated["pin_zeta"][mode_i] = pin["zetas"][mode]
             changed.append(
                 "%s: pinned m_L=%.2f*mass=%.3gkg (f_b %.1f / peak %.1f) "
                 "zeta=%.3g lead=%.0fus"
@@ -1832,10 +1847,41 @@ class DynamicsFitCommands(MeasureCommands):
                     pin_mass,
                     f_b,
                     f_peak,
-                    pin["zeta"],
+                    pin["zetas"][mode],
                     pin["pin_lead_us"],
                 )
             )
+
+    def _write_dynamics_toml(
+        self,
+        name: str,
+        updated: dict[str, Any],
+        ff_lead_us: float,
+        source: str,
+    ) -> str:
+        """Render ``updated`` as a fresh timestamped dynamics TOML (never
+        overwriting a same-second sibling) and return its path. The single
+        profile writer shared by SERVO_SET_COMPLIANCE and SERVO_TUNE_PIN."""
+        os.makedirs(self.dynamics_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(
+            self.dynamics_dir, "dynamics_%s_%s.toml" % (name, stamp)
+        )
+        suffix = 1
+        while os.path.exists(out_path):
+            # never overwrite; same-second re-issues get a counter suffix
+            out_path = os.path.join(
+                self.dynamics_dir,
+                "dynamics_%s_%s-%d.toml" % (name, stamp, suffix),
+            )
+            suffix += 1
+        with open(out_path, "w") as f:
+            f.write(
+                render_fit_dynamics_toml(
+                    updated, updated, [], source, ff_lead_us
+                )
+            )
+        return out_path
 
     def _apply_compliance(
         self,
@@ -1893,29 +1939,12 @@ class DynamicsFitCommands(MeasureCommands):
                     "%s_FREQ nonzero or clear the pin with PIN=0"
                     % (mode, mode.upper())
                 )
-        os.makedirs(self.dynamics_dir, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(
-            self.dynamics_dir, "dynamics_%s_%s.toml" % (name, stamp)
+        out_path = self._write_dynamics_toml(
+            name,
+            updated,
+            baseline.get("ff_lead_us", 0.0),
+            "servo_set_compliance",
         )
-        suffix = 1
-        while os.path.exists(out_path):
-            # never overwrite; same-second re-issues get a counter suffix
-            out_path = os.path.join(
-                self.dynamics_dir,
-                "dynamics_%s_%s-%d.toml" % (name, stamp, suffix),
-            )
-            suffix += 1
-        with open(out_path, "w") as f:
-            f.write(
-                render_fit_dynamics_toml(
-                    updated,
-                    updated,
-                    [],
-                    "servo_set_compliance",
-                    baseline.get("ff_lead_us", 0.0),
-                )
-            )
         send_dynamics_model(engine, handle, updated)
         node.set_live_dynamics_profile(out_path)
         structured_log.event(
@@ -1931,70 +1960,24 @@ class DynamicsFitCommands(MeasureCommands):
             % (" | ".join(changed), out_path, node.name)
         )
 
-    cmd_SERVO_MEASURE_COMPLIANCE_help = (
-        "Measure the LOCKED-ROTOR belt frequency f_b per Cartesian mode "
-        "- the number SERVO_SET_COMPLIANCE wants - from a mode-patterned "
-        "swept position buzz at standstill. The analysis is the "
-        "instrumental-variable FRF from measured torque (6077h) to rotor "
-        "position with the commanded buzz as instrument: its "
-        "anti-resonance notch is exactly sqrt(k_belt/m_load)/2pi and is "
-        "invariant under the position loop (plant zeros cannot be moved "
-        "by feedback). f_b sits above the familiar coupled ringdown "
-        "frequency and below the plant's two-mass peak, which is "
-        "reported alongside as a sanity anchor. Excitation is gentle by "
-        "construction: at the notch the rotor barely moves. Flags: "
-        "compliance_notch_shallow (< 6 dB - raise AMPLITUDE or narrow "
-        "the band), compliance_flanks_incoherent, "
-        "compliance_peak_below_notch (model violation - do not apply). "
-        "Measurement only: it changes nothing on the drives - it prints "
-        "the ready-to-run SERVO_SET_COMPLIANCE line (with X_PEAK/Y_PEAK "
-        "so it is pin-complete), which writes the v7 "
-        "profile and streams it live; point [ethercat_node] "
-        "dynamics_profile at the written TOML to survive RESTART. Params "
-        "MODE=XY|X|Y FREQ_START (60) FREQ_END (320) HZ_PER_SEC (1) "
-        "DURATION AMPLITUDE (0.02) RAMP DWELL_MS NAME (compliance)"
-    )
-
-    def cmd_SERVO_MEASURE_COMPLIANCE(self, gcmd: Any) -> None:
-        kin = self._kin()
-        spatial = servo_strokes.spatial_frame(kin)
-        if spatial is None:
-            raise gcmd.error(
-                "SERVO_MEASURE_COMPLIANCE needs servo rails on X/Y - no "
-                "spatial frame available"
-            )
-        mode_req = gcmd.get("MODE", "XY").upper()
-        wanted = [m for m in ("x", "y") if m.upper() in mode_req]
-        modes = [m for m in spatial["modes"] if m in wanted]
-        if not modes:
-            raise gcmd.error(
-                "MODE=%s selects none of the spatial modes %s"
-                % (mode_req, spatial["modes"])
-            )
-        freq_start = gcmd.get_float("FREQ_START", 60.0, above=0.0)
-        freq_end = gcmd.get_float("FREQ_END", 320.0, above=freq_start)
-        if freq_end > self.MAX_BUZZ_FREQ_HZ:
-            raise gcmd.error(
-                "buzz frequencies must stay at or below %.0f Hz"
-                % (self.MAX_BUZZ_FREQ_HZ,)
-            )
-        amplitude = gcmd.get_float("AMPLITUDE", 0.02, above=0.0)
-        if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
-            raise gcmd.error(
-                "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
-                % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
-            )
-        # Slow default: more dwell per bin right where the response is
-        # smallest (the notch) and more Welch segments per band.
-        hz_per_sec = gcmd.get_float("HZ_PER_SEC", 1.0, above=0.0)
-        duration = gcmd.get_float("DURATION", 0.0, minval=0.0)
-        if duration <= 0.0:
-            duration = max((freq_end - freq_start) / hz_per_sec, 0.5)
-        ramp = gcmd.get_float(
-            "RAMP", min(0.1 * duration, 3.0 / freq_start), above=0.0
-        )
-        dwell = gcmd.get_int("DWELL_MS", self.dwell_ms, minval=0)
-        name = gcmd.get("NAME", "compliance")
+    def _run_compliance_measure(
+        self,
+        gcmd: Any,
+        spatial: dict[str, Any],
+        modes: list[str],
+        name: str,
+        freq_start: float,
+        freq_end: float,
+        hz_per_sec: float,
+        duration: float,
+        ramp: float,
+        amplitude: float,
+        dwell: int,
+    ) -> tuple[Any, dict[str, float], dict[str, float], list[str]]:
+        """Run the mode-patterned swept buzz per mode and analyze it into the
+        locked-rotor notch f_b (and FRF peak) per Cartesian mode. Returns
+        (node, freq_by_mode, peak_by_mode, flagged). Shared by
+        SERVO_MEASURE_COMPLIANCE and SERVO_TUNE_PIN's measurement stage."""
         servos = list(spatial["axes"])
         node = self._dynamics_node(gcmd, servos)
         handle = node.get_engine_handle()
@@ -2084,9 +2067,9 @@ class DynamicsFitCommands(MeasureCommands):
             results = self._analyze_and_report(gcmd, run)
         finally:
             self._active_run = None
-        freq_by_mode = {}
-        peak_by_mode = {}
-        flagged = []
+        freq_by_mode: dict[str, float] = {}
+        peak_by_mode: dict[str, float] = {}
+        flagged: list[str] = []
         for step in results.get("steps", []):
             comp = step.get("compliance")
             if comp is None:
@@ -2104,6 +2087,90 @@ class DynamicsFitCommands(MeasureCommands):
                 "the analysis produced no compliance results - is servo-cal "
                 "up to date? (rebuild with ./install.sh)"
             )
+        return node, freq_by_mode, peak_by_mode, flagged
+
+    cmd_SERVO_MEASURE_COMPLIANCE_help = (
+        "Measure the LOCKED-ROTOR belt frequency f_b per Cartesian mode "
+        "- the number SERVO_SET_COMPLIANCE wants - from a mode-patterned "
+        "swept position buzz at standstill. The analysis is the "
+        "instrumental-variable FRF from measured torque (6077h) to rotor "
+        "position with the commanded buzz as instrument: its "
+        "anti-resonance notch is exactly sqrt(k_belt/m_load)/2pi and is "
+        "invariant under the position loop (plant zeros cannot be moved "
+        "by feedback). f_b sits above the familiar coupled ringdown "
+        "frequency and below the plant's two-mass peak, which is "
+        "reported alongside as a sanity anchor. Excitation is gentle by "
+        "construction: at the notch the rotor barely moves. Flags: "
+        "compliance_notch_shallow (< 6 dB - raise AMPLITUDE or narrow "
+        "the band), compliance_flanks_incoherent, "
+        "compliance_peak_below_notch (model violation - do not apply). "
+        "Measurement only: it changes nothing on the drives - it prints "
+        "the ready-to-run SERVO_SET_COMPLIANCE line (with X_PEAK/Y_PEAK "
+        "so it is pin-complete), which writes the v7 "
+        "profile and streams it live; point [ethercat_node] "
+        "dynamics_profile at the written TOML to survive RESTART. Params "
+        "MODE=XY|X|Y FREQ_START (60) FREQ_END (320) HZ_PER_SEC (1) "
+        "DURATION AMPLITUDE (0.02) RAMP DWELL_MS NAME (compliance)"
+    )
+
+    def cmd_SERVO_MEASURE_COMPLIANCE(self, gcmd: Any) -> None:
+        kin = self._kin()
+        spatial = servo_strokes.spatial_frame(kin)
+        if spatial is None:
+            raise gcmd.error(
+                "SERVO_MEASURE_COMPLIANCE needs servo rails on X/Y - no "
+                "spatial frame available"
+            )
+        mode_req = gcmd.get("MODE", "XY").upper()
+        wanted = [m for m in ("x", "y") if m.upper() in mode_req]
+        modes = [m for m in spatial["modes"] if m in wanted]
+        if not modes:
+            raise gcmd.error(
+                "MODE=%s selects none of the spatial modes %s"
+                % (mode_req, spatial["modes"])
+            )
+        freq_start = gcmd.get_float("FREQ_START", 60.0, above=0.0)
+        freq_end = gcmd.get_float("FREQ_END", 320.0, above=freq_start)
+        if freq_end > self.MAX_BUZZ_FREQ_HZ:
+            raise gcmd.error(
+                "buzz frequencies must stay at or below %.0f Hz"
+                % (self.MAX_BUZZ_FREQ_HZ,)
+            )
+        amplitude = gcmd.get_float("AMPLITUDE", 0.02, above=0.0)
+        if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
+            raise gcmd.error(
+                "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
+                % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
+            )
+        # Slow default: more dwell per bin right where the response is
+        # smallest (the notch) and more Welch segments per band.
+        hz_per_sec = gcmd.get_float("HZ_PER_SEC", 1.0, above=0.0)
+        duration = gcmd.get_float("DURATION", 0.0, minval=0.0)
+        if duration <= 0.0:
+            duration = max((freq_end - freq_start) / hz_per_sec, 0.5)
+        ramp = gcmd.get_float(
+            "RAMP", min(0.1 * duration, 3.0 / freq_start), above=0.0
+        )
+        dwell = gcmd.get_int("DWELL_MS", self.dwell_ms, minval=0)
+        name = gcmd.get("NAME", "compliance")
+        (
+            node,
+            freq_by_mode,
+            peak_by_mode,
+            flagged,
+        ) = self._run_compliance_measure(
+            gcmd,
+            spatial,
+            modes,
+            name,
+            freq_start,
+            freq_end,
+            hz_per_sec,
+            duration,
+            ramp,
+            amplitude,
+            dwell,
+        )
         parts = []
         for m, f in sorted(freq_by_mode.items()):
             parts.append("%s_FREQ=%.1f" % (m.upper(), f))
@@ -2153,6 +2220,14 @@ class DynamicsFitCommands(MeasureCommands):
         raw = gcmd.get("VALUES", None)
         if raw is None:
             raise gcmd.error("VALUES= is required (comma list of 2..12 values)")
+        return self._coerce_pin_values(gcmd, param, raw)
+
+    def _coerce_pin_values(
+        self, gcmd: Any, param: str, raw: str
+    ) -> list[float]:
+        """Parse a comma list of pin-parameter values, validating each by
+        the SERVO_SET_COMPLIANCE rules. Shared by SERVO_SWEEP_PIN (VALUES=)
+        and SERVO_TUNE_PIN (ZETA_COARSE=/LEAD_VALUES=)."""
         parts = [p.strip() for p in raw.split(",") if p.strip()]
         if not 2 <= len(parts) <= 12:
             raise gcmd.error(
@@ -2233,78 +2308,34 @@ class DynamicsFitCommands(MeasureCommands):
             )
         return rows
 
-    def cmd_SERVO_SWEEP_PIN(self, gcmd: Any) -> None:
-        if tomllib is None:
-            raise gcmd.error("SERVO_SWEEP_PIN requires Python 3.11+ (tomllib)")
-        kin = self._kin()
-        spatial = servo_strokes.spatial_frame(kin)
-        if spatial is None:
-            raise gcmd.error(
-                "SERVO_SWEEP_PIN needs servo rails on X/Y - no spatial frame "
-                "available"
-            )
-        mode_req = gcmd.get("MODE", "").upper()
-        wanted = [m for m in ("x", "y") if m.upper() in mode_req]
-        modes = [m for m in spatial["modes"] if m in wanted]
-        if len(modes) != 1:
-            raise gcmd.error(
-                "MODE= must select exactly one spatial mode (X or Y); got "
-                "%r from %s" % (mode_req, spatial["modes"])
-            )
-        mode = modes[0]
-        freq = gcmd.get_float("FREQ", None, above=0.0)
-        if freq is None:
-            raise gcmd.error("FREQ= is required (the dwell tone in Hz)")
-        if freq < 20.0 or freq > self.MAX_BUZZ_FREQ_HZ:
-            raise gcmd.error(
-                "FREQ must be between 20 and %.0f Hz (the dwell tone, "
-                "typically f_b)" % (self.MAX_BUZZ_FREQ_HZ,)
-            )
-        param = gcmd.get("PARAM", "ZETA").upper()
-        if param not in ("ZETA", "LEAD"):
-            raise gcmd.error("PARAM must be ZETA or LEAD (got %r)" % (param,))
-        values = self._parse_pin_sweep_values(gcmd, param)
-        dwell_s = gcmd.get_float("DWELL", 3.0, minval=1.0)
-        amplitude = gcmd.get_float("AMPLITUDE", 0.01, above=0.0)
-        if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
-            raise gcmd.error(
-                "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
-                % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
-            )
-        name = gcmd.get("NAME", "pin_sweep")
-        servos = list(spatial["axes"])
-        node = self._dynamics_node(gcmd, servos)
-        handle = node.get_engine_handle()
-        if handle is None:
-            raise gcmd.error(
-                "ethercat_node %s has no engine handle" % (node.name,)
-            )
-        engine = self.printer.lookup_object("motion_engine")
-        profile_path, baseline = self._load_baseline_dynamics(gcmd, node)
-        if mode not in baseline["modes"]:
-            raise gcmd.error(
-                "mode %s not in profile %s (modes %s)"
-                % (mode, profile_path, baseline["modes"])
-            )
-        mode_i = baseline["modes"].index(mode)
-        if not baseline["pin_mass"][mode_i] > 0.0:
-            raise gcmd.error(
-                "mode %s is not pinned in the baseline (pin_mass=0) - pin it "
-                "first with SERVO_SET_COMPLIANCE PIN=%s %s_PEAK=... then "
-                "sweep" % (mode, mode.upper(), mode.upper())
-            )
-        slot_for: dict[str, int] = {}
-        invert_for: dict[str, bool] = {}
-        for servo in servos:
-            slot = node.get_slot_for_motor(servo)
-            if slot is None:
-                raise gcmd.error(
-                    "motor %r is not on node %s" % (servo, node.name)
-                )
-            slot_for[servo] = slot
-            invert_for[servo] = bool(
-                getattr(self._resolve_motor(servo), "invert_direction", False)
-            )
+    def _run_pin_staircase(
+        self,
+        gcmd: Any,
+        node: Any,
+        handle: int,
+        engine: Any,
+        servos: list[str],
+        slot_for: dict[str, int],
+        invert_for: dict[str, bool],
+        spatial: dict[str, Any],
+        baseline: dict[str, Any],
+        profile_path: str,
+        mode: str,
+        mode_i: int,
+        freq: float,
+        param: str,
+        values: list[float],
+        dwell_s: float,
+        amplitude: float,
+        name: str,
+    ) -> tuple[list[tuple[float, float | None]], float, float, str]:
+        """Dwell a fixed tone at FREQ in the mode's frame while stepping one
+        pin parameter through VALUES, re-streaming the model live per step,
+        and read each step's settled pin-residual magnitude. Restores the
+        passed ``baseline`` model at the end (also on failure), matching the
+        gain-sweep restore discipline. Returns (rows, best_value, best_res,
+        run_dir) where rows are (value, residual_mm|None). Shared by
+        SERVO_SWEEP_PIN and SERVO_TUNE_PIN."""
         row = spatial["frame"][spatial["modes"].index(mode)]
         slot_mask = 0
         sign_mask = 0
@@ -2387,20 +2418,113 @@ class DynamicsFitCommands(MeasureCommands):
                 )
             results = self._run_analyze(gcmd, run)
         finally:
-            # Restore the pre-sweep model (also on failure), matching the
-            # gain-sweep restore discipline.
+            # Restore the pre-sweep model (also on failure).
             try:
                 send_dynamics_model(engine, handle, baseline)
                 node.set_live_dynamics_profile(profile_path)
             finally:
                 self._active_run = None
         rows = self._pin_sweep_scores(gcmd, results, values)
+        best_value, best_res = min(
+            ((v, r) for v, r in rows if r is not None), key=lambda t: t[1]
+        )
+        return rows, best_value, best_res, run.run_dir
+
+    def cmd_SERVO_SWEEP_PIN(self, gcmd: Any) -> None:
+        if tomllib is None:
+            raise gcmd.error("SERVO_SWEEP_PIN requires Python 3.11+ (tomllib)")
+        kin = self._kin()
+        spatial = servo_strokes.spatial_frame(kin)
+        if spatial is None:
+            raise gcmd.error(
+                "SERVO_SWEEP_PIN needs servo rails on X/Y - no spatial frame "
+                "available"
+            )
+        mode_req = gcmd.get("MODE", "").upper()
+        wanted = [m for m in ("x", "y") if m.upper() in mode_req]
+        modes = [m for m in spatial["modes"] if m in wanted]
+        if len(modes) != 1:
+            raise gcmd.error(
+                "MODE= must select exactly one spatial mode (X or Y); got "
+                "%r from %s" % (mode_req, spatial["modes"])
+            )
+        mode = modes[0]
+        freq = gcmd.get_float("FREQ", None, above=0.0)
+        if freq is None:
+            raise gcmd.error("FREQ= is required (the dwell tone in Hz)")
+        if freq < 20.0 or freq > self.MAX_BUZZ_FREQ_HZ:
+            raise gcmd.error(
+                "FREQ must be between 20 and %.0f Hz (the dwell tone, "
+                "typically f_b)" % (self.MAX_BUZZ_FREQ_HZ,)
+            )
+        param = gcmd.get("PARAM", "ZETA").upper()
+        if param not in ("ZETA", "LEAD"):
+            raise gcmd.error("PARAM must be ZETA or LEAD (got %r)" % (param,))
+        values = self._parse_pin_sweep_values(gcmd, param)
+        dwell_s = gcmd.get_float("DWELL", 3.0, minval=1.0)
+        amplitude = gcmd.get_float("AMPLITUDE", 0.01, above=0.0)
+        if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
+            raise gcmd.error(
+                "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
+                % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
+            )
+        name = gcmd.get("NAME", "pin_sweep")
+        servos = list(spatial["axes"])
+        node = self._dynamics_node(gcmd, servos)
+        handle = node.get_engine_handle()
+        if handle is None:
+            raise gcmd.error(
+                "ethercat_node %s has no engine handle" % (node.name,)
+            )
+        engine = self.printer.lookup_object("motion_engine")
+        profile_path, baseline = self._load_baseline_dynamics(gcmd, node)
+        if mode not in baseline["modes"]:
+            raise gcmd.error(
+                "mode %s not in profile %s (modes %s)"
+                % (mode, profile_path, baseline["modes"])
+            )
+        mode_i = baseline["modes"].index(mode)
+        if not baseline["pin_mass"][mode_i] > 0.0:
+            raise gcmd.error(
+                "mode %s is not pinned in the baseline (pin_mass=0) - pin it "
+                "first with SERVO_SET_COMPLIANCE PIN=%s %s_PEAK=... then "
+                "sweep" % (mode, mode.upper(), mode.upper())
+            )
+        slot_for: dict[str, int] = {}
+        invert_for: dict[str, bool] = {}
+        for servo in servos:
+            slot = node.get_slot_for_motor(servo)
+            if slot is None:
+                raise gcmd.error(
+                    "motor %r is not on node %s" % (servo, node.name)
+                )
+            slot_for[servo] = slot
+            invert_for[servo] = bool(
+                getattr(self._resolve_motor(servo), "invert_direction", False)
+            )
+        rows, best_value, best_res, run_dir = self._run_pin_staircase(
+            gcmd,
+            node,
+            handle,
+            engine,
+            servos,
+            slot_for,
+            invert_for,
+            spatial,
+            baseline,
+            profile_path,
+            mode,
+            mode_i,
+            freq,
+            param,
+            values,
+            dwell_s,
+            amplitude,
+            name,
+        )
         table = ", ".join(
             "%g -> %s" % (v, "%.2f um" % (r * 1e3,) if r is not None else "n/a")
             for v, r in rows
-        )
-        best_value, best_res = min(
-            ((v, r) for v, r in rows if r is not None), key=lambda t: t[1]
         )
         # Reconstruct the FRF peak the baseline pin encodes so the printed
         # line is fully specified: pin_mass = mass*(1-(f_b/f_peak)^2).
@@ -2415,8 +2539,16 @@ class DynamicsFitCommands(MeasureCommands):
             best_value if param == "LEAD" else baseline.get("pin_lead_us", 0.0)
         )
         apply_line = (
-            "SERVO_SET_COMPLIANCE PIN=%s %s_PEAK=%.1f ZETA=%g PIN_LEAD_US=%g"
-            % (mode.upper(), mode.upper(), f_peak, zeta_val, lead_val)
+            "SERVO_SET_COMPLIANCE PIN=%s %s_PEAK=%.1f %s_ZETA=%g "
+            "PIN_LEAD_US=%g"
+            % (
+                mode.upper(),
+                mode.upper(),
+                f_peak,
+                mode.upper(),
+                zeta_val,
+                lead_val,
+            )
         )
         structured_log.event(
             "calibration",
@@ -2428,7 +2560,7 @@ class DynamicsFitCommands(MeasureCommands):
                 None if r is None else round(r * 1e3, 4) for _v, r in rows
             ],
             best_value=best_value,
-            run_dir=run.run_dir,
+            run_dir=run_dir,
         )
         gcmd.respond_info(
             "pin sweep %s (mode %s) residual: %s | minimum at %s=%g "
@@ -2441,5 +2573,320 @@ class DynamicsFitCommands(MeasureCommands):
                 best_value,
                 best_res * 1e3,
                 apply_line,
+            )
+        )
+
+    cmd_SERVO_TUNE_PIN_help = (
+        "Full measured pin-rotor tuning campaign for one or both Cartesian "
+        "modes, chaining the identification and staircase primitives into "
+        "one command. Per mode (MODES=XY|X|Y): (1) unless X_FREQ/X_PEAK "
+        "(resp. Y_FREQ/Y_PEAK) are given, run the SERVO_MEASURE_COMPLIANCE "
+        "identification to get the locked-rotor notch f_b and the FRF peak "
+        "f_peak; (2) pin the mode (the SERVO_SET_COMPLIANCE math: pin_mass "
+        "= mass*(1-(f_b/f_peak)^2)); (3) a COARSE zeta staircase dwelling a "
+        "fixed tone at f_b (ZETA_COARSE=) picks the residual minimum via "
+        "SERVO_SWEEP_PIN's machinery; (4) a FINE staircase of 5 log-spaced "
+        "values spanning winner/1.6 .. winner*1.6 refines it; (5) the fine "
+        "winner is applied to that mode's pin_zeta. After every mode a "
+        "single LEAD staircase (LEAD_VALUES=) runs on the LOWEST-frequency "
+        "tuned mode - pin_lead_us is a whole-model scalar and the slowest "
+        "mode gives the best degrees-per-microsecond resolution - and its "
+        "winner is applied globally. The tuned model is written as a fresh "
+        "timestamped profile (same writer SET uses) and left LIVE until "
+        "RESTART; the summary prints the ready-to-run SERVO_SET_COMPLIANCE "
+        "line (X_ZETA/Y_ZETA spelling) and the reminder to point "
+        "[ethercat_node] dynamics_profile at the written TOML to keep it. "
+        "Any failure restores the pre-tune model and reports the partial "
+        "results. Params MODES (XY|X|Y) DWELL (s, 3) AMPLITUDE (mm, 0.01) "
+        "LEAD_VALUES (0,150,300,450,600) "
+        "ZETA_COARSE (0.02,0.035,0.05,0.08,0.12,0.2,0.3) "
+        "X_FREQ Y_FREQ X_PEAK Y_PEAK (Hz, skip a mode's measurement) "
+        "NAME (pin_tune) PROFILE"
+    )
+
+    def cmd_SERVO_TUNE_PIN(self, gcmd: Any) -> None:
+        if tomllib is None:
+            raise gcmd.error("SERVO_TUNE_PIN requires Python 3.11+ (tomllib)")
+        kin = self._kin()
+        spatial = servo_strokes.spatial_frame(kin)
+        if spatial is None:
+            raise gcmd.error(
+                "SERVO_TUNE_PIN needs servo rails on X/Y - no spatial frame "
+                "available"
+            )
+        modes_req = gcmd.get("MODES", "XY").upper()
+        wanted = [m for m in ("x", "y") if m.upper() in modes_req]
+        modes = [m for m in spatial["modes"] if m in wanted]
+        if not modes:
+            raise gcmd.error(
+                "MODES=%s selects none of the spatial modes %s"
+                % (modes_req, spatial["modes"])
+            )
+        dwell_s = gcmd.get_float("DWELL", 3.0, minval=1.0)
+        amplitude = gcmd.get_float("AMPLITUDE", 0.01, above=0.0)
+        if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
+            raise gcmd.error(
+                "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
+                % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
+            )
+        lead_values = self._coerce_pin_values(
+            gcmd, "LEAD", gcmd.get("LEAD_VALUES", "0,150,300,450,600")
+        )
+        zeta_coarse = self._coerce_pin_values(
+            gcmd,
+            "ZETA",
+            gcmd.get("ZETA_COARSE", "0.02,0.035,0.05,0.08,0.12,0.2,0.3"),
+        )
+        name = gcmd.get("NAME", "pin_tune")
+        servos = list(spatial["axes"])
+        node = self._dynamics_node(gcmd, servos)
+        handle = node.get_engine_handle()
+        if handle is None:
+            raise gcmd.error(
+                "ethercat_node %s has no engine handle" % (node.name,)
+            )
+        engine = self.printer.lookup_object("motion_engine")
+        profile_path, baseline = self._load_baseline_dynamics(gcmd, node)
+        missing = [m for m in modes if m not in baseline["modes"]]
+        if missing:
+            raise gcmd.error(
+                "mode(s) %s not in profile %s (modes %s)"
+                % (", ".join(missing), profile_path, baseline["modes"])
+            )
+        slot_for: dict[str, int] = {}
+        invert_for: dict[str, bool] = {}
+        for servo in servos:
+            slot = node.get_slot_for_motor(servo)
+            if slot is None:
+                raise gcmd.error(
+                    "motor %r is not on node %s" % (servo, node.name)
+                )
+            slot_for[servo] = slot
+            invert_for[servo] = bool(
+                getattr(self._resolve_motor(servo), "invert_direction", False)
+            )
+        freq_params = {"x": "X_FREQ", "y": "Y_FREQ"}
+        peak_params = {"x": "X_PEAK", "y": "Y_PEAK"}
+        # SERVO_MEASURE_COMPLIANCE identification defaults (used only for a
+        # mode whose f_b/f_peak were not supplied as overrides).
+        m_fs, m_fe, m_hps = 60.0, 320.0, 1.0
+        m_dur = max((m_fe - m_fs) / m_hps, 0.5)
+        m_ramp = min(0.1 * m_dur, 3.0 / m_fs)
+        m_amp = min(0.02, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
+        pre_tune = _copy_dynamics(baseline)
+        pre_tune["ff_lead_us"] = baseline.get("ff_lead_us", 0.0)
+        working = _copy_dynamics(baseline)
+        working["ff_lead_us"] = baseline.get("ff_lead_us", 0.0)
+        summary: dict[str, dict[str, float]] = {}
+        lead_win = working.get("pin_lead_us", 0.0)
+        lead_res: float | None = None
+        lead_mode = None
+        try:
+            for mode in modes:
+                mode_i = working["modes"].index(mode)
+                f_b = gcmd.get_float(freq_params[mode], None, above=0.0)
+                f_peak = gcmd.get_float(peak_params[mode], None, above=0.0)
+                if f_b is None or f_peak is None:
+                    (
+                        _node,
+                        freq_by_mode,
+                        peak_by_mode,
+                        flagged,
+                    ) = self._run_compliance_measure(
+                        gcmd,
+                        spatial,
+                        [mode],
+                        name,
+                        m_fs,
+                        m_fe,
+                        m_hps,
+                        m_dur,
+                        m_ramp,
+                        m_amp,
+                        self.dwell_ms,
+                    )
+                    if mode not in freq_by_mode or mode not in peak_by_mode:
+                        raise gcmd.error(
+                            "measurement produced no f_b/f_peak for mode %s - "
+                            "pass %s and %s to skip its measurement"
+                            % (mode, freq_params[mode], peak_params[mode])
+                        )
+                    if flagged:
+                        gcmd.respond_info(
+                            "mode %s measurement flags: %s - proceeding; "
+                            "re-measure if the tune looks off"
+                            % (mode, "; ".join(flagged))
+                        )
+                    if f_b is None:
+                        f_b = freq_by_mode[mode]
+                    if f_peak is None:
+                        f_peak = peak_by_mode[mode]
+                if not f_peak > f_b:
+                    raise gcmd.error(
+                        "mode %s peak %.1f Hz must sit above the notch f_b "
+                        "%.1f Hz" % (mode.upper(), f_peak, f_b)
+                    )
+                # Pin the mode (SERVO_SET_COMPLIANCE math), baseline zeta =
+                # the first coarse value so the staircase starts defined.
+                working["compliance"][mode_i] = 1.0 / (2.0 * math.pi * f_b) ** 2
+                pin = {
+                    "modes": {mode},
+                    "peaks": {mode: f_peak},
+                    "zetas": {mode: zeta_coarse[0]},
+                    "pin_lead_us": working.get("pin_lead_us", 0.0),
+                }
+                self._apply_pin(gcmd, working, pin, [])
+                _rows, coarse_win, _cres, _crd = self._run_pin_staircase(
+                    gcmd,
+                    node,
+                    handle,
+                    engine,
+                    servos,
+                    slot_for,
+                    invert_for,
+                    spatial,
+                    working,
+                    profile_path,
+                    mode,
+                    mode_i,
+                    f_b,
+                    "ZETA",
+                    zeta_coarse,
+                    dwell_s,
+                    amplitude,
+                    name,
+                )
+                working["pin_zeta"][mode_i] = coarse_win
+                fine_lo = coarse_win / 1.6
+                fine_hi = coarse_win * 1.6
+                fine_values = [
+                    fine_lo * (fine_hi / fine_lo) ** (i / 4.0) for i in range(5)
+                ]
+                _rows2, fine_win, fine_res, _frd = self._run_pin_staircase(
+                    gcmd,
+                    node,
+                    handle,
+                    engine,
+                    servos,
+                    slot_for,
+                    invert_for,
+                    spatial,
+                    working,
+                    profile_path,
+                    mode,
+                    mode_i,
+                    f_b,
+                    "ZETA",
+                    fine_values,
+                    dwell_s,
+                    amplitude,
+                    name,
+                )
+                working["pin_zeta"][mode_i] = fine_win
+                summary[mode] = {
+                    "f_b": f_b,
+                    "f_peak": f_peak,
+                    "zeta": fine_win,
+                    "residual_um": fine_res * 1e3,
+                    "mode_i": float(mode_i),
+                }
+            # One LEAD staircase on the lowest-frequency tuned mode: lead is
+            # a whole-model scalar, and the slowest mode resolves the phase
+            # advance in the most degrees per microsecond.
+            lead_mode = min(summary, key=lambda m: summary[m]["f_b"])
+            lead_mode_i = int(summary[lead_mode]["mode_i"])
+            _lr, lead_win, lead_res, _lrd = self._run_pin_staircase(
+                gcmd,
+                node,
+                handle,
+                engine,
+                servos,
+                slot_for,
+                invert_for,
+                spatial,
+                working,
+                profile_path,
+                lead_mode,
+                lead_mode_i,
+                summary[lead_mode]["f_b"],
+                "LEAD",
+                lead_values,
+                dwell_s,
+                amplitude,
+                name,
+            )
+            working["pin_lead_us"] = lead_win
+            out_path = self._write_dynamics_toml(
+                name,
+                working,
+                working.get("ff_lead_us", 0.0),
+                "servo_tune_pin",
+            )
+            send_dynamics_model(engine, handle, working)
+            node.set_live_dynamics_profile(out_path)
+        except Exception as exc:
+            # Restore the pre-tune model (also on failure) and report the
+            # partial results, matching the sweep/gain restore discipline.
+            try:
+                send_dynamics_model(engine, handle, pre_tune)
+                node.set_live_dynamics_profile(profile_path)
+            finally:
+                self._active_run = None
+            done = (
+                ", ".join(
+                    "%s zeta=%g" % (m, summary[m]["zeta"]) for m in summary
+                )
+                or "none"
+            )
+            raise gcmd.error(
+                "SERVO_TUNE_PIN failed (%s); tuned so far: %s; pre-tune "
+                "model restored" % (exc, done)
+            )
+        table_parts = []
+        for m in modes:
+            s = summary[m]
+            table_parts.append(
+                "%s: f_b=%.1f Hz peak=%.1f Hz zeta=%.4g residual=%.2f um"
+                % (m, s["f_b"], s["f_peak"], s["zeta"], s["residual_um"])
+            )
+        pin_arg = "".join(m.upper() for m in modes)
+        set_line = "SERVO_SET_COMPLIANCE PIN=%s" % (pin_arg,)
+        for m in modes:
+            s = summary[m]
+            set_line += " %s_FREQ=%.1f %s_PEAK=%.1f %s_ZETA=%.4g" % (
+                m.upper(),
+                s["f_b"],
+                m.upper(),
+                s["f_peak"],
+                m.upper(),
+                s["zeta"],
+            )
+        set_line += " PIN_LEAD_US=%g" % (lead_win,)
+        lead_res_txt = (
+            "%.2f um" % (lead_res * 1e3,) if lead_res is not None else "n/a"
+        )
+        structured_log.event(
+            "calibration",
+            "tune_pin",
+            profile=out_path,
+            modes=modes,
+            zeta={m: summary[m]["zeta"] for m in summary},
+            f_b={m: summary[m]["f_b"] for m in summary},
+            f_peak={m: summary[m]["f_peak"] for m in summary},
+            pin_lead_us=lead_win,
+            lead_mode=lead_mode,
+        )
+        gcmd.respond_info(
+            "pin tune | %s | lead=%g us on mode %s (%s) | written %s | model "
+            "live until RESTART - point [ethercat_node %s] dynamics_profile "
+            "at it to keep it | to reapply: %s"
+            % (
+                " | ".join(table_parts),
+                lead_win,
+                lead_mode,
+                lead_res_txt,
+                out_path,
+                node.name,
+                set_line,
             )
         )

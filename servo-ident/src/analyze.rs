@@ -200,6 +200,7 @@ fn cartesian_ferr_psd(
     segs: &[(usize, usize)],
     fs: f64,
     expected_bins: usize,
+    require_moving: bool,
 ) -> Result<Option<BTreeMap<String, Vec<f64>>>, String> {
     validate_spatial_shape(spatial)?;
     let mut motor_ferr_mm = Vec::new();
@@ -219,7 +220,11 @@ fn cartesian_ferr_psd(
     let modes = project_modes(&spatial.frame, &motor_ferr_mm);
     let mut out = BTreeMap::new();
     for (mode_name, mode_series) in spatial.modes.iter().zip(modes) {
-        let (freq_hz, psd) = segments_welch_psd(&mode_series, segs, fs)?;
+        let (freq_hz, psd) = if segs.is_empty() && !require_moving {
+            welch_psd(&mode_series, fs)?
+        } else {
+            segments_welch_psd(&mode_series, segs, fs)?
+        };
         if freq_hz.len() != expected_bins {
             return Err(format!(
                 "cartesian mode {mode_name:?} psd has {} bins, expected {expected_bins} \
@@ -335,11 +340,20 @@ fn analyze_drive(
     torque_limit: i64,
     fs: f64,
     ff_lead_samples: usize,
+    require_moving: bool,
 ) -> Result<DriveAnalysis, String> {
     let series = drive_series(cap, idx)?;
     let metrics = compute_metrics(&series, settle_band, torque_limit, fs, ff_lead_samples)?;
     let segs = motion_segments(&series.flags);
-    let (freq_hz, psd) = moving_psd(&series, &segs, fs)?;
+    // Buzz-family captures are a position wiggle, not commanded moves, so the
+    // motion-active flag may never latch (it is threshold-dependent). When the
+    // experiment does not require moves, fall back to the whole capture rather
+    // than erroring — the PSD is the reading surface there.
+    let (freq_hz, psd) = if segs.is_empty() && !require_moving {
+        welch_psd(&series.following_error, fs)?
+    } else {
+        moving_psd(&series, &segs, fs)?
+    };
     let psd_peaks = top_peaks(&freq_hz, &psd, PSD_PEAK_COUNT);
     let resonance = detect_resonance(&freq_hz, &psd);
     Ok(DriveAnalysis {
@@ -378,6 +392,19 @@ fn step_flags(drives: &BTreeMap<String, DriveResult>) -> Vec<String> {
     flags
 }
 
+/// Buzz-family experiments drive a locked-rotor position wiggle rather than
+/// commanded moves, so the motion-active flag may never latch and the capture
+/// legitimately has zero moving segments. For those, per-drive/cartesian PSDs
+/// are taken over the whole capture instead of the (empty) moving segments;
+/// move-based experiments (tracking, gain/inertia/accel sweeps, dynamics fits)
+/// still require moves and error when none are present. Compliance and
+/// differential are also buzz-driven but analyze through their own FRF paths
+/// (`analyze_compliance_capture`/`analyze_differential_capture`), so they never
+/// reach the generic `analyze_capture` and are not listed here.
+fn experiment_requires_moving(experiment: &str) -> bool {
+    !matches!(experiment, "pin_sweep")
+}
+
 /// Analyze one capture into a `StepResult` and a `PlotStep`.
 pub fn analyze_capture(
     cap: &Scap,
@@ -389,6 +416,7 @@ pub fn analyze_capture(
     accel_path: Option<&Path>,
     ff_lead_samples: usize,
     spatial: Option<&ManifestSpatial>,
+    require_moving: bool,
 ) -> Result<(StepResult, PlotStep), String> {
     let fs = cap.fs();
     let n = cap.n_records;
@@ -396,7 +424,15 @@ pub fn analyze_capture(
     for (idx, dname) in cap.drive_names().into_iter().enumerate() {
         analyses.push((
             dname,
-            analyze_drive(cap, idx, settle_band, torque_limit, fs, ff_lead_samples)?,
+            analyze_drive(
+                cap,
+                idx,
+                settle_band,
+                torque_limit,
+                fs,
+                ff_lead_samples,
+                require_moving,
+            )?,
         ));
     }
 
@@ -493,6 +529,7 @@ pub fn analyze_capture(
             &sample_segs,
             fs,
             psd_freq_hz.len(),
+            require_moving,
         )?,
         None => None,
     };
@@ -1211,6 +1248,7 @@ fn build_run_reusing(
                 accel_path.as_deref(),
                 manifest.ff_lead_samples(cap.fs()),
                 manifest.spatial.as_ref(),
+                experiment_requires_moving(&manifest.experiment),
             )?
         };
         if let Some((opts, expected_strokes)) = &ringdown_plan {
