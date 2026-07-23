@@ -596,6 +596,46 @@ re-measure warning instead of a recommendation. Params: `MODE=XY|X|Y`
 `FREQ_START` (60) `FREQ_END` (320) `HZ_PER_SEC` (1) `DURATION`
 `AMPLITUDE` (0.02 mm) `RAMP` `DWELL_MS` `NAME` (compliance).
 
+#### SERVO_SWEEP_PIN
+Staircase-tunes one pin-rotor parameter (`ZETA` or `LEAD`, i.e.
+`PIN_LEAD_US`) for a single already-pinned mode by dwelling the engine
+buzz as a **constant tone** — `freq_start == freq_end = FREQ`, typically
+the mode's notch `f_b` — in that mode's frame pattern, then re-streaming
+the dynamics model live at each step. The pin runs *through* the tone:
+streaming a new model mid-buzz rebuilds the endpoint's pin state, so
+every step's residual demodulator restarts cleanly and settles inside
+the dwell while the buzz forcing keeps integrating on the fresh damping.
+The un-swept pin parameter stays at its current baseline value.
+
+Scoring is **magnitude, not phase**. After the capture stops, the host
+reads the settled pin-residual magnitude `|pin_res|` at the tone that the
+analyzer already produces per step
+(`drives[*].metrics.pin_residual_mm`, the 0.25 s low-passed
+`pin_res_re/pin_res_im` phasor, so it is fully settled by the ≥ 1 s
+dwell) and reports a `value → residual (µm)` table with the minimum
+marked. The residual **phase** walks 0 → 180° across the notch naturally
+and is *not* a tuning target — the well-damped hold is the one that
+leaves the smallest settled residual magnitude at the tone, so the
+minimum of the table wins. The mode's residual rides the drive block of
+the same index, so the score is the max `pin_residual_mm` over the
+step's captured drives.
+
+Measurement only — nothing is left applied. The pre-sweep model is
+restored at the end (also on any failure mid-sweep, the same
+restore discipline `SERVO_CALIBRATE_GAINS` uses for drive params), and
+the command prints the ready-to-run
+`SERVO_SET_COMPLIANCE PIN=… …_PEAK=… ZETA=… PIN_LEAD_US=…` line with the
+winning value substituted (measure prints, [`SERVO_SET_COMPLIANCE`](#servo_set_compliance)
+applies; the peak is reconstructed from the baseline pin so the line is
+complete, and the un-swept parameter is carried through unchanged). If
+the capture carries no pin channels or every step reads ~0 it errors —
+the swept mode must be actively pinned (`pin_mass > 0`; pin it first with
+`SERVO_SET_COMPLIANCE PIN=`) and the kalico endpoint build must be
+current. Params: `MODE=X|Y` `FREQ` (Hz) `PARAM` (`ZETA`|`LEAD`, default
+`ZETA`) `VALUES` (comma list, 2..12, each validated by the
+`SERVO_SET_COMPLIANCE` `ZETA`/`PIN_LEAD_US` rules) `DWELL` (s, default 3,
+min 1) `AMPLITUDE` (mm, 0.01) `NAME` (pin_sweep) `PROFILE`.
+
 #### SERVO_CALIBRATE_INERTIA_RATIO
 Step 2 of tuning: identify the load inertia and print the recommended C00.06.
 `TORQUE_NM` and `INERTIA_KGM2` are **required** (config or param). On
@@ -729,6 +769,7 @@ Schemas: [servo-cal-contracts.md](servo-cal-contracts.md).
 | `SERVO_CALIBRATE_GAINS` | `servo-cal analyze` | run dir + `results.json` verdict (highest clean gain step); `APPLY=1` also writes + verifies |
 | `SERVO_SWEEP_INERTIA` | `servo-cal analyze` | run dir + `results.json` (no automated pick, so `APPLY=1` always errors) |
 | `SERVO_SWEEP_ACCEL` | `servo-cal analyze` | run dir + `results.json` verdict (max non-railing accel); `APPLY=1` verifies at the recommended accel (no SDO write) |
+| `SERVO_SWEEP_PIN` | `servo-cal analyze` | run dir + `results.json` (per-step settled pin-residual magnitude; prints the `value → µm` table + winning `SERVO_SET_COMPLIANCE` line; nothing applied) |
 | `SERVO_FIT_DYNAMICS`, `SERVO_CALIBRATE_INERTIA_RATIO` | `servo-cal fit` | run dir + `~/printer_data/config/servo_dynamics/dynamics_<name>_<stamp>.toml` + C00.06 |
 | `SERVO_TUNE_DYNAMICS` | `servo-cal fit --response ferr` (per capture) | run dir + tuned `dynamics_<name>_<stamp>.toml` when a pass beats the baseline (search is host-side; tuned model stays live until RESTART) |
 | `SERVO_MEASURE_INERTIA` | — | run dir + `.scap` capture only (the building block behind the fit commands) |

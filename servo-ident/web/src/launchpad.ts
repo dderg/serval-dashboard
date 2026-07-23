@@ -189,6 +189,20 @@ const LAUNCHPAD_GROUPS: LpGroup[] = [
         ],
       },
       {
+        name: "SERVO_SWEEP_PIN",
+        blurb: "staircase-tune one pin parameter: dwell a constant tone in a mode and step ZETA or LEAD by re-streaming the model live, scoring each by settled pin-residual magnitude; prints the winning SERVO_SET_COMPLIANCE line (nothing applied)",
+        params: [
+          { name: "MODE", type: "enum", choices: ["X", "Y"], dflt: "X", hint: "single mode; must already be pinned in the baseline" },
+          { name: "FREQ", type: "float", unit: "Hz", hint: "dwell tone, typically the mode notch f_b" },
+          { name: "PARAM", type: "enum", choices: ["ZETA", "LEAD"], dflt: "ZETA", hint: "swept pin parameter; the other stays at its current value" },
+          { name: "VALUES", type: "list", hint: "comma list, 2..12; same rules as SERVO_SET_COMPLIANCE ZETA / PIN_LEAD_US" },
+          { name: "DWELL", type: "float", dflt: "3", unit: "s", hint: "per step, min 1" },
+          { name: "AMPLITUDE", type: "float", dflt: "0.01", unit: "mm" },
+          { name: "PROFILE", type: "string", hint: "baseline TOML; defaults to the live model, else the node's profile" },
+          { name: "NAME", type: "string", dflt: "pin_sweep" },
+        ],
+      },
+      {
         name: "SERVO_CALIBRATE_INERTIA_RATIO",
         blurb: "identify the load inertia and print the recommended C00.06",
         params: [

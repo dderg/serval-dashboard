@@ -81,6 +81,7 @@ class CalibrationHost:
             "SERVO_TUNE_DYNAMICS",
             "SERVO_SET_COMPLIANCE",
             "SERVO_MEASURE_COMPLIANCE",
+            "SERVO_SWEEP_PIN",
             "SERVO_SWEEP_INERTIA",
             "SERVO_SWEEP_ACCEL",
             "SERVO_AUTOTUNE",

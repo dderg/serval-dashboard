@@ -2119,3 +2119,325 @@ class DynamicsFitCommands(MeasureCommands):
             "point [ethercat_node %s] dynamics_profile at the written "
             "TOML to keep it across RESTART" % (apply_line, node.name)
         )
+
+    cmd_SERVO_SWEEP_PIN_help = (
+        "Staircase-tune one pin-rotor parameter by dwelling a constant "
+        "engine buzz as a fixed tone (freq_start==freq_end=FREQ, typically "
+        "the mode's notch f_b) in a single mode's frame pattern and "
+        "re-streaming the dynamics model live at each step. PARAM (ZETA or "
+        "LEAD) steps through VALUES= (2..12, each validated by the same "
+        "rules as SERVO_SET_COMPLIANCE ZETA / PIN_LEAD_US); the OTHER pin "
+        "parameter stays at its current baseline value. The pin runs "
+        "THROUGH the tone - a model swap rebuilds the endpoint's pin state, "
+        "so each step's residual demodulator restarts and settles within "
+        "the dwell. Scoring is measurement only: after the capture stops "
+        "the settled pin-residual magnitude |pin_res| at the tone is read "
+        "per step (score is settled MAGNITUDE, not phase - the residual "
+        "phase walks 0->180 across the notch naturally and is not a "
+        "tuning target), a value->residual table is printed, and the "
+        "minimum wins. Nothing is left applied: it prints the ready-to-run "
+        "SERVO_SET_COMPLIANCE line with the winning value substituted (the "
+        "house pattern - measure prints, set applies). The mode must "
+        "already be pinned in the baseline (pin_mass>0) - pin it first "
+        "with SERVO_SET_COMPLIANCE PIN=. Baseline profile resolution "
+        "matches SERVO_SET_COMPLIANCE (PROFILE=, else the live-tuned "
+        "model, else the configured node profile); the pre-sweep model is "
+        "restored at the end (also on failure). Params MODE=X|Y FREQ (Hz) "
+        "PARAM (ZETA|LEAD, ZETA) VALUES (comma list) DWELL (s, 3) "
+        "AMPLITUDE (mm, 0.01) NAME (pin_sweep) PROFILE"
+    )
+
+    def _parse_pin_sweep_values(self, gcmd: Any, param: str) -> list[float]:
+        raw = gcmd.get("VALUES", None)
+        if raw is None:
+            raise gcmd.error("VALUES= is required (comma list of 2..12 values)")
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if not 2 <= len(parts) <= 12:
+            raise gcmd.error(
+                "VALUES must list 2..12 comma-separated values (got %d)"
+                % (len(parts),)
+            )
+        values: list[float] = []
+        for p in parts:
+            try:
+                v = float(p)
+            except ValueError:
+                raise gcmd.error("VALUES entry %r is not a number" % (p,))
+            # Same rules as SERVO_SET_COMPLIANCE: ZETA above 0 and <= max
+            # (get_float above=0.0, maxval=PIN_ZETA_MAX); PIN_LEAD_US in
+            # [0, PIN_LEAD_US_MAX] (minval=0.0, maxval=PIN_LEAD_US_MAX).
+            if param == "ZETA":
+                if not 0.0 < v <= PIN_ZETA_MAX:
+                    raise gcmd.error(
+                        "VALUES ZETA entry %g must be > 0 and <= %g (same "
+                        "rule as SERVO_SET_COMPLIANCE ZETA)" % (v, PIN_ZETA_MAX)
+                    )
+            elif not 0.0 <= v <= PIN_LEAD_US_MAX:
+                raise gcmd.error(
+                    "VALUES LEAD entry %g must be >= 0 and <= %g (same rule "
+                    "as SERVO_SET_COMPLIANCE PIN_LEAD_US)"
+                    % (v, PIN_LEAD_US_MAX)
+                )
+            values.append(v)
+        return values
+
+    def _pin_sweep_model(
+        self,
+        baseline: dict[str, Any],
+        mode_i: int,
+        param: str,
+        value: float,
+    ) -> dict[str, Any]:
+        """Copy the baseline and set the one swept pin parameter on the
+        pinned mode; the other pin parameter is preserved by the copy."""
+        updated = _copy_dynamics(baseline)
+        updated["ff_lead_us"] = baseline.get("ff_lead_us", 0.0)
+        if param == "ZETA":
+            updated["pin_zeta"][mode_i] = value
+        else:  # LEAD -> pin_lead_us is a whole-model scalar
+            updated["pin_lead_us"] = value
+        return updated
+
+    def _pin_sweep_scores(
+        self, gcmd: Any, results: dict[str, Any], values: list[float]
+    ) -> list[tuple[float, float | None]]:
+        """Read the settled pin-residual magnitude the analyzer already
+        produces per step (drives[*].metrics.pin_residual_mm, the low-passed
+        |phasor| at the tone). The mode's residual rides the drive block of
+        the same index, so the max over the step's captured drives isolates
+        it. Errors when no pin channels are present or every step reads ~0."""
+        by_name = {s.get("name"): s for s in results.get("steps") or []}
+        rows: list[tuple[float, float | None]] = []
+        for i, value in enumerate(values):
+            step = by_name.get("v%d" % (i,))
+            residual_mm: float | None = None
+            if step is not None:
+                for drive in (step.get("drives") or {}).values():
+                    mag = (drive.get("metrics") or {}).get("pin_residual_mm")
+                    if mag is not None:
+                        residual_mm = (
+                            mag
+                            if residual_mm is None
+                            else max(residual_mm, mag)
+                        )
+            rows.append((value, residual_mm))
+        scored = [(v, r) for v, r in rows if r is not None]
+        if not scored or all(r <= 1e-9 for _v, r in scored):
+            raise gcmd.error(
+                "no pin residual in the capture - the swept mode must be "
+                "actively pinned (pin_mass>0) and the kalico build must "
+                "stream pin_res_re/pin_res_im (rebuild the endpoint with "
+                "./install.sh)"
+            )
+        return rows
+
+    def cmd_SERVO_SWEEP_PIN(self, gcmd: Any) -> None:
+        if tomllib is None:
+            raise gcmd.error("SERVO_SWEEP_PIN requires Python 3.11+ (tomllib)")
+        kin = self._kin()
+        spatial = servo_strokes.spatial_frame(kin)
+        if spatial is None:
+            raise gcmd.error(
+                "SERVO_SWEEP_PIN needs servo rails on X/Y - no spatial frame "
+                "available"
+            )
+        mode_req = gcmd.get("MODE", "").upper()
+        wanted = [m for m in ("x", "y") if m.upper() in mode_req]
+        modes = [m for m in spatial["modes"] if m in wanted]
+        if len(modes) != 1:
+            raise gcmd.error(
+                "MODE= must select exactly one spatial mode (X or Y); got "
+                "%r from %s" % (mode_req, spatial["modes"])
+            )
+        mode = modes[0]
+        freq = gcmd.get_float("FREQ", None, above=0.0)
+        if freq is None:
+            raise gcmd.error("FREQ= is required (the dwell tone in Hz)")
+        if freq < 20.0 or freq > self.MAX_BUZZ_FREQ_HZ:
+            raise gcmd.error(
+                "FREQ must be between 20 and %.0f Hz (the dwell tone, "
+                "typically f_b)" % (self.MAX_BUZZ_FREQ_HZ,)
+            )
+        param = gcmd.get("PARAM", "ZETA").upper()
+        if param not in ("ZETA", "LEAD"):
+            raise gcmd.error("PARAM must be ZETA or LEAD (got %r)" % (param,))
+        values = self._parse_pin_sweep_values(gcmd, param)
+        dwell_s = gcmd.get_float("DWELL", 3.0, minval=1.0)
+        amplitude = gcmd.get_float("AMPLITUDE", 0.01, above=0.0)
+        if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
+            raise gcmd.error(
+                "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
+                % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
+            )
+        name = gcmd.get("NAME", "pin_sweep")
+        servos = list(spatial["axes"])
+        node = self._dynamics_node(gcmd, servos)
+        handle = node.get_engine_handle()
+        if handle is None:
+            raise gcmd.error(
+                "ethercat_node %s has no engine handle" % (node.name,)
+            )
+        engine = self.printer.lookup_object("motion_engine")
+        profile_path, baseline = self._load_baseline_dynamics(gcmd, node)
+        if mode not in baseline["modes"]:
+            raise gcmd.error(
+                "mode %s not in profile %s (modes %s)"
+                % (mode, profile_path, baseline["modes"])
+            )
+        mode_i = baseline["modes"].index(mode)
+        if not baseline["pin_mass"][mode_i] > 0.0:
+            raise gcmd.error(
+                "mode %s is not pinned in the baseline (pin_mass=0) - pin it "
+                "first with SERVO_SET_COMPLIANCE PIN=%s %s_PEAK=... then "
+                "sweep" % (mode, mode.upper(), mode.upper())
+            )
+        slot_for: dict[str, int] = {}
+        invert_for: dict[str, bool] = {}
+        for servo in servos:
+            slot = node.get_slot_for_motor(servo)
+            if slot is None:
+                raise gcmd.error(
+                    "motor %r is not on node %s" % (servo, node.name)
+                )
+            slot_for[servo] = slot
+            invert_for[servo] = bool(
+                getattr(self._resolve_motor(servo), "invert_direction", False)
+            )
+        row = spatial["frame"][spatial["modes"].index(mode)]
+        slot_mask = 0
+        sign_mask = 0
+        step_servos: list[str] = []
+        for servo, weight in zip(servos, row):
+            if weight == 0.0:
+                continue
+            slot = slot_for[servo]
+            slot_mask |= 1 << slot
+            step_servos.append(servo)
+            sign_cmd = (1.0 if weight > 0.0 else -1.0) * (
+                -1.0 if invert_for[servo] else 1.0
+            )
+            if sign_cmd < 0.0:
+                sign_mask |= 1 << slot
+        # One tone spans every dwell; size it to cover the whole staircase
+        # plus the per-step re-stream overhead, and let it lapse (the buzz
+        # is duration-bounded - there is no early-stop command).
+        ramp = min(0.3, 3.0 / freq)
+        total_s = len(values) * (dwell_s + 0.5) + ramp + 1.0
+        stroke_plan = {
+            "freq": freq,
+            "amplitude": amplitude,
+            "dwell_s": dwell_s,
+            "ramp": ramp,
+            "mode": mode,
+            "param": param,
+            "values": values,
+        }
+        run = self._begin_run(
+            gcmd, "pin_sweep", name, "XY", servos, stroke_plan
+        )
+        reactor = self.printer.get_reactor()
+        gcmd.respond_info(
+            "pin sweep, mode %s: %s over %d values x %.1f s at %.1f Hz, "
+            "amplitude %.3f mm on %s"
+            % (
+                mode,
+                param,
+                len(values),
+                dwell_s,
+                freq,
+                amplitude,
+                "+".join(step_servos),
+            )
+        )
+        self._prep("X", 0)
+        self._prep("Y", 0)
+        try:
+            engine.resonance_buzz(
+                handle,
+                slot_mask,
+                sign_mask,
+                int(round(freq * 1000.0)),
+                int(round(freq * 1000.0)),
+                int(round(amplitude * 1e6)),
+                int(round(total_s * 1000.0)),
+                int(round(ramp * 1000.0)),
+            )
+            for i, value in enumerate(values):
+                updated = self._pin_sweep_model(baseline, mode_i, param, value)
+                send_dynamics_model(engine, handle, updated)
+                step_name = "v%d" % (i,)
+                t_start = round(reactor.monotonic(), 3)
+                self._start_capture(step_name, step_servos)
+                try:
+                    reactor.pause(reactor.monotonic() + dwell_s)
+                finally:
+                    self._stop_capture()
+                run.record_step(
+                    SweepStep(
+                        step_name,
+                        {
+                            "value": value,
+                            "t_start_s": t_start,
+                            "t_end_s": round(reactor.monotonic(), 3),
+                        },
+                        [],
+                    )
+                )
+            results = self._run_analyze(gcmd, run)
+        finally:
+            # Restore the pre-sweep model (also on failure), matching the
+            # gain-sweep restore discipline.
+            try:
+                send_dynamics_model(engine, handle, baseline)
+                node.set_live_dynamics_profile(profile_path)
+            finally:
+                self._active_run = None
+        rows = self._pin_sweep_scores(gcmd, results, values)
+        table = ", ".join(
+            "%g -> %s" % (v, "%.2f um" % (r * 1e3,) if r is not None else "n/a")
+            for v, r in rows
+        )
+        best_value, best_res = min(
+            ((v, r) for v, r in rows if r is not None), key=lambda t: t[1]
+        )
+        # Reconstruct the FRF peak the baseline pin encodes so the printed
+        # line is fully specified: pin_mass = mass*(1-(f_b/f_peak)^2).
+        comp = baseline["compliance"][mode_i]
+        f_b = 1.0 / (2.0 * math.pi * math.sqrt(comp))
+        fraction = baseline["pin_mass"][mode_i] / baseline["mass"][mode_i]
+        f_peak = f_b / math.sqrt(max(1.0 - fraction, 1e-9))
+        zeta_val = (
+            best_value if param == "ZETA" else baseline["pin_zeta"][mode_i]
+        )
+        lead_val = (
+            best_value if param == "LEAD" else baseline.get("pin_lead_us", 0.0)
+        )
+        apply_line = (
+            "SERVO_SET_COMPLIANCE PIN=%s %s_PEAK=%.1f ZETA=%g PIN_LEAD_US=%g"
+            % (mode.upper(), mode.upper(), f_peak, zeta_val, lead_val)
+        )
+        structured_log.event(
+            "calibration",
+            "pin_sweep",
+            mode=mode,
+            param=param,
+            values=values,
+            residuals_um=[
+                None if r is None else round(r * 1e3, 4) for _v, r in rows
+            ],
+            best_value=best_value,
+            run_dir=run.run_dir,
+        )
+        gcmd.respond_info(
+            "pin sweep %s (mode %s) residual: %s | minimum at %s=%g "
+            "(%.2f um) | to apply: %s"
+            % (
+                param,
+                mode,
+                table,
+                param,
+                best_value,
+                best_res * 1e3,
+                apply_line,
+            )
+        )
