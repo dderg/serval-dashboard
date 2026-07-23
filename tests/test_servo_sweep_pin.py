@@ -247,3 +247,18 @@ def test_pin_sweep_scores_gate_unexcited_steps():
     assert rows[0][1] == 0.005
     assert rows[1][1] == 0.002
     assert rows[2][1] is None, "unexcited step must not score"
+
+
+@requires_tomllib
+def test_pin_sweep_amplitude_config_default_drives_the_tone():
+    # [servo_calibration] pin_sweep_amplitude sets the dwell-tone amplitude
+    # when AMPLITUDE= is omitted; the buzz call carries it in nanometers.
+    sc, _gcode, _node, _path = _setup(residuals=[3.0e-3, 1.0e-3])
+    assert sc.pin_sweep_amplitude_mm == 0.01  # config default
+    assert sc.compliance_amplitude_mm == 0.02  # config default
+    sc.pin_sweep_amplitude_mm = 0.025
+    gcmd = FakeGcmd(MODE="X", FREQ="130", VALUES="0.02,0.04", DWELL="1")
+    sc.cmd_SERVO_SWEEP_PIN(gcmd)
+    engine = sc.printer.lookup_object("motion_engine")
+    amps = {b[5] for b in engine.buzzes}
+    assert amps == {25000}, amps

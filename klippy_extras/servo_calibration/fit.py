@@ -2136,7 +2136,9 @@ class DynamicsFitCommands(MeasureCommands):
                 "buzz frequencies must stay at or below %.0f Hz"
                 % (self.MAX_BUZZ_FREQ_HZ,)
             )
-        amplitude = gcmd.get_float("AMPLITUDE", 0.02, above=0.0)
+        amplitude = gcmd.get_float(
+            "AMPLITUDE", self.compliance_amplitude_mm, above=0.0
+        )
         if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
             raise gcmd.error(
                 "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
@@ -2213,7 +2215,8 @@ class DynamicsFitCommands(MeasureCommands):
         "model, else the configured node profile); the pre-sweep model is "
         "restored at the end (also on failure). Params MODE=X|Y FREQ (Hz) "
         "PARAM (ZETA|LEAD, ZETA) VALUES (comma list) DWELL (s, 3) "
-        "AMPLITUDE (mm, 0.01) NAME (pin_sweep) PROFILE"
+        "AMPLITUDE (mm; config pin_sweep_amplitude, 0.01) NAME (pin_sweep) "
+        "PROFILE"
     )
 
     def _parse_pin_sweep_values(self, gcmd: Any, param: str) -> list[float]:
@@ -2500,7 +2503,9 @@ class DynamicsFitCommands(MeasureCommands):
             raise gcmd.error("PARAM must be ZETA or LEAD (got %r)" % (param,))
         values = self._parse_pin_sweep_values(gcmd, param)
         dwell_s = gcmd.get_float("DWELL", 3.0, minval=1.0)
-        amplitude = gcmd.get_float("AMPLITUDE", 0.01, above=0.0)
+        amplitude = gcmd.get_float(
+            "AMPLITUDE", self.pin_sweep_amplitude_mm, above=0.0
+        )
         if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
             raise gcmd.error(
                 "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
@@ -2635,7 +2640,9 @@ class DynamicsFitCommands(MeasureCommands):
         "line (X_ZETA/Y_ZETA spelling) and the reminder to point "
         "[ethercat_node] dynamics_profile at the written TOML to keep it. "
         "Any failure restores the pre-tune model and reports the partial "
-        "results. Params MODES (XY|X|Y) DWELL (s, 3) AMPLITUDE (mm, 0.01) "
+        "results. Params MODES (XY|X|Y) DWELL (s, 3) AMPLITUDE (mm, ladder "
+        "dwell tone; config pin_sweep_amplitude, 0.01) MEASURE_AMPLITUDE "
+        "(mm, identification sweep; config compliance_amplitude, 0.02) "
         "LEAD_VALUES (0,150,300,450,600) "
         "ZETA_COARSE (0.02,0.035,0.05,0.08,0.12,0.2,0.3) "
         "X_FREQ Y_FREQ X_PEAK Y_PEAK (Hz, skip a mode's measurement) "
@@ -2661,7 +2668,9 @@ class DynamicsFitCommands(MeasureCommands):
                 % (modes_req, spatial["modes"])
             )
         dwell_s = gcmd.get_float("DWELL", 3.0, minval=1.0)
-        amplitude = gcmd.get_float("AMPLITUDE", 0.01, above=0.0)
+        amplitude = gcmd.get_float(
+            "AMPLITUDE", self.pin_sweep_amplitude_mm, above=0.0
+        )
         if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
             raise gcmd.error(
                 "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
@@ -2710,7 +2719,14 @@ class DynamicsFitCommands(MeasureCommands):
         m_fs, m_fe, m_hps = 60.0, 320.0, 1.0
         m_dur = max((m_fe - m_fs) / m_hps, 0.5)
         m_ramp = min(0.1 * m_dur, 3.0 / m_fs)
-        m_amp = min(0.02, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
+        m_amp = gcmd.get_float(
+            "MEASURE_AMPLITUDE", self.compliance_amplitude_mm, above=0.0
+        )
+        if m_amp > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
+            raise gcmd.error(
+                "MEASURE_AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
+                % (m_amp, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
+            )
         pre_tune = _copy_dynamics(baseline)
         pre_tune["ff_lead_us"] = baseline.get("ff_lead_us", 0.0)
         working = _copy_dynamics(baseline)

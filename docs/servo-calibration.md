@@ -50,6 +50,8 @@ they are configured or passed.
 | `iterations` | `3` | strokes per grid point (`ITERATIONS=`) |
 | `dwell_ms` | `700` | settle between strokes (`DWELL_MS=`) |
 | `travel_speed` | `100` | CoreXY centering moves between grid points |
+| `compliance_amplitude` | `0.02` | default buzz amplitude (mm) for the compliance identification sweep (`SERVO_MEASURE_COMPLIANCE AMPLITUDE=`, `SERVO_TUNE_PIN MEASURE_AMPLITUDE=`) |
+| `pin_sweep_amplitude` | `0.01` | default dwell-tone amplitude (mm) for the pin staircases (`SERVO_SWEEP_PIN`/`SERVO_TUNE_PIN` `AMPLITUDE=`) |
 | `accel_chip` | — | accelerometer section name (e.g. `adxl345`); when set, `SERVO_CALIBRATE_GAINS` also records vibration per step (`ACCEL_CHIP=`) |
 | `captures_root` | `~/printer_data/logs/servo_captures` | parent directory for experiment run directories |
 | `journal_params` | — | comma list of drive SDO addresses (`addr[:type]`, e.g. `0x2001.0x31:u16`) read back from every captured drive at run start and recorded under `ambient.journal_params` in the manifest — the campaign's varied registers (notch mode, etc.) |
@@ -602,7 +604,7 @@ peaks make it pin-complete, with the persistence reminder); when any
 step is flagged it prints a
 re-measure warning instead of a recommendation. Params: `MODE=XY|X|Y`
 `FREQ_START` (60) `FREQ_END` (320) `HZ_PER_SEC` (1) `DURATION`
-`AMPLITUDE` (0.02 mm) `RAMP` `DWELL_MS` `NAME` (compliance).
+`AMPLITUDE` (0.02 mm; config `compliance_amplitude`) `RAMP` `DWELL_MS` `NAME` (compliance).
 
 #### SERVO_SWEEP_PIN
 Staircase-tunes one pin-rotor parameter (`ZETA` or `LEAD`, i.e.
@@ -642,7 +644,7 @@ the swept mode must be actively pinned (`pin_mass > 0`; pin it first with
 current. Params: `MODE=X|Y` `FREQ` (Hz) `PARAM` (`ZETA`|`LEAD`, default
 `ZETA`) `VALUES` (comma list, 2..12, each validated by the
 `SERVO_SET_COMPLIANCE` `ZETA`/`PIN_LEAD_US` rules) `DWELL` (s, default 3,
-min 1) `AMPLITUDE` (mm, 0.01) `NAME` (pin_sweep) `PROFILE`.
+min 1) `AMPLITUDE` (mm, 0.01; config `pin_sweep_amplitude`) `NAME` (pin_sweep) `PROFILE`.
 
 #### SERVO_TUNE_PIN
 The full measured pin-rotor tuning campaign, chaining the identification
@@ -678,7 +680,7 @@ reports the partial results. The summary prints a per-mode table (`f_b`,
 ready-to-run `SERVO_SET_COMPLIANCE … X_ZETA=… Y_ZETA=… PIN_LEAD_US=…`
 line (per-mode `X_ZETA`/`Y_ZETA` spelling) plus the reminder to point
 `[ethercat_node] dynamics_profile` at the written TOML to keep it. Params:
-`MODES` (XY|X|Y) `DWELL` (s, 3) `AMPLITUDE` (mm, 0.01) `LEAD_VALUES`
+`MODES` (XY|X|Y) `DWELL` (s, 3) `AMPLITUDE` (mm, ladder tone, 0.01; config `pin_sweep_amplitude`) `MEASURE_AMPLITUDE` (mm, identification sweep, 0.02; config `compliance_amplitude`) `LEAD_VALUES`
 (`0,150,300,450,600`) `ZETA_COARSE` (`0.02,0.035,0.05,0.08,0.12,0.2,0.3`)
 `X_FREQ` `Y_FREQ` `X_PEAK` `Y_PEAK` (Hz, skip a mode's measurement)
 `NAME` (pin_tune) `PROFILE`.

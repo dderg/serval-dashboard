@@ -49,6 +49,16 @@ class CalibrationHost:
         self.accel_chip_name = config.get("accel_chip", None)
         self.dwell_ms = config.getint("dwell_ms", 700, minval=0)
         self.travel_speed = config.getfloat("travel_speed", 100.0, above=0.0)
+        # Default buzz amplitudes (mm), overridable per command: the
+        # compliance identification sweep and the pin staircase dwell tone.
+        # Machines differ in how much excitation gives a clean notch without
+        # noise complaints - set what works for your frame.
+        self.compliance_amplitude_mm = config.getfloat(
+            "compliance_amplitude", 0.02, above=0.0
+        )
+        self.pin_sweep_amplitude_mm = config.getfloat(
+            "pin_sweep_amplitude", 0.01, above=0.0
+        )
         self.captures_root = config.get("captures_root", DEFAULT_CAPTURES_ROOT)
         self.dynamics_dir = os.path.expanduser(DEFAULT_DYNAMICS_DIR)
         self.servo_cal_binary = config.get(
