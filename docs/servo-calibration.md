@@ -675,7 +675,7 @@ the capture carries no pin channels or every step reads ~0 it errors —
 the swept mode must be actively pinned (`pin_mass > 0`; pin it first with
 `SERVO_SET_COMPLIANCE PIN=`) and the kalico endpoint build must be
 current. Params: `MODE=X|Y` `FREQ` (Hz) `PARAM` (`ZETA`|`LEAD`, default
-`ZETA`) `VALUES` (comma list, 2..12, each validated by the
+`ZETA`) `VALUES` (comma list, one or more, each validated by the
 `SERVO_SET_COMPLIANCE` `ZETA`/`PIN_LEAD_US` rules) `DWELL` (s, default 3,
 min 1) `AMPLITUDE` (mm, 0.01; config `pin_sweep_amplitude`) `NAME` (pin_sweep) `ACCEL_CHIP` `PROFILE`.
 

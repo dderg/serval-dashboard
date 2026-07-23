@@ -249,11 +249,11 @@ def _values(sc, param, text):
 @requires_tomllib
 def test_pin_sweep_values_validation_reuses_set_rules():
     sc, _gcode, _node, _path = _setup()
-    # count bounds: 2..12
-    with pytest.raises(Exception, match="2..12"):
-        _values(sc, "ZETA", "0.02")
-    with pytest.raises(Exception, match="2..12"):
-        _values(sc, "ZETA", ",".join("0.01" for _ in range(13)))
+    # count: at least one value; single-value runs are legal, empty is not
+    with pytest.raises(Exception, match="at least one"):
+        _values(sc, "ZETA", " , ")
+    assert _values(sc, "ZETA", "0.02") == [0.02]
+    assert len(_values(sc, "ZETA", ",".join("0.01" for _ in range(13)))) == 13
     # ZETA: finite and > 0, no upper cap (overdamped predictors are legal -
     # the SERVO_SET_COMPLIANCE ZETA rule)
     with pytest.raises(Exception, match="ZETA"):

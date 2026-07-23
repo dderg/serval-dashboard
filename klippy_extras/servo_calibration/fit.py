@@ -2199,7 +2199,7 @@ class DynamicsFitCommands(MeasureCommands):
         )
         if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
             raise gcmd.error(
-                "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
+                "AMPLITUDE %.3f mm is not wire-representable (amplitude_nm is u32; max %.1f mm)"
                 % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
             )
         # Slow default: more dwell per bin right where the response is
@@ -2263,7 +2263,7 @@ class DynamicsFitCommands(MeasureCommands):
         "engine buzz as a fixed tone (freq_start==freq_end=FREQ, typically "
         "the mode's notch f_b) in a single mode's frame pattern and "
         "re-streaming the dynamics model live at each step. PARAM (ZETA or "
-        "LEAD) steps through VALUES= (2..12, each validated by the same "
+        "LEAD) steps through VALUES= (one or more, each validated by the "
         "rules as SERVO_SET_COMPLIANCE ZETA / PIN_LEAD_US); the OTHER pin "
         "parameter stays at its current baseline value. The pin runs "
         "THROUGH the tone - a model swap rebuilds the endpoint's pin state, "
@@ -2292,7 +2292,7 @@ class DynamicsFitCommands(MeasureCommands):
     def _parse_pin_sweep_values(self, gcmd: Any, param: str) -> list[float]:
         raw = gcmd.get("VALUES", None)
         if raw is None:
-            raise gcmd.error("VALUES= is required (comma list of 2..12 values)")
+            raise gcmd.error("VALUES= is required (comma list)")
         return self._coerce_pin_values(gcmd, param, raw)
 
     def _coerce_pin_values(
@@ -2302,11 +2302,8 @@ class DynamicsFitCommands(MeasureCommands):
         the SERVO_SET_COMPLIANCE rules. Shared by SERVO_SWEEP_PIN (VALUES=)
         and SERVO_TUNE_PIN (ZETA_COARSE=/LEAD_VALUES=)."""
         parts = [p.strip() for p in raw.split(",") if p.strip()]
-        if not 2 <= len(parts) <= 12:
-            raise gcmd.error(
-                "VALUES must list 2..12 comma-separated values (got %d)"
-                % (len(parts),)
-            )
+        if not parts:
+            raise gcmd.error("VALUES must list at least one value")
         values: list[float] = []
         for p in parts:
             try:
@@ -2660,7 +2657,7 @@ class DynamicsFitCommands(MeasureCommands):
         )
         if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
             raise gcmd.error(
-                "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
+                "AMPLITUDE %.3f mm is not wire-representable (amplitude_nm is u32; max %.1f mm)"
                 % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
             )
         name = gcmd.get("NAME", "pin_sweep")
@@ -2847,7 +2844,7 @@ class DynamicsFitCommands(MeasureCommands):
         )
         if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
             raise gcmd.error(
-                "AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
+                "AMPLITUDE %.3f mm is not wire-representable (amplitude_nm is u32; max %.1f mm)"
                 % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
             )
         lead_values = self._coerce_pin_values(
@@ -2899,7 +2896,7 @@ class DynamicsFitCommands(MeasureCommands):
         )
         if m_amp > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
             raise gcmd.error(
-                "MEASURE_AMPLITUDE %.3f mm exceeds the %.1f mm buzz ceiling"
+                "MEASURE_AMPLITUDE %.3f mm is not wire-representable (amplitude_nm is u32; max %.1f mm)"
                 % (m_amp, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
             )
         pre_tune = _copy_dynamics(baseline)

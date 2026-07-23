@@ -25,7 +25,9 @@ class MeasureCommands(CalibrationHost):
         name = gcmd.get("NAME", "track")
         self._measure_tracking(gcmd, axis, name)
 
-    MAX_DIFFERENTIAL_AMPLITUDE_MM = 0.5
+    # Hard limit only: the wire carries amplitude_nm as u32, so anything
+    # representable is legal. Loudness is the operator's call.
+    MAX_DIFFERENTIAL_AMPLITUDE_MM = 4294.967295
     MAX_BUZZ_FREQ_HZ = 2000.0
 
     cmd_SERVO_MEASURE_DIFFERENTIAL_help = (
