@@ -23,7 +23,10 @@ FF_LEAD_US_MAX = 10_000.0
 # Endpoint ceiling for the belt-compliance term 1/omega_b^2: 1/(2*pi*20 Hz)^2.
 # A mode softer than 20 Hz is a typo, not a belt.
 COMPLIANCE_MAX_S2 = 6.4e-4
-PIN_ZETA_MAX = 0.5
+# Hard math limit (matches the endpoint): the pin predictor's exact-rotation
+# update uses omega_d = omega*sqrt(1-zeta^2), so zeta must stay strictly
+# below 1. Not a taste cap - heavily damped belt modes measure zeta >= 0.5.
+PIN_ZETA_MAX = 0.99
 PIN_LEAD_US_MAX = 10_000.0
 
 
