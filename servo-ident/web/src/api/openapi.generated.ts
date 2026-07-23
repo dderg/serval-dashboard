@@ -242,6 +242,83 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/pin-compare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List pin-parameter comparisons, newest first. */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Comparison summaries, newest first. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PinCompareSummary"][];
+                    };
+                };
+                500: components["responses"]["ServerError"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/pin-compare/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Full pin-parameter comparison manifest with every sweep's curves. */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description Comparison name. */
+                    name: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The comparison manifest, verbatim. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PinCompareManifest"];
+                    };
+                };
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/runs": {
         parameters: {
             query?: never;
@@ -811,6 +888,51 @@ export interface components {
         };
         NoteResponse: {
             note: string;
+        };
+        /**
+         * @description A named pin-parameter comparison: every sweep captured under one NAME,
+         *     accumulated across coarse/fine passes. Stored at
+         *     `<captures_root>/pin_compare/<name>/manifest.json`.
+         */
+        PinCompareManifest: {
+            baseline_profile?: string | null;
+            created_utc: string;
+            /** Format: double */
+            freq_end: number;
+            /** Format: double */
+            freq_start: number;
+            mode: string;
+            name: string;
+            param: string;
+            sweeps: components["schemas"]["PinCompareSweep"][];
+        };
+        /**
+         * @description The pin-compare list row: enough to populate the dropdown without
+         *     shipping every curve.
+         */
+        PinCompareSummary: {
+            created_utc: string;
+            mode: string;
+            /** Format: uint */
+            n_sweeps: number;
+            name: string;
+            param: string;
+        };
+        /**
+         * @description One swept-sine buzz reduced to an accel-vs-frequency curve, plus the
+         *     normalized `response_ratio` (accel relative to commanded accel). Schema
+         *     mirrors the Python-authored pin-compare manifest the sweep command writes.
+         */
+        PinCompareSweep: {
+            accel_mm_s2: number[];
+            /** Format: double */
+            amplitude_mm: number;
+            curve_hz: number[];
+            /** Format: double */
+            hz_per_sec: number;
+            response_ratio: number[];
+            /** Format: double */
+            value: number;
         };
         PlotAccel: {
             magnitude: number[];

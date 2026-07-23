@@ -16,6 +16,7 @@ from typing import Any
 
 from ... import structured_log
 from .. import servo_axis, servo_strokes
+from .common import _utc_now
 from .dynamics import (
     DYNAMICS_TERM_KEYS,
     PIN_LEAD_US_MAX,
@@ -2783,6 +2784,391 @@ class DynamicsFitCommands(MeasureCommands):
                 best_value,
                 best_res * 1e3,
                 apply_line,
+            )
+        )
+
+    cmd_SERVO_COMPARE_PIN_help = (
+        "Sweep a pin-rotor parameter and compare the toolhead accelerometer "
+        "response across values with one swept-sine buzz (chirp) per value. "
+        "For each VALUES entry the dynamics model is re-streamed live (only "
+        "the swept PARAM changes; the other pin parameter keeps its baseline "
+        "value), a linear chirp FREQ_START->FREQ_END runs in the mode's "
+        "frame pattern, and the accelerometer captures the whole sweep "
+        "window. Each capture is reduced to accel-vs-frequency curves: the "
+        "linear chirp maps sample time to instantaneous frequency, samples "
+        "fall into ~1 Hz bins, and each bin's 3-axis vector-magnitude mean "
+        "is the raw accel. Constant-displacement excitation makes raw accel "
+        "~ f^2, so a response_ratio normalized by (2*pi*f)^2 * amplitude is "
+        "stored alongside the raw column. A comparison manifest is written "
+        "under <captures_root>/pin_compare/<NAME>/manifest.json (same NAME "
+        "appends sweeps; mode/param must match on append) for the dashboard "
+        "to overlay. Measurement only: the pre-sweep model is restored at "
+        "the end (also on failure). Params MODE=X|Y PARAM=ZETA|LEAD "
+        "VALUES (comma list) FREQ_START FREQ_END (Hz, required) HZ_PER_SEC "
+        "(5.0) AMPLITUDE (mm; config compliance_amplitude) RAMP DWELL (s "
+        "between sweeps, 3) ACCEL_CHIP (required; config accel_chip) "
+        "NAME (compare) PROFILE"
+    )
+
+    def _chirp_accel_curve(
+        self,
+        samples: list[tuple[float, float, float, float]],
+        freq_start: float,
+        freq_end: float,
+        hz_per_sec: float,
+        amplitude_mm: float,
+    ) -> tuple[list[float], list[float], list[float]]:
+        """Reduce a swept-sine accel capture to accel-vs-frequency curves.
+        The linear chirp maps capture time to instantaneous frequency
+        (f = freq_start + hz_per_sec*(t - t0)); samples land in ~1 Hz bins
+        and each bin's 3-axis vector-magnitude mean is the raw accel. A
+        constant-displacement buzz makes raw accel ~ f^2, so a
+        response_ratio normalized by (2*pi*f)^2 * amplitude_mm is returned
+        alongside. Returns (curve_hz, accel_mm_s2, response_ratio) sorted by
+        frequency. Empty capture -> three empty lists (never a fake zero)."""
+        if not samples:
+            return [], [], []
+        t0 = samples[0][0]
+        bins: dict[int, list[float]] = {}
+        for sample in samples:
+            f = freq_start + hz_per_sec * (sample[0] - t0)
+            if f < freq_start or f > freq_end:
+                continue
+            idx = int(f - freq_start)  # 1 Hz bins anchored at freq_start
+            mag = math.sqrt(
+                sample[1] * sample[1]
+                + sample[2] * sample[2]
+                + sample[3] * sample[3]
+            )
+            bins.setdefault(idx, []).append(mag)
+        curve_hz: list[float] = []
+        accel_mm_s2: list[float] = []
+        response_ratio: list[float] = []
+        for idx in sorted(bins):
+            f_c = freq_start + idx + 0.5
+            a = sum(bins[idx]) / len(bins[idx])
+            curve_hz.append(round(f_c, 4))
+            accel_mm_s2.append(a)
+            denom = (2.0 * math.pi * f_c) ** 2 * amplitude_mm
+            response_ratio.append(a / denom if denom > 0.0 else 0.0)
+        return curve_hz, accel_mm_s2, response_ratio
+
+    def _compare_manifest_path(self, name: str) -> str:
+        root = os.path.expanduser(self.captures_root)
+        return os.path.join(root, "pin_compare", name, "manifest.json")
+
+    def _append_compare_manifest(
+        self,
+        gcmd: Any,
+        path: str,
+        name: str,
+        mode: str,
+        param: str,
+        freq_start: float,
+        freq_end: float,
+        baseline_profile: str | None,
+        new_sweeps: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Write (or append to) the pin-compare manifest per contract. A
+        same-NAME manifest appends its sweeps; a mode/param mismatch on
+        append is an error (the overlay would compare unlike runs)."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path):
+            with open(path) as f:
+                manifest = json.load(f)
+            if manifest.get("mode") != mode or manifest.get("param") != param:
+                raise gcmd.error(
+                    "pin-compare manifest %s already holds mode=%s param=%s "
+                    "- cannot append mode=%s param=%s (use a new NAME)"
+                    % (
+                        path,
+                        manifest.get("mode"),
+                        manifest.get("param"),
+                        mode,
+                        param,
+                    )
+                )
+            manifest["sweeps"].extend(new_sweeps)
+        else:
+            manifest = {
+                "name": name,
+                "created_utc": _utc_now(),
+                "mode": mode,
+                "param": param,
+                "freq_start": freq_start,
+                "freq_end": freq_end,
+                "baseline_profile": baseline_profile,
+                "sweeps": list(new_sweeps),
+            }
+        with open(path, "w") as f:
+            json.dump(manifest, f)
+        return manifest
+
+    def _run_compare_sweep(
+        self,
+        gcmd: Any,
+        node: Any,
+        handle: int,
+        engine: Any,
+        servos: list[str],
+        slot_for: dict[str, int],
+        invert_for: dict[str, bool],
+        spatial: dict[str, Any],
+        baseline: dict[str, Any],
+        profile_path: str,
+        mode: str,
+        mode_i: int,
+        param: str,
+        values: list[float],
+        freq_start: float,
+        freq_end: float,
+        hz_per_sec: float,
+        amplitude: float,
+        ramp: float,
+        dwell_s: float,
+        accel_chip: Any,
+    ) -> list[dict[str, Any]]:
+        """One chirp per value: re-stream the model, buzz FREQ_START->
+        FREQ_END in the mode's frame pattern, capture the accelerometer over
+        the sweep, and reduce to curves. Restores the passed baseline model
+        at the end (also on failure), matching the staircase discipline.
+        Returns the list of per-value sweep dicts (contract shape)."""
+        row = spatial["frame"][spatial["modes"].index(mode)]
+        slot_mask = 0
+        sign_mask = 0
+        step_servos: list[str] = []
+        for servo, weight in zip(servos, row):
+            if weight == 0.0:
+                continue
+            slot = slot_for[servo]
+            slot_mask |= 1 << slot
+            step_servos.append(servo)
+            sign_cmd = (1.0 if weight > 0.0 else -1.0) * (
+                -1.0 if invert_for[servo] else 1.0
+            )
+            if sign_cmd < 0.0:
+                sign_mask |= 1 << slot
+        duration = (freq_end - freq_start) / hz_per_sec
+        reactor = self.printer.get_reactor()
+        gcmd.respond_info(
+            "pin compare, mode %s: %s over %d values, chirp %.0f->%.0f Hz "
+            "at %.1f Hz/s, amplitude %.3f mm on %s"
+            % (
+                mode,
+                param,
+                len(values),
+                freq_start,
+                freq_end,
+                hz_per_sec,
+                amplitude,
+                "+".join(step_servos),
+            )
+        )
+        self._prep("X", 0)
+        self._prep("Y", 0)
+        sweeps: list[dict[str, Any]] = []
+        try:
+            for i, value in enumerate(values):
+                updated = self._pin_sweep_model(baseline, mode_i, param, value)
+                send_dynamics_model(engine, handle, updated)
+                aclient = accel_chip.start_internal_client()
+                engine.resonance_buzz(
+                    handle,
+                    slot_mask,
+                    sign_mask,
+                    int(round(freq_start * 1000.0)),
+                    int(round(freq_end * 1000.0)),
+                    int(round(amplitude * 1e6)),
+                    int(round(duration * 1000.0)),
+                    int(round(ramp * 1000.0)),
+                )
+                reactor.pause(reactor.monotonic() + duration + 0.2)
+                aclient.finish_measurements()
+                samples = (
+                    list(aclient.get_samples())
+                    if aclient.has_valid_samples()
+                    else []
+                )
+                curve_hz, accel, ratio = self._chirp_accel_curve(
+                    samples, freq_start, freq_end, hz_per_sec, amplitude
+                )
+                sweeps.append(
+                    {
+                        "value": value,
+                        "hz_per_sec": hz_per_sec,
+                        "amplitude_mm": amplitude,
+                        "curve_hz": curve_hz,
+                        "accel_mm_s2": accel,
+                        "response_ratio": ratio,
+                    }
+                )
+                if ratio:
+                    pk = max(range(len(ratio)), key=lambda k: ratio[k])
+                    gcmd.respond_info(
+                        "pin compare %s=%g: peak response %.1f Hz "
+                        "(response ratio %.4g)"
+                        % (param, value, curve_hz[pk], ratio[pk])
+                    )
+                else:
+                    gcmd.respond_info(
+                        "pin compare %s=%g: no accel samples captured "
+                        "(no curve)" % (param, value)
+                    )
+                if dwell_s and i < len(values) - 1:
+                    reactor.pause(reactor.monotonic() + dwell_s)
+        finally:
+            # Restore the pre-sweep model (also on failure).
+            send_dynamics_model(engine, handle, baseline)
+            node.set_live_dynamics_profile(profile_path)
+        return sweeps
+
+    def cmd_SERVO_COMPARE_PIN(self, gcmd: Any) -> None:
+        if tomllib is None:
+            raise gcmd.error(
+                "SERVO_COMPARE_PIN requires Python 3.11+ (tomllib)"
+            )
+        kin = self._kin()
+        spatial = servo_strokes.spatial_frame(kin)
+        if spatial is None:
+            raise gcmd.error(
+                "SERVO_COMPARE_PIN needs servo rails on X/Y - no spatial "
+                "frame available"
+            )
+        mode_req = gcmd.get("MODE", "").upper()
+        wanted = [m for m in ("x", "y") if m.upper() in mode_req]
+        modes = [m for m in spatial["modes"] if m in wanted]
+        if len(modes) != 1:
+            raise gcmd.error(
+                "MODE= must select exactly one spatial mode (X or Y); got "
+                "%r from %s" % (mode_req, spatial["modes"])
+            )
+        mode = modes[0]
+        param = gcmd.get("PARAM", "").upper()
+        if param not in ("ZETA", "LEAD"):
+            raise gcmd.error(
+                "PARAM= is required and must be ZETA or LEAD (got %r)"
+                % (param,)
+            )
+        values = self._parse_pin_sweep_values(gcmd, param)
+        freq_start = gcmd.get_float("FREQ_START", None, above=0.0)
+        if freq_start is None:
+            raise gcmd.error("FREQ_START= is required (chirp start in Hz)")
+        freq_end = gcmd.get_float("FREQ_END", None, above=freq_start)
+        if freq_end is None:
+            raise gcmd.error(
+                "FREQ_END= is required (chirp end in Hz, above FREQ_START)"
+            )
+        if freq_start < 20.0 or freq_end > self.MAX_BUZZ_FREQ_HZ:
+            raise gcmd.error(
+                "chirp frequencies must be between 20 and %.0f Hz"
+                % (self.MAX_BUZZ_FREQ_HZ,)
+            )
+        hz_per_sec = gcmd.get_float("HZ_PER_SEC", 5.0, above=0.0)
+        amplitude = gcmd.get_float(
+            "AMPLITUDE", self.compliance_amplitude_mm, above=0.0
+        )
+        if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
+            raise gcmd.error(
+                "AMPLITUDE %.3f mm is not wire-representable (amplitude_nm "
+                "is u32; max %.1f mm)"
+                % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
+            )
+        duration = (freq_end - freq_start) / hz_per_sec
+        ramp = gcmd.get_float(
+            "RAMP", min(0.1 * duration, 3.0 / freq_start), above=0.0
+        )
+        dwell_s = gcmd.get_float("DWELL", 3.0, minval=0.0)
+        name = gcmd.get("NAME", "compare")
+        accel_chip, _accel_name = self._accel_chip(gcmd)
+        if accel_chip is None:
+            raise gcmd.error(
+                "ACCEL_CHIP= is required (pass it or set [servo_calibration] "
+                "accel_chip) - the comparison overlays accelerometer curves"
+            )
+        servos = list(spatial["axes"])
+        node = self._dynamics_node(gcmd, servos)
+        handle = node.get_engine_handle()
+        if handle is None:
+            raise gcmd.error(
+                "ethercat_node %s has no engine handle" % (node.name,)
+            )
+        engine = self.printer.lookup_object("motion_engine")
+        profile_path, baseline = self._load_baseline_dynamics(gcmd, node)
+        if mode not in baseline["modes"]:
+            raise gcmd.error(
+                "mode %s not in profile %s (modes %s)"
+                % (mode, profile_path, baseline["modes"])
+            )
+        mode_i = baseline["modes"].index(mode)
+        slot_for: dict[str, int] = {}
+        invert_for: dict[str, bool] = {}
+        for servo in servos:
+            slot = node.get_slot_for_motor(servo)
+            if slot is None:
+                raise gcmd.error(
+                    "motor %r is not on node %s" % (servo, node.name)
+                )
+            slot_for[servo] = slot
+            invert_for[servo] = bool(
+                getattr(self._resolve_motor(servo), "invert_direction", False)
+            )
+        sweeps = self._run_compare_sweep(
+            gcmd,
+            node,
+            handle,
+            engine,
+            servos,
+            slot_for,
+            invert_for,
+            spatial,
+            baseline,
+            profile_path,
+            mode,
+            mode_i,
+            param,
+            values,
+            freq_start,
+            freq_end,
+            hz_per_sec,
+            amplitude,
+            ramp,
+            dwell_s,
+            accel_chip,
+        )
+        path = self._compare_manifest_path(name)
+        manifest = self._append_compare_manifest(
+            gcmd,
+            path,
+            name,
+            mode,
+            param,
+            freq_start,
+            freq_end,
+            profile_path,
+            sweeps,
+        )
+        structured_log.event(
+            "calibration",
+            "pin_compare",
+            name=name,
+            mode=mode,
+            param=param,
+            values=values,
+            freq_start=freq_start,
+            freq_end=freq_end,
+            n_sweeps=len(manifest["sweeps"]),
+            manifest=path,
+        )
+        gcmd.respond_info(
+            "pin compare %s (mode %s, %s): %d sweep(s) this run, %d total "
+            "in manifest %s"
+            % (
+                name,
+                mode,
+                param,
+                len(sweeps),
+                len(manifest["sweeps"]),
+                path,
             )
         )
 

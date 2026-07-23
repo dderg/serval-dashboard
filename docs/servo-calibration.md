@@ -52,7 +52,7 @@ they are configured or passed.
 | `travel_speed` | `100` | CoreXY centering moves between grid points |
 | `compliance_amplitude` | `0.02` | default buzz amplitude (mm) for the compliance identification sweep (`SERVO_MEASURE_COMPLIANCE AMPLITUDE=`, `SERVO_TUNE_PIN MEASURE_AMPLITUDE=`) |
 | `pin_sweep_amplitude` | `0.01` | default dwell-tone amplitude (mm) for the pin staircases (`SERVO_SWEEP_PIN`/`SERVO_TUNE_PIN` `AMPLITUDE=`) |
-| `accel_chip` | — | accelerometer section name (e.g. `adxl345`); when set, `SERVO_CALIBRATE_GAINS` records vibration per step and the pin staircases (`SERVO_SWEEP_PIN`/`SERVO_TUNE_PIN`) score the toolhead accel at the tone (`ACCEL_CHIP=`) |
+| `accel_chip` | — | accelerometer section name (e.g. `adxl345`); when set, `SERVO_CALIBRATE_GAINS` records vibration per step, the pin staircases (`SERVO_SWEEP_PIN`/`SERVO_TUNE_PIN`) score the toolhead accel at the tone, and it is the default (and required) chip for `SERVO_COMPARE_PIN` (`ACCEL_CHIP=`) |
 | `captures_root` | `~/printer_data/logs/servo_captures` | parent directory for experiment run directories |
 | `journal_params` | — | comma list of drive SDO addresses (`addr[:type]`, e.g. `0x2001.0x31:u16`) read back from every captured drive at run start and recorded under `ambient.journal_params` in the manifest — the campaign's varied registers (notch mode, etc.) |
 | `servo_cal_binary` | `target/snapshot/servo-cal` | path to the `servo-cal` analysis binary |
@@ -695,6 +695,48 @@ physical spike directly. Suggested use: set `FREQ` to the old coupled peak
 toolhead accel there. Steps whose capture yields no samples report `n/a`,
 never a fake zero (the same honesty rule as the residual column).
 
+#### SERVO_COMPARE_PIN
+Sweeps one pin-rotor parameter (`ZETA` or `LEAD`) across a list of values
+and compares the **toolhead accelerometer response curve** each value
+produces, so a bench operator can overlay them and see which pin setting
+flattens the resonance. Unlike [`SERVO_SWEEP_PIN`](#servo_sweep_pin) — which
+dwells a single constant tone and scores one settled residual per value —
+this runs a full **swept-sine buzz (chirp)** `FREQ_START → FREQ_END` in the
+selected mode's frame pattern once per value, re-streaming the dynamics
+model live before each sweep (only the swept `PARAM` changes; the other pin
+parameter keeps its baseline value) and capturing the accelerometer over the
+whole sweep window.
+
+Each capture is reduced to an accel-vs-frequency curve. The chirp is linear,
+so sample time maps to instantaneous frequency
+(`f = FREQ_START + HZ_PER_SEC·t`); samples fall into ~1 Hz bins and each
+bin's mean 3-axis vector magnitude is the raw accel (`accel_mm_s2`). Because
+the buzz holds **constant displacement**, the raw accel grows like `f²`, so a
+normalized `response_ratio = accel / ((2π·f)²·amplitude_mm)` is stored
+alongside the raw column — that ratio divides out the geometric `f²` growth
+and leaves the actual mechanical transfer shape (peaks at the resonances).
+Per value the command reports the peak-response frequency and its ratio.
+
+Results are written to a comparison manifest at
+`<captures_root>/pin_compare/<NAME>/manifest.json`
+(`{name, created_utc, mode, param, freq_start, freq_end, baseline_profile,
+sweeps:[{value, hz_per_sec, amplitude_mm, curve_hz, accel_mm_s2,
+response_ratio}]}`). Re-invoking with the same `NAME` **appends** its sweeps
+to the existing manifest (build a comparison incrementally across runs); a
+`mode`/`param` mismatch on append errors rather than mixing unlike curves.
+The dashboard reads it over `GET /api/pin-compare` (list) and
+`GET /api/pin-compare/<name>` (full manifest) to overlay the curves.
+
+Measurement only — the pre-sweep model is restored at the end (also on any
+failure mid-sweep), and a failed run persists nothing. Params: `MODE=X|Y`
+(required, exactly one mode) `PARAM=ZETA|LEAD` (required) `VALUES` (comma
+list, nonempty, each validated by the `SERVO_SET_COMPLIANCE`
+`ZETA`/`PIN_LEAD_US` rules) `FREQ_START` `FREQ_END` (Hz, required,
+hard-limit validated) `HZ_PER_SEC` (default 5.0) `AMPLITUDE` (mm; config
+`compliance_amplitude`) `RAMP` `DWELL` (s between sweeps, default 3)
+`ACCEL_CHIP` (**required** — pass it or set `[servo_calibration] accel_chip`;
+the comparison is the accelerometer) `NAME` (default `compare`) `PROFILE`.
+
 #### SERVO_TUNE_PIN
 The full measured pin-rotor tuning campaign, chaining the identification
 and staircase primitives into one command so a bench operator gets a
@@ -871,6 +913,7 @@ Schemas: [servo-cal-contracts.md](servo-cal-contracts.md).
 | `SERVO_SWEEP_INERTIA` | `servo-cal analyze` | run dir + `results.json` (no automated pick, so `APPLY=1` always errors) |
 | `SERVO_SWEEP_ACCEL` | `servo-cal analyze` | run dir + `results.json` verdict (max non-railing accel); `APPLY=1` verifies at the recommended accel (no SDO write) |
 | `SERVO_SWEEP_PIN` | `servo-cal analyze` | run dir + `results.json` (per-step settled pin-residual magnitude; prints the `value → µm` table + winning `SERVO_SET_COMPLIANCE` line; nothing applied) |
+| `SERVO_COMPARE_PIN` | host-side chirp reduction (no `servo-cal`) | `<captures_root>/pin_compare/<NAME>/manifest.json` — one accel-vs-frequency curve (raw `accel_mm_s2` + normalized `response_ratio`) per swept value; same `NAME` appends; dashboard overlays via `/api/pin-compare`; nothing applied |
 | `SERVO_TUNE_PIN` | `servo-cal analyze` (per staircase) | run dir(s) + tuned `dynamics_<name>_<stamp>.toml` (per-mode coarse→fine `ZETA` + shared `LEAD` staircases; model stays live until RESTART; restores pre-tune model on failure) |
 | `SERVO_FIT_DYNAMICS`, `SERVO_CALIBRATE_INERTIA_RATIO` | `servo-cal fit` | run dir + `~/printer_data/config/servo_dynamics/dynamics_<name>_<stamp>.toml` + C00.06 |
 | `SERVO_TUNE_DYNAMICS` | `servo-cal fit --response ferr` (per capture) | run dir + tuned `dynamics_<name>_<stamp>.toml` when a pass beats the baseline (search is host-side; tuned model stays live until RESTART) |

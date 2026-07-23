@@ -148,6 +148,8 @@ fn path_method_inventory_matches_the_router() {
         "GET /api/live",
         "GET /api/live/{name}",
         "GET /api/live_tap",
+        "GET /api/pin-compare",
+        "GET /api/pin-compare/{name}",
         "GET /api/runs/{name}/manifest",
         "GET /api/runs/{name}/results",
         "GET /api/runs/{name}/plot_series",

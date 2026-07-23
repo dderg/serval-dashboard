@@ -720,6 +720,130 @@
         ],
         "type": "object"
       },
+      "PinCompareManifest": {
+        "description": "A named pin-parameter comparison: every sweep captured under one NAME,\naccumulated across coarse/fine passes. Stored at\n`<captures_root>/pin_compare/<name>/manifest.json`.",
+        "properties": {
+          "baseline_profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_utc": {
+            "type": "string"
+          },
+          "freq_end": {
+            "format": "double",
+            "type": "number"
+          },
+          "freq_start": {
+            "format": "double",
+            "type": "number"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "param": {
+            "type": "string"
+          },
+          "sweeps": {
+            "items": {
+              "$ref": "#/components/schemas/PinCompareSweep"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "created_utc",
+          "mode",
+          "param",
+          "freq_start",
+          "freq_end",
+          "sweeps"
+        ],
+        "type": "object"
+      },
+      "PinCompareSummary": {
+        "description": "The pin-compare list row: enough to populate the dropdown without\nshipping every curve.",
+        "properties": {
+          "created_utc": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "n_sweeps": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "param": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "mode",
+          "param",
+          "n_sweeps",
+          "created_utc"
+        ],
+        "type": "object"
+      },
+      "PinCompareSweep": {
+        "description": "One swept-sine buzz reduced to an accel-vs-frequency curve, plus the\nnormalized `response_ratio` (accel relative to commanded accel). Schema\nmirrors the Python-authored pin-compare manifest the sweep command writes.",
+        "properties": {
+          "accel_mm_s2": {
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "amplitude_mm": {
+            "format": "double",
+            "type": "number"
+          },
+          "curve_hz": {
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "hz_per_sec": {
+            "format": "double",
+            "type": "number"
+          },
+          "response_ratio": {
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "value": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "value",
+          "hz_per_sec",
+          "amplitude_mm",
+          "curve_hz",
+          "accel_mm_s2",
+          "response_ratio"
+        ],
+        "type": "object"
+      },
       "PlotAccel": {
         "properties": {
           "magnitude": {
@@ -2306,6 +2430,60 @@
           }
         },
         "summary": "This OpenAPI 3.1 document."
+      }
+    },
+    "/api/pin-compare": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PinCompareSummary"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Comparison summaries, newest first."
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "summary": "List pin-parameter comparisons, newest first."
+      }
+    },
+    "/api/pin-compare/{name}": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Comparison name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PinCompareManifest"
+                }
+              }
+            },
+            "description": "The comparison manifest, verbatim."
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "summary": "Full pin-parameter comparison manifest with every sweep's curves."
       }
     },
     "/api/runs": {

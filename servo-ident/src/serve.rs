@@ -60,6 +60,117 @@ pub struct RunPath {
     pub steps: Vec<RunPathStep>,
 }
 
+/// One swept-sine buzz reduced to an accel-vs-frequency curve, plus the
+/// normalized `response_ratio` (accel relative to commanded accel). Schema
+/// mirrors the Python-authored pin-compare manifest the sweep command writes.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PinCompareSweep {
+    pub value: f64,
+    pub hz_per_sec: f64,
+    pub amplitude_mm: f64,
+    pub curve_hz: Vec<f64>,
+    pub accel_mm_s2: Vec<f64>,
+    pub response_ratio: Vec<f64>,
+}
+
+/// A named pin-parameter comparison: every sweep captured under one NAME,
+/// accumulated across coarse/fine passes. Stored at
+/// `<captures_root>/pin_compare/<name>/manifest.json`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PinCompareManifest {
+    pub name: String,
+    pub created_utc: String,
+    pub mode: String,
+    pub param: String,
+    pub freq_start: f64,
+    pub freq_end: f64,
+    pub baseline_profile: Option<String>,
+    pub sweeps: Vec<PinCompareSweep>,
+}
+
+/// The pin-compare list row: enough to populate the dropdown without
+/// shipping every curve.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PinCompareSummary {
+    pub name: String,
+    pub mode: String,
+    pub param: String,
+    pub n_sweeps: usize,
+    pub created_utc: String,
+}
+
+const PIN_COMPARE_DIR: &str = "pin_compare";
+
+/// Scan `<captures_root>/pin_compare` for comparison directories holding
+/// `manifest.json`, newest (by manifest mtime) first. A missing directory
+/// is not an error — it just means no comparison has ever run here.
+fn list_pin_compares(captures_root: &Path) -> Result<Vec<PinCompareSummary>, String> {
+    let root = captures_root.join(PIN_COMPARE_DIR);
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let entries = std::fs::read_dir(&root).map_err(|e| format!("read {}: {e}", root.display()))?;
+    let mut rows = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", root.display()))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let manifest_path = path.join("manifest.json");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("read {}: {e}", manifest_path.display()))?;
+        let manifest: PinCompareManifest = serde_json::from_str(&text)
+            .map_err(|e| format!("{}: manifest parse: {e}", manifest_path.display()))?;
+        let manifest_mtime = mtime(&manifest_path)?;
+        rows.push((
+            manifest_mtime,
+            PinCompareSummary {
+                name: manifest.name,
+                mode: manifest.mode,
+                param: manifest.param,
+                n_sweeps: manifest.sweeps.len(),
+                created_utc: manifest.created_utc,
+            },
+        ));
+    }
+    rows.sort_by(|(a_mtime, a), (b_mtime, b)| {
+        b_mtime.cmp(a_mtime).then_with(|| b.name.cmp(&a.name))
+    });
+    Ok(rows.into_iter().map(|(_, r)| r).collect())
+}
+
+/// `GET /api/pin-compare`: comparison summaries for the pin-compare view's
+/// dropdown, newest first.
+fn handle_pin_compare_list(captures_root: &Path) -> Response {
+    match list_pin_compares(captures_root) {
+        Ok(list) => Response::json(
+            200,
+            serde_json::to_string(&list).expect("PinCompareSummary always serializes"),
+        ),
+        Err(e) => Response::text(500, "text/plain", e),
+    }
+}
+
+/// `GET /api/pin-compare/<name>`: the raw comparison manifest with every
+/// sweep's curves. `valid_run_name` keeps the path inside `captures_root`.
+fn handle_pin_compare_get(captures_root: &Path, name: &str) -> Response {
+    if !valid_run_name(name) {
+        return Response::not_found(&format!("invalid comparison name {name:?}"));
+    }
+    let path = captures_root
+        .join(PIN_COMPARE_DIR)
+        .join(name)
+        .join("manifest.json");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Response::json(200, text),
+        Err(e) => Response::not_found(&format!("{}: {e}", path.display())),
+    }
+}
+
 const NOTE_FILE: &str = "note.txt";
 
 fn read_note(run_dir: &Path) -> Result<Option<String>, String> {
@@ -573,6 +684,8 @@ pub fn handle(captures_root: &Path, req: &Request) -> Response {
             Response::json(200, crate::openapi::document().to_string())
         }
         ("GET", ["api", "runs"]) => handle_list(captures_root),
+        ("GET", ["api", "pin-compare"]) => handle_pin_compare_list(captures_root),
+        ("GET", ["api", "pin-compare", name]) => handle_pin_compare_get(captures_root, name),
         ("GET", ["api", "drive_state"]) => handle_drive_state(captures_root),
         ("GET", ["api", "live"]) => handle_live_status(captures_root),
         ("GET", ["api", "live", name]) => handle_live_tail(captures_root, name, &req.path),
