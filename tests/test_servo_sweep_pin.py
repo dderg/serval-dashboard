@@ -6,7 +6,6 @@ import pytest
 from fakes import FakeReactor
 from klippy.extras.servo_calibration.dynamics import (
     PIN_LEAD_US_MAX,
-    PIN_ZETA_MAX,
 )
 from test_servo_calibration_awd import (
     FakeGcmd,
@@ -198,15 +197,13 @@ def test_pin_sweep_values_validation_reuses_set_rules():
         _values(sc, "ZETA", "0.02")
     with pytest.raises(Exception, match="2..12"):
         _values(sc, "ZETA", ",".join("0.01" for _ in range(13)))
-    # ZETA: above 0 and <= PIN_ZETA_MAX (the SERVO_SET_COMPLIANCE ZETA rule)
+    # ZETA: finite and > 0, no upper cap (overdamped predictors are legal -
+    # the SERVO_SET_COMPLIANCE ZETA rule)
     with pytest.raises(Exception, match="ZETA"):
         _values(sc, "ZETA", "0.0,0.04")
     with pytest.raises(Exception, match="ZETA"):
-        _values(sc, "ZETA", "0.04,%g" % (PIN_ZETA_MAX + 0.01,))
-    assert _values(sc, "ZETA", "0.02,%g" % (PIN_ZETA_MAX,)) == [
-        0.02,
-        PIN_ZETA_MAX,
-    ]
+        _values(sc, "ZETA", "0.04,inf")
+    assert _values(sc, "ZETA", "0.02,1.4") == [0.02, 1.4]
     # LEAD: >= 0 and <= PIN_LEAD_US_MAX (the PIN_LEAD_US rule)
     with pytest.raises(Exception, match="LEAD"):
         _values(sc, "LEAD", "-1,100")
