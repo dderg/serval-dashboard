@@ -2279,16 +2279,38 @@ class DynamicsFitCommands(MeasureCommands):
         self, gcmd: Any, results: dict[str, Any], values: list[float]
     ) -> list[tuple[float, float | None]]:
         """Read the settled pin-residual magnitude the analyzer already
-        produces per step (drives[*].metrics.pin_residual_mm, the low-passed
-        |phasor| at the tone). The mode's residual rides the drive block of
-        the same index, so the max over the step's captured drives isolates
-        it. Errors when no pin channels are present or every step reads ~0."""
+        produces per step (drives[*].metrics.pin_residual_mm, the settled-
+        tail median |phasor| at the tone). The mode's residual rides the
+        drive block of the same index, so the max over the step's captured
+        drives isolates it. A step whose capture shows no excitation torque
+        (tone never ran - e.g. a lapsed buzz) scores None instead of a fake
+        near-zero residual: an unexcited dwell decays to silence and would
+        otherwise win every staircase. Errors when no pin channels are
+        present or every step reads ~0."""
         by_name = {s.get("name"): s for s in results.get("steps") or []}
+        # Excitation reference: the largest per-step actual-torque peak in
+        # the run (whole-capture, motion-flag independent - buzz captures
+        # latch FLAG_MOTION_ACTIVE unreliably). Steps below 10% of it did
+        # not carry the tone.
+        step_torque: dict[str, int] = {}
+        for name, step in by_name.items():
+            peak = 0
+            for drive in (step.get("drives") or {}).values():
+                t = ((drive.get("metrics") or {}).get("torque") or {}).get(
+                    "peak"
+                )
+                if t:
+                    peak = max(peak, abs(int(t)))
+            step_torque[name] = peak
+        torque_ref = max(step_torque.values(), default=0)
         rows: list[tuple[float, float | None]] = []
         for i, value in enumerate(values):
-            step = by_name.get("v%d" % (i,))
+            name = "v%d" % (i,)
+            step = by_name.get(name)
             residual_mm: float | None = None
-            if step is not None:
+            if step is not None and (
+                torque_ref == 0 or step_torque.get(name, 0) >= torque_ref // 10
+            ):
                 for drive in (step.get("drives") or {}).values():
                     mag = (drive.get("metrics") or {}).get("pin_residual_mm")
                     if mag is not None:
@@ -2351,11 +2373,13 @@ class DynamicsFitCommands(MeasureCommands):
             )
             if sign_cmd < 0.0:
                 sign_mask |= 1 << slot
-        # One tone spans every dwell; size it to cover the whole staircase
-        # plus the per-step re-stream overhead, and let it lapse (the buzz
-        # is duration-bounded - there is no early-stop command).
+        # One tone per step, started after the step's model re-stream: a
+        # single staircase-spanning tone depends on a guessed per-step
+        # overhead, and when capture start/stop runs long the tone lapses
+        # early - trailing steps then dwell in silence and score a fake
+        # ~0 residual (the bench tuner picked exactly those). A per-step
+        # tone makes each dwell's excitation deterministic.
         ramp = min(0.3, 3.0 / freq)
-        total_s = len(values) * (dwell_s + 0.5) + ramp + 1.0
         stroke_plan = {
             "freq": freq,
             "amplitude": amplitude,
@@ -2384,21 +2408,35 @@ class DynamicsFitCommands(MeasureCommands):
         )
         self._prep("X", 0)
         self._prep("Y", 0)
+        tone_end = 0.0
         try:
-            engine.resonance_buzz(
-                handle,
-                slot_mask,
-                sign_mask,
-                int(round(freq * 1000.0)),
-                int(round(freq * 1000.0)),
-                int(round(amplitude * 1e6)),
-                int(round(total_s * 1000.0)),
-                int(round(ramp * 1000.0)),
-            )
             for i, value in enumerate(values):
+                # The endpoint refuses a new buzz while one is armed: wait
+                # out the previous step's tone tail (it is oversized past
+                # the scored window on purpose).
+                now = reactor.monotonic()
+                if now < tone_end:
+                    reactor.pause(tone_end + 0.1)
                 updated = self._pin_sweep_model(baseline, mode_i, param, value)
                 send_dynamics_model(engine, handle, updated)
                 step_name = "v%d" % (i,)
+                # Tone covers this dwell only; generously oversized (it is
+                # duration-bounded and lapses harmlessly after the capture
+                # stops - the next step re-streams and starts its own).
+                engine.resonance_buzz(
+                    handle,
+                    slot_mask,
+                    sign_mask,
+                    int(round(freq * 1000.0)),
+                    int(round(freq * 1000.0)),
+                    int(round(amplitude * 1e6)),
+                    int(round((ramp + dwell_s + 2.0) * 1000.0)),
+                    int(round(ramp * 1000.0)),
+                )
+                tone_end = reactor.monotonic() + ramp + dwell_s + 2.0
+                # Let the tone ramp and the demodulator settle before the
+                # scored window opens.
+                reactor.pause(reactor.monotonic() + ramp)
                 t_start = round(reactor.monotonic(), 3)
                 self._start_capture(step_name, step_servos)
                 try:

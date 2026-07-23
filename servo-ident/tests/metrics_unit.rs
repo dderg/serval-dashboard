@@ -246,7 +246,7 @@ fn nopin_capture(samples: usize) -> Vec<u8> {
 }
 
 #[test]
-fn pin_residual_magnitude_and_phase_from_last_sample() {
+fn pin_residual_magnitude_and_phase_from_settled_tail() {
     let cap = Scap::from_bytes(&pin_capture(&[0.1, 0.2, 3.0], &[0.1, 0.2, 4.0])).unwrap();
     let s = drive_series(&cap, 0).unwrap();
     let m = compute_metrics(&s, 50, 1400, cap.fs(), 0).unwrap();
@@ -284,4 +284,21 @@ fn pin_phase_suppressed_below_noise_floor() {
     let mag = m.pin_residual_mm.expect("tiny magnitude still reported");
     assert!((mag - 5e-7).abs() < 1e-12, "mag={mag}");
     assert!(m.pin_phase_deg.is_none());
+}
+
+#[test]
+fn pin_residual_ignores_reset_trailing_zeros() {
+    // A model restore or pin reset racing the capture stop zeroes the
+    // demodulator; the settled-tail median must ignore those samples
+    // instead of reporting a fake 0.00 (which won bench staircases).
+    let re: Vec<f32> = (0..20).map(|k| if k < 16 { 3.0 } else { 0.0 }).collect();
+    let im: Vec<f32> = (0..20).map(|k| if k < 16 { 4.0 } else { 0.0 }).collect();
+    let cap = Scap::from_bytes(&pin_capture(&re, &im)).unwrap();
+    let s = drive_series(&cap, 0).unwrap();
+    let m = compute_metrics(&s, 50, 1400, cap.fs(), 0).unwrap();
+    let mag = m.pin_residual_mm.expect("magnitude present");
+    assert!(
+        (mag - 5.0).abs() < 1e-5,
+        "settled tail must ignore reset zeros: {mag}"
+    );
 }

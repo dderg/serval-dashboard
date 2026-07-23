@@ -213,3 +213,37 @@ def test_pin_sweep_values_validation_reuses_set_rules():
         0.0,
         PIN_LEAD_US_MAX,
     ]
+
+
+@requires_tomllib
+def test_pin_sweep_scores_gate_unexcited_steps():
+    # A step whose capture shows (almost) no actual torque never carried the
+    # tone (lapsed buzz): its near-zero residual is silence, not a win. It
+    # must score None instead of beating honestly excited steps.
+    sc, _gcode, _node, _path = _setup()
+    gcmd = FakeGcmd({})
+
+    def step(name, residual, torque_peak):
+        return {
+            "name": name,
+            "drives": {
+                "motor_a": {
+                    "metrics": {
+                        "pin_residual_mm": residual,
+                        "torque": {"peak": torque_peak},
+                    }
+                }
+            },
+        }
+
+    results = {
+        "steps": [
+            step("v0", 0.005, 400),
+            step("v1", 0.002, 380),
+            step("v2", 0.00001, 12),  # unexcited: 3% of the run's torque
+        ]
+    }
+    rows = sc._pin_sweep_scores(gcmd, results, [0.02, 0.05, 0.1])
+    assert rows[0][1] == 0.005
+    assert rows[1][1] == 0.002
+    assert rows[2][1] is None, "unexcited step must not score"

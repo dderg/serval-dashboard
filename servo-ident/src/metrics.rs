@@ -329,12 +329,28 @@ pub fn compute_metrics(
     if let (Some(re), Some(im)) = (&d.pin_res_re, &d.pin_res_im) {
         let any_nonzero = re.iter().chain(im.iter()).any(|&v| v != 0.0);
         if any_nonzero {
-            let re_last = re.last().copied().unwrap_or(0.0);
-            let im_last = im.last().copied().unwrap_or(0.0);
-            let mag = (re_last * re_last + im_last * im_last).sqrt();
-            metrics.pin_residual_mm = Some(mag);
-            if mag > 1e-6 {
-                metrics.pin_phase_deg = Some(im_last.atan2(re_last).to_degrees());
+            // Settled-tail median, not the last sample: a model restore or
+            // pin reset racing the capture stop zeroes the demodulator, and
+            // a last-sample readout then reports a fake 0.00 (the bench
+            // tuner picked edge values on exactly that artifact). Median
+            // |phasor| over the last 40% of samples, with exact trailing
+            // zeros (the reset residue) dropped first.
+            let mut tail_end = re.len();
+            while tail_end > 0 && re[tail_end - 1] == 0.0 && im[tail_end - 1] == 0.0 {
+                tail_end -= 1;
+            }
+            let tail_start = tail_end - (tail_end * 2) / 5;
+            let mut mags: Vec<f64> = (tail_start..tail_end).map(|k| re[k].hypot(im[k])).collect();
+            if !mags.is_empty() {
+                mags.sort_by(|a, b| a.total_cmp(b));
+                let mag = mags[mags.len() / 2];
+                metrics.pin_residual_mm = Some(mag);
+                if mag > 1e-6 {
+                    // Phase from the mid-tail sample nearest the median
+                    // magnitude window: use the settled last nonzero sample.
+                    let k = tail_end - 1;
+                    metrics.pin_phase_deg = Some(im[k].atan2(re[k]).to_degrees());
+                }
             }
         }
     }
