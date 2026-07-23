@@ -489,63 +489,57 @@ resume. Params: `MAX_ACCEL` `MAX_SPEED` `STEP` (0.15) `TERMS`
 `BOUND` `SMALL_SIZE`.
 
 #### SERVO_SET_COMPLIANCE
-Writes the per-mode **belt-compliance feedforward** term `1/ω_b²`
-into the dynamics profile (version 7) and streams it live (no
-restart). With a nonzero compliance the endpoint inverts the two-mass
-plant every DC cycle: the rotor is commanded to `x + a/ω_b²` — it
-deliberately leads the trajectory by exactly the belt stretch the
-commanded accel consumes — so the carriage follows the planner curve
-without ringing *from commanded motion*; the matching jerk term lands
-on the 60B1h velocity offset and the snap term in the 60B2h torque
-model automatically, evaluated analytically from the streamed
-trajectory pieces. On a coupled node the per-mode terms compose
-through the frame (`G = F⁺·diag(c)·F`), so per-axis frequencies map
-correctly onto CoreXY motors.
+Writes the per-mode **belt-compliance** term `1/ω_b²` into the
+dynamics profile and streams it live (no restart). Compliance is
+**identification data**: it records the locked-rotor belt frequency
+`f_b` per Cartesian mode and is the **pin-rotor's `ω_b` source**. The
+endpoint no longer applies a command-path geometry correction from it
+— that "mode B" position/velocity/torque lead has been retired.
+Geometry inversion — commanding
+`x + (2ζ/ω)·ẋ + (1/ω²)·ẍ` so the toolhead follows the nominal path —
+now lives in the **planner's `mode_inverse` post-processor stage**
+(see [`mode_inverse` config](#planner-mode_inverse-config) below), fed
+by these identified numbers. Because the endpoint no longer leads the
+command path, the old **double-correction hazard** (endpoint lead
+stacking with a planner inversion) is gone by construction.
 
 `X_FREQ`/`Y_FREQ` are the **locked-rotor** belt frequencies in Hz —
 the frequency the carriage rings at when the rotor holds still. This
 sits *above* the coupled frequency a plain `SERVO_MEASURE_RINGDOWN`
 reports (there the rotor recoils on the position-loop spring in
-series with the belt, which reads low), so feeding the raw ringdown
-frequency over-corrects: start above the measured value and iterate.
-`0` disables a mode; an omitted mode keeps its current value. The
-correction is bounded by `max_accel/ω_b²` (tens of µm at print
-accels), lives in the same transient offset channel as the trim and
-strain compensation (never baked into the streamed anchor, exactly
-zero at cruise and rest), and needs an accel-smooth command stream —
-run a `smooth_*` input-shaper kernel. Residual excitation the command
-didn't cause (cogging, reversals, model error) still rings at the old
-coupled frequency — keep a light shaper or the belt damper for that.
+series with the belt, which reads low). `0` clears a mode; an omitted
+mode keeps its current value. On a coupled node the per-mode terms
+compose through the frame (`G = F⁺·diag(c)·F`), so per-axis
+frequencies map correctly onto CoreXY motors.
 
-`PIN=XY|X|Y|0` switches the named mode(s) to **pin-rotor** (mode A)
-instead of the position lead (mode B): the endpoint holds the rotor on
-the planner path and cancels the belt reaction with a predictive torque,
-so the toolhead rings at the locked-rotor `f_b` where a standard input
-shaper applies. Pin needs the mode's compliance as its frequency source,
-so set `X_FREQ`/`Y_FREQ` in the same call (or apply it to an existing v7
-profile). Each pinned mode also needs its FRF **peak** frequency —
-`X_PEAK`/`Y_PEAK` in Hz, reported per mode by
-`SERVO_MEASURE_COMPLIANCE`. With the mode's notch `f_b` and peak
-`f_peak` the per-mode load fraction is `1 − (f_b/f_peak)²` and the
-pinned inertia is `pin_mass = mass·(1 − (f_b/f_peak)²)`. This replaces
-the old `RATIO`/C00.06 source: C00.06 is a per-drive gain-scheduling
-number, not per-mode physics, whereas the IV FRF's peak/notch ratio
-recovers the open-loop plant and gives the load fraction per mode.
-`X_ZETA`/`Y_ZETA` (default `0.02`)
-set the per-mode belt damping ratio for the predictor decay — `ZETA`
-is the shared fallback for a pinned mode that omits its own — and
-`PIN_LEAD_US`
+`PIN=XY|X|Y|0` switches the named mode(s) to **pin-rotor** (mode A):
+the endpoint holds the rotor on the planner path and cancels the belt
+reaction with a predictive torque, so the toolhead rings at the
+locked-rotor `f_b` where a standard input shaper applies. Pin needs
+the mode's compliance as its frequency source, so set `X_FREQ`/`Y_FREQ`
+in the same call (or apply it to an existing profile). Each pinned mode
+also needs its FRF **peak** frequency — `X_PEAK`/`Y_PEAK` in Hz,
+reported per mode by `SERVO_MEASURE_COMPLIANCE`. With the mode's notch
+`f_b` and peak `f_peak` the per-mode load fraction is `1 − (f_b/f_peak)²`
+and the pinned inertia is `pin_mass = mass·(1 − (f_b/f_peak)²)`. This
+replaces the old `RATIO`/C00.06 source: C00.06 is a per-drive
+gain-scheduling number, not per-mode physics, whereas the IV FRF's
+peak/notch ratio recovers the open-loop plant and gives the load
+fraction per mode. `X_ZETA`/`Y_ZETA` (default `0.02`) set the per-mode
+belt damping ratio for the predictor decay — `ZETA` is the shared
+fallback for a pinned mode that omits its own — and `PIN_LEAD_US`
 (default `0`) the pin torque's phase lead in microseconds; because the
-pin term lives at `f_b`, the lead is tuned by minimizing the mode's line
-in the rotor following-error PSD (or the pin residual telemetry once it
-is captured).
+pin term lives at `f_b`, the lead is tuned by minimizing the mode's
+line in the rotor following-error PSD (or the pin residual telemetry).
 
-Choose pin-rotor (A) when you want the rotor held and the correction
+The pin-rotor path (A) holds the rotor and makes the correction
 *measurable at the rotor encoder* — the belt reaction is cancelled at
-the source and what remains rings at `f_b`, which a shaper then handles.
-Choose position-lead (B) when you want the toolhead to follow the
-planner below `f_b`, with no shaper needed for the commanded content.
-Per mode the two are mutually exclusive.
+the source and what remains rings at `f_b`, which a shaper then
+handles. Toolhead-follows-the-planner behaviour below `f_b` is the job
+of the planner's `mode_inverse` stage, not the endpoint. The pin and
+`mode_inverse` are complementary: the pin damps residual excitation the
+command didn't cause (cogging, reversals, model error), while
+`mode_inverse` inverts the belt geometry for commanded motion.
 
 Baseline resolution matches `SERVO_TUNE_DYNAMICS` (`PROFILE=`, else
 the live-tuned model, else the configured node profile); the result
@@ -556,6 +550,38 @@ Params: `X_FREQ` `Y_FREQ` (Hz, ≥ 20; 0 disables) `PIN` (0)
 `X_PEAK` `Y_PEAK` (Hz, FRF peak, required per pinned mode) `X_ZETA`
 `Y_ZETA` (per-mode damping) `ZETA` (0.02, shared fallback)
 `PIN_LEAD_US` (0) `NAME` (compliance) `PROFILE` `SERVOS`.
+
+#### Planner mode_inverse config
+Geometry inversion — following the nominal path by commanding
+`x + (2ζ/ω)·ẋ + (1/ω²)·ẍ` — is a **planner** post-processor stage
+([`trajectory::algos::ModeInverse`]), not an endpoint correction. Enable
+it per axis with a `[post_processor]` section of `type: mode_inverse`
+and reference it from the axis, preceded by a short smoothing kernel
+(the inverse amplifies high frequencies via the `ẍ` term, so bandlimit
+its input):
+
+```
+[post_processor slew]
+type: smooth_bell
+smooth_time: 0.0015
+
+[post_processor belt_x]
+type: mode_inverse
+frequency_hz: 131.0
+damping_ratio: 0.05
+
+[axis x]
+post_processors: slew, belt_x
+```
+
+`frequency_hz` is the measured locked-rotor belt notch `f_b`
+(`SERVO_MEASURE_COMPLIANCE`) and `damping_ratio` is the mode's belt
+damping ratio ζ (the fine-ladder winner from `SERVO_TUNE_PIN`).
+`SERVO_MEASURE_COMPLIANCE` and `SERVO_TUNE_PIN` both print a
+ready-to-paste snippet per mode. Runtime-tunable via
+`SET_POST_PROCESSOR`; kernel and inversion are both LTI so config order
+does not change the math. Adding zero endpoint lead alongside the
+planner stage means there is no double-correction hazard.
 
 #### SERVO_MEASURE_COMPLIANCE
 Measures the locked-rotor belt frequency `f_b` per Cartesian mode —
@@ -575,9 +601,9 @@ the notch; the loop *is* the torque generator. `f_b` lands above the
 familiar coupled ringdown frequency and below the plant's two-mass
 peak, which is reported alongside as a sanity anchor.
 
-Re-measuring with a correction already applied stays honest either
-way: the position-lead (B) is suppressed for the buzz's duration, and
-a live pin (A) cannot bias the notch — the FRF is measured-torque →
+Re-measuring with the machine already tuned stays honest: the endpoint
+applies no command-path lead, and a live pin (A) cannot bias the notch
+— the FRF is measured-torque →
 position, and plant zeros don't care who generated the torque. Pinned
 modes do run their predictor through buzz cycles, so accelerometer
 resonance tests (`TEST_RESONANCES`) measure the *pinned* machine —
@@ -600,7 +626,11 @@ Measurement only — it changes nothing on the drives. The verdict
 carries `f_b`, `f_peak` and the implied compliance per mode, and the
 command prints the ready-to-run
 `SERVO_SET_COMPLIANCE X_FREQ=… X_PEAK=… Y_FREQ=… Y_PEAK=…` line (the
-peaks make it pin-complete, with the persistence reminder); when any
+peaks make it pin-complete, with the persistence reminder). It also
+prints a ready-to-paste planner
+[`mode_inverse` snippet](#planner-mode_inverse-config) per mode
+(`frequency_hz=f_b`); `damping_ratio` is a placeholder here — the belt
+ζ comes from `SERVO_SWEEP_PIN`/`SERVO_TUNE_PIN`. When any
 step is flagged it prints a
 re-measure warning instead of a recommendation. Params: `MODE=XY|X|Y`
 `FREQ_START` (60) `FREQ_END` (320) `HZ_PER_SEC` (1) `DURATION`
@@ -681,7 +711,10 @@ live until `RESTART`; any failure restores the pre-tune model and
 reports the partial results. The summary prints a per-mode table (`f_b`,
 `f_peak`, `zeta`, residual µm), the lead and its residual, and the
 ready-to-run `SERVO_SET_COMPLIANCE … X_ZETA=… Y_ZETA=… PIN_LEAD_US=…`
-line (per-mode `X_ZETA`/`Y_ZETA` spelling) plus the reminder to point
+line (per-mode `X_ZETA`/`Y_ZETA` spelling) for the pin, a ready-to-paste
+planner [`mode_inverse` snippet](#planner-mode_inverse-config) per mode
+(`frequency_hz=f_b`, `damping_ratio=` the fine-ladder belt ζ), plus the
+reminder to point
 `[ethercat_node] dynamics_profile` at the written TOML to keep it. Params:
 `MODES` (XY|X|Y) `DWELL` (s, 3) `AMPLITUDE` (mm, ladder tone, 0.01; config `pin_sweep_amplitude`) `MEASURE_AMPLITUDE` (mm, identification sweep, 0.02; config `compliance_amplitude`) `LEAD_VALUES`
 (`0,150,300,450,600`) `ZETA_COARSE` (`0.02,0.035,0.05,0.08,0.12,0.2,0.3`)

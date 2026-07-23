@@ -1188,6 +1188,12 @@ def test_measure_compliance_buzzes_each_mode_and_prints_the_apply_line():
         in r
     ]
     assert apply_lines, gcmd.responses
+    report = "\n".join(gcmd.responses)
+    assert "type: mode_inverse" in report
+    assert "frequency_hz: 214.0" in report
+    assert "frequency_hz: 141.0" in report
+    # measure-only: belt zeta is a marked placeholder, not a number
+    assert "damping_ratio: <belt zeta" in report
     assert "dynamics_profile" in apply_lines[-1]  # persistence hint
     manifest = _manifest_for(sc)
     assert manifest["experiment"] == "compliance"

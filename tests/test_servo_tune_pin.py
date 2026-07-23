@@ -124,6 +124,13 @@ def test_tune_pin_full_flow_applies_per_mode_zeta_and_shared_lead():
     assert "X_ZETA=" in report
     assert "Y_ZETA=" in report
     assert "PIN_LEAD_US=300" in report
+    # per-mode planner mode_inverse snippet: frequency_hz = measured f_b,
+    # damping_ratio = the fine-ladder belt zeta winner.
+    assert "type: mode_inverse" in report
+    assert "frequency_hz: 216.8" in report
+    assert "frequency_hz: 131.5" in report
+    assert "damping_ratio: %.4g" % (fine_x,) in report
+    assert "damping_ratio: %.4g" % (fine_y,) in report
     assert sc._active_run is None
 
 

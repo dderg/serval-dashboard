@@ -1660,36 +1660,34 @@ class DynamicsFitCommands(MeasureCommands):
                 self._active_run = None
 
     cmd_SERVO_SET_COMPLIANCE_help = (
-        "Write the per-mode belt-compliance feedforward term 1/omega_b^2 "
-        "into the dynamics profile and stream it live (no restart). With "
-        "a nonzero compliance the endpoint inverts the two-mass plant: "
-        "the rotor leads the commanded trajectory by accel/omega_b^2 - "
-        "exactly the belt stretch the accel consumes - so the carriage "
-        "follows the planner curve without ringing from commanded "
-        "motion (jerk and snap terms land on the 60B1h/60B2h streams "
-        "automatically). X_FREQ/Y_FREQ are the LOCKED-ROTOR belt "
-        "frequencies in Hz per Cartesian mode - the frequency the "
-        "carriage rings at when the rotor holds still. This sits ABOVE "
-        "the coupled frequency a plain ringdown measures (there the "
-        "rotor recoils on the position-loop spring in series with the "
-        "belt), so feeding the raw ringdown frequency OVER-corrects: "
-        "start above the measured value and tune down, or 0 to disable "
-        "a mode. An omitted mode keeps its current profile value. The "
-        "profile is written as a new timestamped v7 TOML (never "
+        "Write the per-mode belt-compliance term 1/omega_b^2 into the "
+        "dynamics profile and stream it live (no restart). Compliance is "
+        "IDENTIFICATION DATA: it records the locked-rotor belt frequency "
+        "f_b per Cartesian mode and is the pin-rotor's omega_b source. "
+        "The endpoint no longer applies a command-path geometry "
+        "correction from it - geometry inversion "
+        "(x + (2*zeta/omega)*xdot + (1/omega^2)*xddot) now lives in the "
+        "planner's mode_inverse post-processor stage ([post_processor] "
+        "type: mode_inverse, frequency_hz=, damping_ratio=), fed by "
+        "these identified numbers; run SERVO_MEASURE_COMPLIANCE / "
+        "SERVO_TUNE_PIN for a ready-to-paste snippet. Because the "
+        "endpoint no longer leads the command path, the old "
+        "double-correction hazard (endpoint lead + planner inversion "
+        "stacking) is gone by construction. X_FREQ/Y_FREQ are the "
+        "LOCKED-ROTOR belt frequencies in Hz per Cartesian mode - the "
+        "frequency the carriage rings at when the rotor holds still. An "
+        "omitted mode keeps its current profile value; 0 clears a mode. "
+        "The profile is written as a new timestamped v7 TOML (never "
         "overwritten) and left LIVE until RESTART - point "
-        "[ethercat_node] dynamics_profile at it to keep it. Residual "
-        "excitation the command didn't cause (cogging, reversals, model "
-        "error) still rings at the coupled frequency - keep a light "
-        "input shaper or the belt damper for that. Baseline profile "
-        "resolution matches SERVO_TUNE_DYNAMICS (PROFILE=, else the "
-        "live-tuned model, else the configured node profile). PIN "
-        "(XY|X|Y) pins the rotor for those modes: instead of the "
-        "position/velocity lead, the endpoint holds a predictive "
-        "torque against the modelled deflection, replacing the "
-        "compliance lead for that mode with an active hold. Pinning "
-        "needs the mode's FRF peak X_PEAK/Y_PEAK (Hz) alongside its "
-        "notch f_b (X_FREQ/Y_FREQ now or nonzero baseline compliance): "
-        "the per-mode load fraction is 1-(f_b/f_peak)^2 and the pinned "
+        "[ethercat_node] dynamics_profile at it to keep it. Baseline "
+        "profile resolution matches SERVO_TUNE_DYNAMICS (PROFILE=, else "
+        "the live-tuned model, else the configured node profile). PIN "
+        "(XY|X|Y) pins the rotor for those modes: the endpoint holds a "
+        "predictive torque against the modelled deflection so the "
+        "toolhead rings at the locked-rotor f_b. Pinning needs the "
+        "mode's FRF peak X_PEAK/Y_PEAK (Hz) alongside its notch f_b "
+        "(X_FREQ/Y_FREQ now or nonzero baseline compliance): the "
+        "per-mode load fraction is 1-(f_b/f_peak)^2 and the pinned "
         "mass is mass*fraction (run SERVO_MEASURE_COMPLIANCE, which "
         "reports f_peak per mode). X_ZETA/Y_ZETA (default 0.02) set the "
         "per-mode hold damping (ZETA is the shared fallback for modes "
@@ -2115,6 +2113,28 @@ class DynamicsFitCommands(MeasureCommands):
             )
         return node, freq_by_mode, peak_by_mode, flagged
 
+    def _mode_inverse_snippet(
+        self, mode: str, freq_hz: float, zeta: float | None
+    ) -> str:
+        """Build a ready-to-paste planner [post_processor] mode_inverse
+        config block for one Cartesian mode. Geometry inversion lives in
+        the planner now, not the endpoint: frequency_hz is the measured
+        locked-rotor belt notch f_b and damping_ratio is the mode's belt
+        zeta. Pair it with a short smoothing kernel on the same axis (the
+        inverse amplifies high frequencies). A None zeta prints a marked
+        placeholder (belt zeta comes from SERVO_SWEEP_PIN/SERVO_TUNE_PIN)."""
+        zeta_txt = (
+            "%.4g" % (zeta,)
+            if zeta is not None
+            else "<belt zeta - run SERVO_SWEEP_PIN/SERVO_TUNE_PIN>"
+        )
+        return (
+            "[post_processor belt_%s]\n"
+            "type: mode_inverse\n"
+            "frequency_hz: %.1f\n"
+            "damping_ratio: %s"
+        ) % (mode, freq_hz, zeta_txt)
+
     cmd_SERVO_MEASURE_COMPLIANCE_help = (
         "Measure the LOCKED-ROTOR belt frequency f_b per Cartesian mode "
         "- the number SERVO_SET_COMPLIANCE wants - from a mode-patterned "
@@ -2130,11 +2150,17 @@ class DynamicsFitCommands(MeasureCommands):
         "compliance_notch_shallow (< 6 dB - raise AMPLITUDE or narrow "
         "the band), compliance_flanks_incoherent, "
         "compliance_peak_below_notch (model violation - do not apply). "
-        "Measurement only: it changes nothing on the drives - it prints "
+        "Measurement only: it changes nothing on the drives. It prints "
         "the ready-to-run SERVO_SET_COMPLIANCE line (with X_PEAK/Y_PEAK "
-        "so it is pin-complete), which writes the v7 "
-        "profile and streams it live; point [ethercat_node] "
-        "dynamics_profile at the written TOML to survive RESTART. Params "
+        "so it is pin-complete), which writes/streams the compliance "
+        "identification data + pin omega_b source; then point "
+        "[ethercat_node] dynamics_profile at the written TOML to survive "
+        "RESTART. It also prints a ready-to-paste planner mode_inverse "
+        "config snippet per mode ([post_processor] type: mode_inverse, "
+        "frequency_hz=f_b, damping_ratio=belt zeta) - geometry inversion "
+        "runs in the planner now, not the endpoint, so damping_ratio is "
+        "a placeholder here (belt zeta comes from SERVO_SWEEP_PIN/"
+        "SERVO_TUNE_PIN). Params "
         "MODE=XY|X|Y FREQ_START (60) FREQ_END (320) HZ_PER_SEC (1) "
         "DURATION AMPLITUDE (0.02) RAMP DWELL_MS NAME (compliance)"
     )
@@ -2215,6 +2241,15 @@ class DynamicsFitCommands(MeasureCommands):
             "to apply (streams live, writes a v7 profile): %s | then "
             "point [ethercat_node %s] dynamics_profile at the written "
             "TOML to keep it across RESTART" % (apply_line, node.name)
+        )
+        snippets = "\n\n".join(
+            self._mode_inverse_snippet(m, freq_by_mode[m], None)
+            for m in sorted(freq_by_mode)
+        )
+        gcmd.respond_info(
+            "planner geometry inversion (endpoint no longer corrects the "
+            "command path) - paste per axis, preceded by a smoothing "
+            "kernel, and reference from [axis]:\n%s" % (snippets,)
         )
 
     cmd_SERVO_SWEEP_PIN_help = (
@@ -2663,7 +2698,10 @@ class DynamicsFitCommands(MeasureCommands):
         "winner is applied globally. The tuned model is written as a fresh "
         "timestamped profile (same writer SET uses) and left LIVE until "
         "RESTART; the summary prints the ready-to-run SERVO_SET_COMPLIANCE "
-        "line (X_ZETA/Y_ZETA spelling) and the reminder to point "
+        "line (X_ZETA/Y_ZETA spelling) for the pin, a ready-to-paste "
+        "planner mode_inverse config snippet per mode (frequency_hz=f_b, "
+        "damping_ratio=the fine-ladder belt zeta; geometry inversion runs "
+        "in the planner now, not the endpoint), and the reminder to point "
         "[ethercat_node] dynamics_profile at the written TOML to keep it. "
         "Any failure restores the pre-tune model and reports the partial "
         "results. Params MODES (XY|X|Y) DWELL (s, 3) AMPLITUDE (mm, ladder "
@@ -2969,4 +3007,14 @@ class DynamicsFitCommands(MeasureCommands):
                 node.name,
                 set_line,
             )
+        )
+        snippets = "\n\n".join(
+            self._mode_inverse_snippet(m, summary[m]["f_b"], summary[m]["zeta"])
+            for m in modes
+        )
+        gcmd.respond_info(
+            "planner geometry inversion (endpoint no longer corrects the "
+            "command path; the fine-ladder belt zeta feeds damping_ratio) "
+            "- paste per axis, preceded by a smoothing kernel, and "
+            "reference from [axis]:\n%s" % (snippets,)
         )
