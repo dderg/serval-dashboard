@@ -19,7 +19,6 @@ from .. import servo_axis, servo_strokes
 from .dynamics import (
     DYNAMICS_TERM_KEYS,
     PIN_LEAD_US_MAX,
-    PIN_ZETA_MAX,
     TUNE_MASS_FLOOR_FRACTION,
     TUNE_ZERO_FLOOR_STEPS,
     _copy_dynamics,
@@ -1747,7 +1746,10 @@ class DynamicsFitCommands(MeasureCommands):
                         "PIN must be XY, X, Y, or 0 (got %r)" % (raw,)
                     )
                 modes.add(mode_map[ch])
-        zeta = gcmd.get_float("ZETA", 0.02, above=0.0, maxval=PIN_ZETA_MAX)
+        # No upper cap: zeta >= 1 is a legitimate overdamped predictor.
+        zeta = gcmd.get_float("ZETA", 0.02, above=0.0)
+        if not math.isfinite(zeta):
+            raise gcmd.error("ZETA must be finite (got %r)" % (zeta,))
         pin_lead_us = gcmd.get_float(
             "PIN_LEAD_US", 0.0, minval=0.0, maxval=PIN_LEAD_US_MAX
         )
@@ -2163,14 +2165,14 @@ class DynamicsFitCommands(MeasureCommands):
                 v = float(p)
             except ValueError:
                 raise gcmd.error("VALUES entry %r is not a number" % (p,))
-            # Same rules as SERVO_SET_COMPLIANCE: ZETA above 0 and <= max
-            # (get_float above=0.0, maxval=PIN_ZETA_MAX); PIN_LEAD_US in
+            # Same rules as SERVO_SET_COMPLIANCE: ZETA finite and > 0 (no
+            # upper cap - overdamped predictors are legal); PIN_LEAD_US in
             # [0, PIN_LEAD_US_MAX] (minval=0.0, maxval=PIN_LEAD_US_MAX).
             if param == "ZETA":
-                if not 0.0 < v <= PIN_ZETA_MAX:
+                if not (math.isfinite(v) and v > 0.0):
                     raise gcmd.error(
-                        "VALUES ZETA entry %g must be > 0 and <= %g (same "
-                        "rule as SERVO_SET_COMPLIANCE ZETA)" % (v, PIN_ZETA_MAX)
+                        "VALUES ZETA entry %g must be a finite number > 0 "
+                        "(same rule as SERVO_SET_COMPLIANCE ZETA)" % (v,)
                     )
             elif not 0.0 <= v <= PIN_LEAD_US_MAX:
                 raise gcmd.error(

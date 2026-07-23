@@ -357,11 +357,14 @@ def test_pin_mass_without_compliance_is_rejected():
 
 
 def test_pin_zeta_out_of_range_is_rejected():
-    # Hard limit is zeta < 1 (exact-rotation math); heavily damped values
-    # below the 0.99 cap are legitimate and must parse.
-    ok = V8_TOML.replace("pin_zeta = [0.02, 0.1]", "pin_zeta = [0.8, 0.1]")
-    servo_calibration.parse_dynamics_profile(ok)
-    text = V8_TOML.replace("pin_zeta = [0.02, 0.1]", "pin_zeta = [1.0, 0.1]")
+    # No upper cap: zeta >= 1 is a legitimate overdamped predictor. Only
+    # sign and finiteness are hard invariants.
+    for ok in ("0.8", "1.0", "1.4", "10.0"):
+        text = V8_TOML.replace(
+            "pin_zeta = [0.02, 0.1]", "pin_zeta = [%s, 0.1]" % ok
+        )
+        servo_calibration.parse_dynamics_profile(text)
+    text = V8_TOML.replace("pin_zeta = [0.02, 0.1]", "pin_zeta = [-0.1, 0.1]")
     with pytest.raises(ValueError, match="pin_zeta"):
         servo_calibration.parse_dynamics_profile(text)
 

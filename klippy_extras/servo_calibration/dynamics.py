@@ -23,10 +23,6 @@ FF_LEAD_US_MAX = 10_000.0
 # Endpoint ceiling for the belt-compliance term 1/omega_b^2: 1/(2*pi*20 Hz)^2.
 # A mode softer than 20 Hz is a typo, not a belt.
 COMPLIANCE_MAX_S2 = 6.4e-4
-# Hard math limit (matches the endpoint): the pin predictor's exact-rotation
-# update uses omega_d = omega*sqrt(1-zeta^2), so zeta must stay strictly
-# below 1. Not a taste cap - heavily damped belt modes measure zeta >= 0.5.
-PIN_ZETA_MAX = 0.99
 PIN_LEAD_US_MAX = 10_000.0
 
 
@@ -138,15 +134,18 @@ def parse_dynamics_profile(text: str) -> dict[str, Any]:
             "profile pin_zeta must list %d per-mode values" % (n_modes,)
         )
     for v in pin_zeta:
+        # No upper cap: zeta >= 1 is a legitimate overdamped predictor (the
+        # endpoint evaluates all three damping regimes). Hard invariants
+        # are finiteness and sign only.
         if (
             isinstance(v, bool)
             or not isinstance(v, (int, float))
             or not math.isfinite(v)
-            or not (0.0 <= v <= PIN_ZETA_MAX)
+            or v < 0.0
         ):
             raise ValueError(
-                "profile pin_zeta values must be finite numbers in "
-                "[0, %g] (got %r)" % (PIN_ZETA_MAX, v)
+                "profile pin_zeta values must be finite numbers >= 0 "
+                "(got %r)" % (v,)
             )
     for k, m in enumerate(pin_mass):
         if m > 0.0 and not compliance[k] > 0.0:
