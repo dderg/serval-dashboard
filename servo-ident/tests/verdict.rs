@@ -157,3 +157,82 @@ fn dynamics_tune_defers_to_the_host_macro() {
 fn unknown_experiment_fails_loud() {
     assert!(compute_verdict("bogus", &[], &[]).is_err());
 }
+
+// ---- pin_sweep ------------------------------------------------------------
+
+fn pin_step(name: &str, residual_mm: Option<f64>) -> StepResult {
+    use servo_ident::metrics::{Metrics, TorqueSummary};
+    use servo_ident::resonance::Resonance;
+    use servo_ident::results::DriveResult;
+    let mut sr = step_result(name, &[]);
+    sr.drives.insert(
+        "motor_a".to_string(),
+        DriveResult {
+            metrics: Metrics {
+                samples: 100,
+                moves: Vec::new(),
+                torque_saturation_pct: 0.0,
+                torque: TorqueSummary {
+                    peak: 0,
+                    peak_pct_rated: 0.0,
+                    moving_samples: 0,
+                    rail_detected: false,
+                    rail_level: 0,
+                    rail_samples: 0,
+                    rail_pct_moving: 0.0,
+                    rail_ms: 0.0,
+                    longest_burst_ms: 0.0,
+                },
+                ferr_crosscheck_max: 0,
+                ff_velocity_offset_max: None,
+                ff_torque_offset_max: None,
+                pin_residual_mm: residual_mm,
+                pin_phase_deg: None,
+            },
+            psd_peaks: Vec::new(),
+            resonance: Resonance {
+                detected: false,
+                ratio: 0.0,
+                peak_hz: 0.0,
+            },
+        },
+    );
+    sr
+}
+
+#[test]
+fn pin_sweep_recommends_min_residual_step() {
+    let steps = vec![
+        pin_step("v0", Some(0.004)),
+        pin_step("v1", Some(0.0012)),
+        pin_step("v2", Some(0.009)),
+    ];
+    let manifest = vec![
+        manifest_step("v0", json!({"zeta": 0.02})),
+        manifest_step("v1", json!({"zeta": 0.05})),
+        manifest_step("v2", json!({"zeta": 0.1})),
+    ];
+    let v = compute_verdict("pin_sweep", &steps, &manifest).unwrap();
+    assert_eq!(v.recommended_step.as_deref(), Some("v1"));
+    assert!(
+        v.reason.contains("min residual 1.20 um at v1"),
+        "{}",
+        v.reason
+    );
+}
+
+#[test]
+fn pin_sweep_without_pin_channels_recommends_nothing() {
+    let steps = vec![pin_step("v0", None), pin_step("v1", None)];
+    let manifest = vec![
+        manifest_step("v0", json!({"zeta": 0.02})),
+        manifest_step("v1", json!({"zeta": 0.05})),
+    ];
+    let v = compute_verdict("pin_sweep", &steps, &manifest).unwrap();
+    assert!(v.recommended_step.is_none());
+    assert!(
+        v.reason.contains("no step carries pin residual"),
+        "{}",
+        v.reason
+    );
+}
