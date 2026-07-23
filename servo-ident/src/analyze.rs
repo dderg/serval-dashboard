@@ -1021,6 +1021,47 @@ pub fn compute_verdict(
                 apply: None,
             })
         }
+        "pin_sweep" => {
+            // One dwell tone per step; the swept pin parameter changes per
+            // step, so the settled residual magnitude (max over the step's
+            // drives - the mode rides one drive block) ranks the values.
+            let mut best: Option<(usize, f64)> = None;
+            let mut lines = Vec::new();
+            for (i, sr) in steps.iter().enumerate() {
+                let mag = sr
+                    .drives
+                    .values()
+                    .filter_map(|d| d.metrics.pin_residual_mm)
+                    .fold(None::<f64>, |acc, m| Some(acc.map_or(m, |a| a.max(m))));
+                match mag {
+                    Some(m) => {
+                        if best.is_none_or(|(_, b)| m < b) {
+                            best = Some((i, m));
+                        }
+                        lines.push(format!("{}: {:.2} um", sr.name, m * 1e3));
+                    }
+                    None => lines.push(format!("{}: no pin residual", sr.name)),
+                }
+            }
+            let (idx, reason) = match best {
+                Some((i, m)) => (
+                    Some(steps[i].name.clone()),
+                    format!(
+                        "min residual {:.2} um at {}; {}",
+                        m * 1e3,
+                        steps[i].name,
+                        lines.join(", ")
+                    ),
+                ),
+                None => (None, "no step carries pin residual channels".to_string()),
+            };
+            Ok(Verdict {
+                recommended_step: idx,
+                reason,
+                flags: Vec::new(),
+                apply: None,
+            })
+        }
         "tracking" | "inertia_grid" => Ok(Verdict {
             recommended_step: None,
             reason: "not a sweep".to_string(),
