@@ -546,10 +546,11 @@ def test_differential_rejects_single_drive_belts():
     assert not engine.buzzes
 
 
-def test_differential_rejects_oversized_amplitude():
+def test_differential_rejects_wire_unrepresentable_amplitude():
+    # The only hard limit: amplitude_nm is u32 on the wire (~4294.97 mm).
     sc, _gcode, engine = make_differential_calibration()
-    with pytest.raises(RuntimeError, match="differential ceiling"):
-        sc.cmd_SERVO_MEASURE_DIFFERENTIAL(FakeGcmd(BELT="A", AMPLITUDE="0.6"))
+    with pytest.raises(RuntimeError, match="wire-representable"):
+        sc.cmd_SERVO_MEASURE_DIFFERENTIAL(FakeGcmd(BELT="A", AMPLITUDE="4295"))
     assert not engine.buzzes
 
 

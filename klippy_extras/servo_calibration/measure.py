@@ -63,8 +63,8 @@ class MeasureCommands(CalibrationHost):
         amplitude = gcmd.get_float("AMPLITUDE", 0.05, above=0.0)
         if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
             raise gcmd.error(
-                "AMPLITUDE %.3f mm exceeds the %.1f mm differential ceiling "
-                "(belt strain between the pair is twice the amplitude)"
+                "AMPLITUDE %.3f mm is not wire-representable "
+                "(amplitude_nm is u32; max %.1f mm)"
                 % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
             )
         hz_per_sec = gcmd.get_float("HZ_PER_SEC", 5.0, above=0.0)
