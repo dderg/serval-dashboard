@@ -605,6 +605,9 @@ step is flagged it prints a
 re-measure warning instead of a recommendation. Params: `MODE=XY|X|Y`
 `FREQ_START` (60) `FREQ_END` (320) `HZ_PER_SEC` (1) `DURATION`
 `AMPLITUDE` (0.02 mm; config `compliance_amplitude`) `RAMP` `DWELL_MS` `NAME` (compliance).
+A live pin is cleared for the sweep's duration and restored afterwards -
+identification must measure the raw plant (an active pin cancels torque
+exactly around f_b and biases the notch estimate).
 
 #### SERVO_SWEEP_PIN
 Staircase-tunes one pin-rotor parameter (`ZETA` or `LEAD`, i.e.

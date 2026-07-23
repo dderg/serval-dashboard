@@ -1998,6 +1998,29 @@ class DynamicsFitCommands(MeasureCommands):
             invert_for[servo] = bool(
                 getattr(self._resolve_motor(servo), "invert_direction", False)
             )
+        # Identification must see the RAW plant: an active pin cancels the
+        # torque content exactly in the band around f_b, collapsing the FRF's
+        # S/N at the notch and letting the flank-coherence gate pull the
+        # estimate off-frequency (bench: f_b "moved" 128.8 -> 123.7 with the
+        # pin live). Stream a pin-cleared copy for the sweep and restore the
+        # live model afterwards (also on failure). No profile is written.
+        pin_restore: dict[str, Any] | None = None
+        try:
+            _bp, live = self._load_baseline_dynamics(gcmd, node)
+        except Exception:
+            live = None  # no baseline profile: nothing pinned, nothing to do
+        if live is not None and any(
+            m > 0.0 for m in live.get("pin_mass") or []
+        ):
+            cleared = _copy_dynamics(live)
+            cleared["pin_mass"] = [0.0] * len(live["pin_mass"])
+            cleared["pin_zeta"] = [0.0] * len(live["pin_mass"])
+            cleared["pin_lead_us"] = 0.0
+            send_dynamics_model(engine, handle, cleared)
+            pin_restore = live
+            gcmd.respond_info(
+                "pin cleared for the identification sweep (restored after)"
+            )
         stroke_plan = {
             "freq_start": freq_start,
             "freq_end": freq_end,
@@ -2067,6 +2090,9 @@ class DynamicsFitCommands(MeasureCommands):
             results = self._analyze_and_report(gcmd, run)
         finally:
             self._active_run = None
+            if pin_restore is not None:
+                # Put the live (pinned) model back, success or failure.
+                send_dynamics_model(engine, handle, pin_restore)
         freq_by_mode: dict[str, float] = {}
         peak_by_mode: dict[str, float] = {}
         flagged: list[str] = []

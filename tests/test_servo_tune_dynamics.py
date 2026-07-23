@@ -1302,3 +1302,30 @@ def test_tune_dynamics_resume_rejects_non_tune_run_dir():
     bogus = tempfile.mkdtemp()
     with pytest.raises(RuntimeError, match="manifest.json"):
         sc.cmd_SERVO_TUNE_DYNAMICS(FakeGcmd(TERMS="MASS", RESUME=bogus))
+
+
+@requires_tomllib
+def test_measure_compliance_clears_pin_for_the_sweep_and_restores():
+    # Identification must see the raw plant: a live pin cancels torque
+    # exactly around f_b and drags the notch estimate off-frequency
+    # (bench: 128.8 -> "123.7"). The sweep streams a pin-cleared model
+    # first and restores the pinned one afterwards.
+    sc, _gcode, path = make_calibration()
+    with open(path, "w") as f:
+        f.write(
+            BASELINE_TOML.replace("version = 6", "version = 8")
+            + "compliance = [1.0e-5, 1.5e-5]\n"
+            + "pin_mass = [0.010, 0.012]\n"
+            + "pin_zeta = [0.05, 0.06]\n"
+            + "pin_lead_us = 600.0\n"
+        )
+    sc.fake_compliance_by_step = {"y": _fake_notch("y", 141.0, 175.0)}
+    sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({"MODE": "Y"}))
+    engine = sc.printer.lookup_object("motion_engine")
+    # Exactly two streams: pin-cleared for the sweep, pinned restored after.
+    assert len(engine.dynamics_calls) == 2
+    cleared, restored = engine.dynamics_calls
+    assert cleared[6] == [0.0, 0.0], "pin_mass must be cleared for the sweep"
+    assert cleared[7] == [0.0, 0.0]
+    assert restored[6] == [0.010, 0.012], "pinned model must be restored"
+    assert restored[7] == [0.05, 0.06]
