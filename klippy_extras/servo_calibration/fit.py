@@ -3189,7 +3189,7 @@ class DynamicsFitCommands(MeasureCommands):
         structured_log.event(
             "calibration",
             "pin_compare",
-            name=name,
+            compare_name=name,
             mode=mode,
             param=param,
             values=values,
