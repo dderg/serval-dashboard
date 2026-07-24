@@ -324,12 +324,10 @@ def test_square_pattern_is_continuous_with_motion_anchor():
     assert plan["corner_x"] == 70.0 and plan["corner_y"] == 70.0, (
         "80 mm box centered on the (20,200) bounds center 110"
     )
-    assert plan["corner_velocity"] is None, (
-        "default keeps the machine's own corner budget (print-like)"
-    )
-    # Without CORNER_VELOCITY= the corner budget is left alone: kalico's
-    # SQUARE_CORNER_VELOCITY is only an alias for corner deviation, so
-    # touching it silently changes how rounded the corners are.
+    assert "corner_velocity" not in plan
+    # The corner budget is never touched: kalico's SQUARE_CORNER_VELOCITY
+    # is only an alias for corner deviation, so overriding it would
+    # silently change how print-like (rounded) the corners are.
     assert not any(
         "SQUARE_CORNER_VELOCITY" in s
         for s in gcode.scripts
@@ -344,23 +342,6 @@ def test_square_pattern_is_continuous_with_motion_anchor():
     # Legs alternate X and Y between the two corner coordinates.
     assert _step_extents(gcode, "X") == {70.0, 150.0}
     assert _step_extents(gcode, "Y") == {70.0, 150.0}
-
-
-def test_square_corner_velocity_raises_the_budget():
-    sc, gcode = make_calibration()
-    sc.cmd_SERVO_MEASURE_RINGDOWN(
-        FakeGcmd(PATTERN="SQUARE", SPEEDS="100", CORNER_VELOCITY=40)
-    )
-    scv_lines = [
-        line
-        for s in gcode.scripts
-        if isinstance(s, str)
-        for line in s.splitlines()
-        if "SQUARE_CORNER_VELOCITY" in line
-    ]
-    assert scv_lines == [
-        "SET_VELOCITY_LIMIT ACCEL=25000 SQUARE_CORNER_VELOCITY=40"
-    ]
 
 
 def test_square_leg_too_short_fails_loud():

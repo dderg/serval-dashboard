@@ -311,27 +311,26 @@ def emit_square_flowing(
     accel: float,
     iterations: int,
     dwell: int,
-    corner_velocity: float | None = None,
 ) -> float:
     """Square laps (corner at (x0, y0), CCW) as one continuous polyline.
-    The planner takes each 90 degree corner within its corner-deviation
-    budget - rounded, at whatever corner speed that budget allows -
-    exactly what a print corner does (kalico's SQUARE_CORNER_VELOCITY is
-    only a compatibility alias for that budget; there is no instantaneous
-    corner). `corner_velocity` optionally raises the budget for this run.
-    Corner times are NOT modelled here: the analyzer reads them off the
-    capture's own commanded target reversals. Returns the print-time
-    fence read while still parked at (x0, y0) - the motion-start anchor
-    that maps accelerometer print-times onto capture samples. A trailing
-    dwell keeps the capture open past the final stop's ring. The caller
-    restores velocity limits afterwards."""
+    The planner takes each 90 degree corner within the corner-deviation
+    budget from the user's config - rounded, at whatever corner speed
+    that budget allows - exactly what a print corner does. Deliberately
+    never touched here: kalico's SQUARE_CORNER_VELOCITY is only a
+    compatibility alias for that budget and there is no instantaneous
+    corner, so overriding it would silently change how print-like the
+    corners are. Corner times are NOT modelled: the analyzer reads them
+    off the capture's own commanded target reversals. Returns the
+    print-time fence read while still parked at (x0, y0) - the
+    motion-start anchor that maps accelerometer print-times onto capture
+    samples. A trailing dwell keeps the capture open past the final
+    stop's ring. The caller restores velocity limits afterwards."""
     check_reachable(gcode, size, speed, accel)
     toolhead = printer.lookup_object("toolhead")
     feed = int(speed * 60)
-    limits = "SET_VELOCITY_LIMIT ACCEL=%.0f" % (accel,)
-    if corner_velocity is not None:
-        limits += " SQUARE_CORNER_VELOCITY=%.0f" % (corner_velocity,)
-    gcode.run_script_from_command(limits + "\nG90")
+    gcode.run_script_from_command(
+        "SET_VELOCITY_LIMIT ACCEL=%.0f\nG90" % (accel,)
+    )
     # Machine is parked at (x0, y0): the fence read is free.
     t0 = toolhead.get_last_move_time()
     corners = [
