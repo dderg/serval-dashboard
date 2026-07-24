@@ -12,12 +12,16 @@ from test_servo_calibration_awd import (
 )
 from test_servo_sweep_pin import FakeAccelClient, _pinned_profile
 
+GRAVITY_MM_S2 = 9810.0
+
 
 class FakeChirpChip:
     """Emits one client per started capture whose samples span the linear
-    chirp FREQ_START->FREQ_END at HZ_PER_SEC. Each sample's three axes carry
-    an equal share of a constant vector-magnitude accel (per-value amplitude
-    popped from ``amps``; None -> empty capture). The timestamps map, via the
+    chirp FREQ_START->FREQ_END at HZ_PER_SEC. Each capture is a real
+    oscillation: the two horizontal axes share a sine of total amplitude
+    ``amp`` (per-value, popped from ``amps``; None -> empty capture) at the
+    instantaneous chirp frequency, and the vertical axis carries gravity
+    the way a real accelerometer reports it. The timestamps map, via the
     reducer's f = freq_start + hz_per_sec*(t - t0), across the whole band."""
 
     def __init__(self, freq_start, freq_end, hz_per_sec, amps=None, fs=1000.0):
@@ -39,10 +43,18 @@ class FakeChirpChip:
         if amp is not None:
             duration = (self.freq_end - self.freq_start) / self.hz_per_sec
             n = int(duration * self.fs)
-            a = amp / math.sqrt(3.0)
+            a = amp / math.sqrt(2.0)
             for k in range(n + 1):
-                t = 100.0 + k / self.fs
-                samples.append((t, a, a, a))
+                dt = k / self.fs
+                phase = (
+                    2.0
+                    * math.pi
+                    * (self.freq_start * dt + self.hz_per_sec * dt * dt / 2.0)
+                )
+                swing = math.sin(phase)
+                samples.append(
+                    (100.0 + dt, a * swing, a * swing, GRAVITY_MM_S2)
+                )
         client = FakeAccelClient(samples)
         self.clients.append(client)
         return client
@@ -88,28 +100,64 @@ def _manifest(sc, name="cmp"):
 # ---- reduction / normalization math -----------------------------------
 
 
-def test_chirp_reduction_bins_and_normalizes():
+def _sine_bin(f_tone, amp, t0, n=400, fs=1000.0, offset=0.0):
+    """One axis oscillating at f_tone with amplitude amp, riding on offset."""
+    out = []
+    for k in range(n):
+        t = t0 + k / fs
+        out.append(
+            (t, amp * math.sin(2.0 * math.pi * f_tone * (t - t0)) + offset)
+        )
+    return out
+
+
+def test_chirp_reduction_recovers_amplitude_and_rejects_gravity():
     sc, *_ = _setup()
-    # freq_start=100, hz_per_sec=1 -> f = 100 + (t - t0). t0 is the first
-    # sample time. bin idx = int(f - 100): samples at f in [100,101) share
-    # bin 0 (center 100.5), [101,102) share bin 1 (center 101.5). A sample
-    # past freq_end is dropped, never a fake tail bin.
+    # A pure 100.5 Hz tone of amplitude 400 on x, gravity parked on z. The
+    # bin must report the sine AMPLITUDE, not its rectified mean (0.637*A)
+    # and not the gravity-dominated vector magnitude.
     samples = [
-        (0.0, 3.0, 4.0, 0.0),  # f=100.0 -> bin0, mag 5
-        (0.5, 0.0, 6.0, 8.0),  # f=100.5 -> bin0, mag 10
-        (1.2, 1.0, 2.0, 2.0),  # f=101.2 -> bin1, mag 3
-        (5.0, 9.0, 9.0, 9.0),  # f=105.0 > freq_end=103 -> dropped
+        (t, x, 0.0, GRAVITY_MM_S2)
+        for t, x in _sine_bin(100.5, 400.0, 0.0, n=400)
     ]
     curve, accel, ratio = sc._chirp_accel_curve(
         samples, 100.0, 103.0, 1.0, 75.0
     )
+    assert curve == [100.5]
+    assert accel == pytest.approx([400.0], rel=2e-3)
+    assert ratio == pytest.approx([400.0 / (75.0 * 100.5)], rel=2e-3)
+
+
+def test_chirp_reduction_bins_by_instantaneous_frequency():
+    sc, *_ = _setup()
+    # freq_start=100, hz_per_sec=1 -> f = 100 + (t - t0), so bin idx =
+    # int(f - 100): [100,101) is bin 0 (center 100.5), [101,102) is bin 1
+    # (center 101.5). Samples past freq_end are dropped, never a fake tail
+    # bin. Two axes at equal amplitude combine as vector magnitude.
+    samples = []
+    for t, x in _sine_bin(100.5, 300.0, 0.0, n=400):
+        samples.append((t, x, x, GRAVITY_MM_S2))
+    for t, x in _sine_bin(101.5, 100.0, 1.05, n=400):
+        samples.append((t, x, 0.0, GRAVITY_MM_S2))
+    samples.append((5.0, 9.0, 9.0, 9.0))  # f=105 > freq_end -> dropped
+    curve, accel, ratio = sc._chirp_accel_curve(
+        samples, 100.0, 103.0, 1.0, 75.0
+    )
     assert curve == [100.5, 101.5]
-    # per-bin mean of the 3-axis vector magnitude
-    assert accel == pytest.approx([7.5, 3.0])
-    # response ratio divides by the commanded accel ApH * f (the chirp is
-    # constant velocity-amplitude, so commanded accel grows linearly in f)
+    assert accel == pytest.approx([300.0 * math.sqrt(2.0), 100.0], rel=2e-3)
     for f_c, a, r in zip(curve, accel, ratio):
         assert r == pytest.approx(a / (75.0 * f_c))
+
+
+def test_chirp_reduction_reports_zero_for_a_dc_only_capture():
+    sc, *_ = _setup()
+    # Gravity with no excitation is not a response. The old rectified-mean
+    # reduction reported the full vector magnitude here.
+    samples = [(k / 1000.0, 0.0, 0.0, GRAVITY_MM_S2) for k in range(400)]
+    _curve, accel, _ratio = sc._chirp_accel_curve(
+        samples, 100.0, 103.0, 1.0, 75.0
+    )
+    assert accel == pytest.approx([0.0], abs=1e-6)
 
 
 def test_chirp_reduction_empty_capture_is_empty_not_zero():
@@ -144,8 +192,9 @@ def test_compare_writes_manifest_per_contract():
         assert n > 0
         assert len(s["accel_mm_s2"]) == n
         assert len(s["response_ratio"]) == n
-        # constant-magnitude synthetic capture -> every bin equals amp
-        assert s["accel_mm_s2"] == pytest.approx([amp] * n)
+        # constant-amplitude chirp -> every bin recovers that amplitude,
+        # to within the edge effect of a finite (non-integer-cycle) bin
+        assert s["accel_mm_s2"] == pytest.approx([amp] * n, rel=1e-2)
         for f_c, a, r in zip(
             s["curve_hz"], s["accel_mm_s2"], s["response_ratio"]
         ):

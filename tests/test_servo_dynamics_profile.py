@@ -268,6 +268,7 @@ def test_compliance_on_v6_profile_is_rejected():
         "[-1.0e-6, 7.0e-6]",  # negative
         "[nan, 7.0e-6]",  # non-finite
         "[1.0e-2, 7.0e-6]",  # softer than the 20 Hz endpoint floor
+        "[1.0e-4, 7.0e-6]",  # 15.9 Hz - just softer than that floor
         "[true, 7.0e-6]",  # non-numeric
     ],
 )
@@ -278,6 +279,16 @@ def test_parse_v7_profile_rejects_bad_compliance(value):
                 "compliance = [1.76e-5, 7.0e-6]", "compliance = %s" % (value,)
             )
         )
+
+
+def test_parse_v7_profile_accepts_a_belt_just_inside_the_floor():
+    # 6.0e-5 s^2 is ~20.5 Hz, just stiffer than the 20 Hz floor.
+    p = servo_calibration.parse_dynamics_profile(
+        V7_TOML.replace(
+            "compliance = [1.76e-5, 7.0e-6]", "compliance = [6.0e-5, 7.0e-6]"
+        )
+    )
+    assert p["compliance"][0] == 6.0e-5
 
 
 def test_rendered_toml_is_v7_and_round_trips_compliance():

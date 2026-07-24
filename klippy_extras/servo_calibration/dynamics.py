@@ -21,8 +21,9 @@ TUNE_MASS_FLOOR_FRACTION = 0.10
 TUNE_ZERO_FLOOR_STEPS = {"VISCOUS": 0.05, "COULOMB": 5.0}
 FF_LEAD_US_MAX = 10_000.0
 # Endpoint ceiling for the belt-compliance term 1/omega_b^2: 1/(2*pi*20 Hz)^2.
-# A mode softer than 20 Hz is a typo, not a belt.
-COMPLIANCE_MAX_S2 = 6.4e-4
+# A mode softer than 20 Hz is a typo, not a belt. Must match
+# COMPLIANCE_MAX_S2 in kalico's ethercat-rt/src/dynamics.rs.
+COMPLIANCE_MAX_S2 = 6.34e-5
 PIN_LEAD_US_MAX = 10_000.0
 
 

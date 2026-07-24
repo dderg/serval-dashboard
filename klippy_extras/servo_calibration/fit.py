@@ -2836,35 +2836,45 @@ class DynamicsFitCommands(MeasureCommands):
     ) -> tuple[list[float], list[float], list[float]]:
         """Reduce a swept-sine accel capture to accel-vs-frequency curves.
         The linear chirp maps capture time to instantaneous frequency
-        (f = freq_start + hz_per_sec*(t - t0)); samples land in ~1 Hz bins
-        and each bin's 3-axis vector-magnitude mean is the raw accel. The
-        endpoint's chirp holds the velocity amplitude constant (displacement
-        scales as 1/f), so the commanded accel is accel_per_hz * f - the
-        response_ratio column divides each bin by exactly that, making 1.0
-        = perfect command tracking at every frequency. Returns (curve_hz,
-        accel_mm_s2, response_ratio) sorted by frequency. Empty capture ->
-        three empty lists (never a fake zero)."""
+        (f = freq_start + hz_per_sec*(t - t0)), so samples land in 1 Hz
+        bins. Per bin each axis is mean-removed and converted to a sine
+        amplitude (rms*sqrt(2)), then the axes combine as vector magnitude.
+        Mean removal is what drops the ~9810 mm/s^2 gravity vector the
+        accelerometer reports on top of the excitation; amplitude (not
+        rectified mean) is what makes the number comparable to the
+        commanded accel. The endpoint's chirp holds the velocity amplitude
+        constant (displacement scales as 1/f), so the commanded accel is
+        accel_per_hz * f - the response_ratio column divides each bin by
+        exactly that, making 1.0 = perfect command tracking at every
+        frequency. Returns (curve_hz, accel_mm_s2, response_ratio) sorted
+        by frequency. Empty capture -> three empty lists (never a fake
+        zero)."""
         if not samples:
             return [], [], []
         t0 = samples[0][0]
-        bins: dict[int, list[float]] = {}
+        bins: dict[int, list[list[float]]] = {}
         for sample in samples:
             f = freq_start + hz_per_sec * (sample[0] - t0)
             if f < freq_start or f > freq_end:
                 continue
             idx = int(f - freq_start)  # 1 Hz bins anchored at freq_start
-            mag = math.sqrt(
-                sample[1] * sample[1]
-                + sample[2] * sample[2]
-                + sample[3] * sample[3]
-            )
-            bins.setdefault(idx, []).append(mag)
+            axes = bins.setdefault(idx, [[], [], []])
+            for axis in range(3):
+                axes[axis].append(sample[1 + axis])
         curve_hz: list[float] = []
         accel_mm_s2: list[float] = []
         response_ratio: list[float] = []
         for idx in sorted(bins):
+            axes = bins[idx]
+            if len(axes[0]) < 2:
+                continue
             f_c = freq_start + idx + 0.5
-            a = sum(bins[idx]) / len(bins[idx])
+            total_sq = 0.0
+            for values in axes:
+                mean = sum(values) / len(values)
+                var = sum((v - mean) * (v - mean) for v in values) / len(values)
+                total_sq += 2.0 * var
+            a = math.sqrt(total_sq)
             curve_hz.append(round(f_c, 4))
             accel_mm_s2.append(a)
             denom = accel_per_hz * f_c
