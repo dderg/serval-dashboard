@@ -931,3 +931,53 @@ dashboard; `--drive` restricts to one drive in a multi-drive capture, `--csv`
 exports samples. The four gain/inertia/refine/accel sweep-report scripts and
 the fit-dynamics wrapper script were deleted — their metrics and verdict logic
 moved into `servo-cal`.
+
+## Capture retention / disk budget
+
+Run directories accumulate under `<captures_root>`
+(`~/printer_data/logs/servo_captures` on the bench) and the raw `.scap`
+payloads are large. `scripts/servo-capture-prune` keeps the tree within a byte
+budget; `install.sh` installs it as `servo-capture-prune.service` (oneshot,
+`Nice=19` + `IOSchedulingClass=idle`) driven by `servo-capture-prune.timer`
+(`OnCalendar=daily`, `OnBootSec=15min`, `Persistent=true`).
+
+Policy, applied in order every run:
+
+1. **Compress cold payloads.** For any run dir whose newest file is older than
+   `--cold-age-hours` (default **48h**), each `*.scap` is recompressed in place
+   with `zstd -19 --rm` to `*.scap.zst`. Small analysis artifacts
+   (`manifest.json`, `results.json`, `plot_series.json`, …) are left readable so
+   the dashboard's run list and plots keep working for compressed runs.
+2. **Budget prune.** While the total exceeds `--budget-gib` (default **8 GiB**),
+   the oldest whole run dir (ordered by newest-file mtime) is deleted,
+   oldest-first. `pin_compare/<name>` dirs are last-resort: they are only
+   touched after every ordinary run has been exhausted.
+3. **Min-keep floor.** Nothing newer than `--min-keep-hours` (default **24h**)
+   is ever deleted. If the budget cannot be met without deleting a dir inside
+   that window, the prune pass refuses — it deletes **nothing** and exits
+   nonzero with a loud message (so the timer run is marked failed and the
+   captures are left intact for you to clear space manually).
+
+`--dry-run` prints the full plan (compressions + deletions) and modifies
+nothing.
+
+### Changing the budget
+
+Edit the `ExecStart` line in the installed unit
+(`~/servo-cal/servo-capture-prune.service`) to append the flag, e.g.
+`--budget-gib 20`, then `sudo systemctl daemon-reload`. To make it permanent,
+edit `service/servo-capture-prune.service` in this repo and re-run
+`./install.sh`. Run it by hand any time with:
+
+```sh
+~/servo-cal/servo-capture-prune --root ~/printer_data/logs/servo_captures --dry-run
+```
+
+### Re-analyzing a compressed capture
+
+A compressed `.scap.zst` is **not** readable by `servo-cal` or
+`scripts/servo_capture.py` directly. Decompress it first:
+
+```sh
+zstd -d run_dir/step_foo.scap.zst      # -> run_dir/step_foo.scap
+```

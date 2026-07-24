@@ -1,0 +1,10 @@
+[Unit]
+Description=serval servo capture retention (compress cold + budget prune)
+After=network.target
+
+[Service]
+Type=oneshot
+User=@SERVO_CAL_USER@
+Nice=19
+IOSchedulingClass=idle
+ExecStart=@SERVO_CAL_HOME@/servo-capture-prune --root @SERVO_CAPTURES_DIR@
