@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -22,8 +23,6 @@ _loader = importlib.machinery.SourceFileLoader(
 )
 _spec = importlib.util.spec_from_loader("servo_capture_prune", _loader)
 prune = importlib.util.module_from_spec(_spec)
-import sys
-
 sys.modules["servo_capture_prune"] = prune
 _loader.exec_module(prune)
 
