@@ -36,15 +36,53 @@ pub struct RingdownOptions {
     pub window_s: f64,
     pub band_hz: (f64, f64),
 }
-/// Timing plan for a flowing-square step (`PATTERN=SQUARE`): the motion is
-/// one continuous polyline with full-speed corners, so tails cannot come
-/// from standstill segments — corner times are analytic instead. Constant
-/// -|v| legs last exactly `leg_s`; the first leg adds the spin-up
-/// `spin_s = v/(2a)` and the last the spin-down.
+/// Flowing-square step (`PATTERN=SQUARE`): the motion is one continuous
+/// polyline whose corners the planner rounds within its corner-deviation
+/// budget (kalico's SQUARE_CORNER_VELOCITY is only a compatibility alias
+/// for that budget — corners are never instantaneous). Corner times are
+/// therefore never modelled: they are read off the capture's own
+/// commanded target reversals. `motion_start_pt` is the print-time fence
+/// klippy read while parked before the lap; it anchors accelerometer
+/// tails (whose CSV runs on print time) to capture sample indices.
 #[derive(Debug, Clone, Copy)]
 pub struct FlowPlan {
-    pub leg_s: f64,
-    pub spin_s: f64,
+    pub motion_start_pt: Option<f64>,
+}
+
+/// Commanded corner events inside a flowing square: on a CoreXY square
+/// exactly one drive's commanded velocity reverses sign per corner (zero
+/// plateaus skipped), so the union of per-drive target-velocity sign
+/// changes over the motion span, deduped within a small window, is the
+/// corner list. Ground truth from the planner's own output — no geometry
+/// or corner-speed assumptions.
+fn corner_reversals(cap: &Scap, span: (usize, usize)) -> Result<Vec<usize>, String> {
+    let (s, e) = span;
+    let fs = cap.fs();
+    let merge = (0.005 * fs).round() as usize;
+    let mut events: Vec<usize> = Vec::new();
+    for idx in 0..cap.header.drives.len() {
+        let target = cap.read_i64(idx, "target_counts")?;
+        let mut last_sign = 0i64;
+        for k in s.max(1)..e.min(target.len()) {
+            let v = target[k] - target[k - 1];
+            if v == 0 {
+                continue;
+            }
+            let sign = v.signum();
+            if last_sign != 0 && sign != last_sign {
+                events.push(k);
+            }
+            last_sign = sign;
+        }
+    }
+    events.sort_unstable();
+    let mut merged: Vec<usize> = Vec::new();
+    for ev in events {
+        if merged.last().is_none_or(|&m| ev - m > merge) {
+            merged.push(ev);
+        }
+    }
+    Ok(merged)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -847,41 +885,34 @@ pub fn compute_step_ringdown(
             ));
         }
     }
-    // Flowing square: one continuous motion segment; corner sample indices
-    // are analytic from the plan, cross-checked against the segment's real
-    // span so a planner that failed to hold corner speed fails loud
-    // instead of silently mis-windowing every tail.
-    let flow_ranges: Option<Vec<Range<usize>>> = match flow {
+    // Flowing square: corners never stop, so tails cannot come from
+    // standstill segments. Corner sample indices are read off the
+    // capture's own commanded target reversals (one drive reverses per
+    // CoreXY corner); the final corner is the motion end itself.
+    let flow_corners: Option<Vec<usize>> = match flow {
         None => None,
-        Some(fp) => {
-            if ref_segments.len() != 1 {
-                return Err(format!(
-                    "step {name:?}: a flowing square is one continuous \
-                     motion but the capture holds {} segments — corners \
-                     stopped (SQUARE_CORNER_VELOCITY not honored?)",
-                    ref_segments.len()
-                ));
-            }
-            let (seg_start, seg_end) = ref_segments[0];
+        Some(_) => {
+            let span_start = ref_segments.first().expect("nonempty").0;
+            let span_end = ref_segments.last().expect("nonempty").1;
             let n = expected_strokes;
-            let predicted_s = n as f64 * fp.leg_s + 2.0 * fp.spin_s;
-            let actual_s = (seg_end - seg_start) as f64 / fs;
-            if (actual_s - predicted_s).abs() > 0.05 * predicted_s + 0.05 {
+            let mut corners = corner_reversals(cap, (span_start, span_end))?;
+            if corners.len() != n - 1 {
                 return Err(format!(
-                    "step {name:?}: commanded motion spans {actual_s:.3}s \
-                     but the square plan predicts {predicted_s:.3}s — the \
-                     planner did not carry the legs at constant speed, so \
-                     the analytic corner times are wrong"
+                    "step {name:?}: {} commanded reversals in the motion \
+                     span but a {n}-corner square plan implies {} — the \
+                     capture does not look like a CoreXY square lap",
+                    corners.len(),
+                    n - 1
                 ));
             }
-            let mut corner_idx: Vec<usize> = (0..n)
-                .map(|k| {
-                    seg_start + ((fp.spin_s + (k as f64 + 1.0) * fp.leg_s) * fs).round() as usize
-                })
-                .collect();
-            // The last corner is the final full stop — pin it to the
-            // segment's own end rather than the analytic estimate.
-            *corner_idx.last_mut().expect("n >= 1") = seg_end;
+            corners.push(span_end);
+            Some(corners)
+        }
+    };
+    let flow_ranges: Option<Vec<Range<usize>>> = match &flow_corners {
+        None => None,
+        Some(corner_idx) => {
+            let n = expected_strokes;
             let n_records = cap.n_records;
             let mut out = Vec::new();
             for (i, &c) in corner_idx.iter().enumerate() {
@@ -969,13 +1000,38 @@ pub fn compute_step_ringdown(
     }
 
     if let Some(path) = accel_path {
-        let stops = stops_pt.ok_or_else(|| {
-            format!(
-                "step {name:?} has an accelerometer capture but the manifest \
-                 records no stops — re-run with a SERVO_MEASURE_RINGDOWN that \
-                 writes them"
-            )
-        })?;
+        // Flow mode: the accel CSV runs on print time but corners were
+        // detected as capture sample indices — the recorded motion-start
+        // fence converts one into the other. Stroke mode uses the
+        // per-stroke stop times klippy recorded directly.
+        let flow_stops: Option<Vec<f64>> = match (&flow_corners, flow) {
+            (Some(corners), Some(fp)) => {
+                let anchor = fp.motion_start_pt.ok_or_else(|| {
+                    format!(
+                        "step {name:?} has an accelerometer capture but the \
+                         manifest records no motion_start_pt anchor"
+                    )
+                })?;
+                let span_start = ref_segments.first().expect("nonempty").0;
+                Some(
+                    corners
+                        .iter()
+                        .map(|&c| anchor + (c - span_start) as f64 / fs)
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
+        let stops: &[f64] = match &flow_stops {
+            Some(v) => v,
+            None => stops_pt.ok_or_else(|| {
+                format!(
+                    "step {name:?} has an accelerometer capture but the manifest \
+                     records no stops — re-run with a SERVO_MEASURE_RINGDOWN that \
+                     writes them"
+                )
+            })?,
+        };
         let (t, axes) = read_accel_axes(path)?;
         let accel_fs = (t.len() - 1) as f64 / (t[t.len() - 1] - t[0]);
         let mut per_axis_tails = Vec::new();

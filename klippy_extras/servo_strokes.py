@@ -311,26 +311,28 @@ def emit_square_flowing(
     accel: float,
     iterations: int,
     dwell: int,
-) -> list[float]:
-    """Square laps (corner at (x0, y0), CCW) with FULL-SPEED corners:
-    SQUARE_CORNER_VELOCITY is raised to the leg speed so the planner
-    carries |v| through every 90 degree corner - an instantaneous
-    velocity-direction flip, the sharpest corner the machine can command.
-    Returns the analytic print-time of every corner (4 per lap; the last
-    entry is the final full stop), anchored on the pre-lap standstill
-    fence: constant-speed legs last exactly size/speed, the first leg
-    adds the spin-up v/(2a) and the last the spin-down v/(2a). A trailing
+    corner_velocity: float | None = None,
+) -> float:
+    """Square laps (corner at (x0, y0), CCW) as one continuous polyline.
+    The planner takes each 90 degree corner within its corner-deviation
+    budget - rounded, at whatever corner speed that budget allows -
+    exactly what a print corner does (kalico's SQUARE_CORNER_VELOCITY is
+    only a compatibility alias for that budget; there is no instantaneous
+    corner). `corner_velocity` optionally raises the budget for this run.
+    Corner times are NOT modelled here: the analyzer reads them off the
+    capture's own commanded target reversals. Returns the print-time
+    fence read while still parked at (x0, y0) - the motion-start anchor
+    that maps accelerometer print-times onto capture samples. A trailing
     dwell keeps the capture open past the final stop's ring. The caller
-    travels to (x0, y0) first and restores velocity limits afterwards."""
+    restores velocity limits afterwards."""
     check_reachable(gcode, size, speed, accel)
     toolhead = printer.lookup_object("toolhead")
     feed = int(speed * 60)
-    gcode.run_script_from_command(
-        "SET_VELOCITY_LIMIT ACCEL=%.0f SQUARE_CORNER_VELOCITY=%.0f\nG90"
-        % (accel, speed)
-    )
-    # Machine is parked at (x0, y0): the fence read is free and anchors
-    # the analytic corner times on the planner's own clock.
+    limits = "SET_VELOCITY_LIMIT ACCEL=%.0f" % (accel,)
+    if corner_velocity is not None:
+        limits += " SQUARE_CORNER_VELOCITY=%.0f" % (corner_velocity,)
+    gcode.run_script_from_command(limits + "\nG90")
+    # Machine is parked at (x0, y0): the fence read is free.
     t0 = toolhead.get_last_move_time()
     corners = [
         (x0 + size, y0),
@@ -344,16 +346,7 @@ def emit_square_flowing(
             lines.append("G1 X%.3f Y%.3f F%d" % (cx, cy, feed))
     lines += ["M400", "G4 P%d" % (dwell,), "M400"]
     gcode.run_script_from_command("\n".join(lines))
-    leg = size / speed
-    spin = speed / (2.0 * accel)
-    n = 4 * iterations
-    stops: list[float] = []
-    t = t0 + spin + leg  # spin-up + first leg
-    for _ in range(n):
-        stops.append(t)
-        t += leg
-    stops[-1] += spin  # the last leg ends in the spin-down to a stop
-    return stops
+    return t0
 
 
 @dataclass

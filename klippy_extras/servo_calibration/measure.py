@@ -149,13 +149,15 @@ class MeasureCommands(CalibrationHost):
         "residual vibration (servo encoders + optional accelerometer) for "
         "per-mode frequency and damping ratio - the free decay a drive "
         "cannot compensate the way it fights a steady sweep. "
-        "PATTERN=SQUARE drives square laps with FULL-SPEED corners "
-        "instead (corner budget raised to the leg speed: every 90 degree "
-        "corner is an instantaneous direction flip; 4 corners/lap, "
-        "alternating X/Y legs, only the final corner stops; SIZE= side "
-        "in mm, default min(80, bounds)) - the corner-transient variant. "
-        "Params PATTERN=STROKE|SQUARE AXIS=X|Y|A|B SPEEDS ACCEL "
-        "ITERATIONS DWELL_MS CRUISE_MS SIZE ACCEL_CHIP TAG"
+        "PATTERN=SQUARE drives continuous square laps instead: the "
+        "planner rounds each corner within its corner-deviation budget "
+        "(the same transient a print corner produces; CORNER_VELOCITY= "
+        "optionally raises the budget), 4 corners/lap alternating X/Y "
+        "legs, only the final corner stops; corner times are read off "
+        "the capture's commanded reversals. SIZE= side in mm (default "
+        "min(80, bounds)). Params PATTERN=STROKE|SQUARE AXIS=X|Y|A|B "
+        "SPEEDS ACCEL ITERATIONS DWELL_MS CRUISE_MS SIZE CORNER_VELOCITY "
+        "ACCEL_CHIP TAG"
     )
 
     def _ringdown_dynamics(self, gcmd: Any, engine: Any) -> tuple[float, float]:
@@ -393,15 +395,17 @@ class MeasureCommands(CalibrationHost):
         return speeds
 
     def _measure_ringdown_square(self, gcmd: Any) -> None:
-        """Ring-down over a square path with FULL-SPEED corners: the
-        planner's corner budget is raised to the leg speed so every 90
-        degree corner is an instantaneous velocity-direction flip - the
-        real corner transient, not a stop. Post-processors bypassed and
-        jerk lifted exactly like the stroke variant. Corner print-times
-        are analytic (constant-|v| legs last exactly size/speed) anchored
-        on the pre-lap standstill fence; the analyzer windows each
-        corner's ring from them, and only the final corner is a full
-        stop. 4 corners per lap, alternating X and Y legs."""
+        """Ring-down over a continuous square path: the planner rounds
+        each 90 degree corner within its corner-deviation budget - the
+        same transient a real print corner produces (kalico has no
+        instantaneous corners; SQUARE_CORNER_VELOCITY only aliases the
+        deviation budget, which CORNER_VELOCITY= optionally raises for
+        this run). Post-processors bypassed and jerk lifted exactly like
+        the stroke variant. Corner times are not modelled: the analyzer
+        reads them off the capture's commanded target reversals, and the
+        recorded motion-start fence anchors the accelerometer tails.
+        4 corners per lap, alternating X and Y legs; only the final
+        corner is a full stop."""
         engine = self.printer.lookup_object("motion_engine")
         accel, max_velocity = self._ringdown_dynamics(gcmd, engine)
         iterations = gcmd.get_int("ITERATIONS", 3, minval=1)
@@ -413,6 +417,7 @@ class MeasureCommands(CalibrationHost):
         cruise_ms = gcmd.get_int(
             "CRUISE_MS", self.RINGDOWN_DEFAULT_CRUISE_MS, minval=0
         )
+        corner_velocity = gcmd.get_float("CORNER_VELOCITY", None, above=0.0)
         x_start, x_end, y_start, y_end = servo_strokes.xy_bounds(
             gcmd, self.bounds
         )
@@ -444,6 +449,7 @@ class MeasureCommands(CalibrationHost):
             "accel": accel,
             "iterations": iterations,
             "stops_per_iteration": 4,
+            "corner_velocity": corner_velocity,
             "dwell_ms": dwell,
             "cruise_ms": cruise_ms,
             "accel_chip": chip_name,
@@ -460,7 +466,7 @@ class MeasureCommands(CalibrationHost):
                         name = "%s_v%d" % (tag, speed)
                         gcmd.respond_info(
                             "ringdown %d/%d: %.0f mm square at %d mm/s, "
-                            "accel %.0f mm/s^2, %d flowing corners"
+                            "accel %.0f mm/s^2, %d print-like corners%s"
                             % (
                                 i + 1,
                                 len(speeds),
@@ -468,6 +474,10 @@ class MeasureCommands(CalibrationHost):
                                 speed,
                                 accel,
                                 iterations * 4,
+                                ""
+                                if corner_velocity is None
+                                else " (corner budget %.0f mm/s)"
+                                % (corner_velocity,),
                             )
                         )
                         self._goto_xy(x0, y0, dwell)
@@ -478,7 +488,7 @@ class MeasureCommands(CalibrationHost):
                             else chip.start_internal_client()
                         )
                         try:
-                            stops = servo_strokes.emit_square_flowing(
+                            t0 = servo_strokes.emit_square_flowing(
                                 self.printer,
                                 self.gcode,
                                 x0,
@@ -488,6 +498,7 @@ class MeasureCommands(CalibrationHost):
                                 accel,
                                 iterations,
                                 dwell,
+                                corner_velocity,
                             )
                             self._stop_capture()
                         finally:
@@ -495,9 +506,15 @@ class MeasureCommands(CalibrationHost):
                                 aclient.finish_measurements()
                         step = SweepStep(
                             name,
-                            {"speed": float(speed), "stroke_mm": size},
+                            {
+                                "speed": float(speed),
+                                "stroke_mm": size,
+                                # Anchor for the analyzer: maps its
+                                # reversal-detected corner indices onto the
+                                # accel CSV's print-time axis.
+                                "motion_start_pt": t0,
+                            },
                             [],
-                            stops=stops,
                         )
                         if aclient is not None:
                             assert chip_name is not None, (
