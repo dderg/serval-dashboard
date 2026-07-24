@@ -67,6 +67,12 @@ pub struct RunPath {
 pub struct PinCompareSweep {
     pub value: f64,
     pub hz_per_sec: f64,
+    /// Excitation strength in mm/s^2 per Hz (commanded accel = ApH * f).
+    /// Absent in manifests written before the ApH cutover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_per_hz: Option<f64>,
+    /// Displacement at freq_start (the chirp holds velocity amplitude
+    /// constant, so displacement shrinks as 1/f above it).
     pub amplitude_mm: f64,
     pub curve_hz: Vec<f64>,
     pub accel_mm_s2: Vec<f64>,

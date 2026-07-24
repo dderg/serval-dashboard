@@ -714,18 +714,22 @@ whole sweep window.
 Each capture is reduced to an accel-vs-frequency curve. The chirp is linear,
 so sample time maps to instantaneous frequency
 (`f = FREQ_START + HZ_PER_SEC·t`); samples fall into ~1 Hz bins and each
-bin's mean 3-axis vector magnitude is the raw accel (`accel_mm_s2`). Because
-the buzz holds **constant displacement**, the raw accel grows like `f²`, so a
-normalized `response_ratio = accel / ((2π·f)²·amplitude_mm)` is stored
-alongside the raw column — that ratio divides out the geometric `f²` growth
-and leaves the actual mechanical transfer shape (peaks at the resonances).
-Per value the command reports the peak-response frequency and its ratio.
+bin's mean 3-axis vector magnitude is the raw accel (`accel_mm_s2`). The
+excitation is **constant accel-per-Hz** (klipper's `accel_per_hz`
+convention): the endpoint chirp holds the velocity amplitude constant, so
+displacement shrinks as `1/f` and the commanded accel is exactly
+`ACCEL_PER_HZ · f`. The normalized
+`response_ratio = accel / (ACCEL_PER_HZ · f)` divides each bin by that
+commanded accel — 1.0 means perfect command tracking, and peaks mark the
+resonances. Per value the command reports the peak-response frequency and
+its ratio.
 
 Results are written to a comparison manifest at
 `<captures_root>/pin_compare/<NAME>/manifest.json`
 (`{name, created_utc, mode, param, freq_start, freq_end, baseline_profile,
-sweeps:[{value, hz_per_sec, amplitude_mm, curve_hz, accel_mm_s2,
-response_ratio}]}`). Re-invoking with the same `NAME` **appends** its sweeps
+sweeps:[{value, hz_per_sec, accel_per_hz, amplitude_mm, curve_hz,
+accel_mm_s2, response_ratio}]}` — `amplitude_mm` is the derived displacement
+at `FREQ_START`). Re-invoking with the same `NAME` **appends** its sweeps
 to the existing manifest (build a comparison incrementally across runs); a
 `mode`/`param` mismatch on append errors rather than mixing unlike curves.
 The dashboard reads it over `GET /api/pin-compare` (list) and
@@ -736,8 +740,9 @@ failure mid-sweep), and a failed run persists nothing. Params: `MODE=X|Y`
 (required, exactly one mode) `PARAM=ZETA|LEAD` (required) `VALUES` (comma
 list, nonempty, each validated by the `SERVO_SET_COMPLIANCE`
 `ZETA`/`PIN_LEAD_US` rules) `FREQ_START` `FREQ_END` (Hz, required,
-hard-limit validated) `HZ_PER_SEC` (default 5.0) `AMPLITUDE` (mm; config
-`compliance_amplitude`) `RAMP` `DWELL` (s between sweeps, default 3)
+hard-limit validated) `HZ_PER_SEC` (default 1.0) `ACCEL_PER_HZ` (mm/s² per
+Hz, default 75 — sets the displacement at `FREQ_START` to
+`ACCEL_PER_HZ/(4π²·FREQ_START)`) `RAMP` `DWELL` (s between sweeps, default 3)
 `ACCEL_CHIP` (**required** — pass it or set `[servo_calibration] accel_chip`;
 the comparison is the accelerometer) `NAME` (default `compare`) `PROFILE`.
 

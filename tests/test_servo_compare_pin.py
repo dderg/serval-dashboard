@@ -101,19 +101,20 @@ def test_chirp_reduction_bins_and_normalizes():
         (5.0, 9.0, 9.0, 9.0),  # f=105.0 > freq_end=103 -> dropped
     ]
     curve, accel, ratio = sc._chirp_accel_curve(
-        samples, 100.0, 103.0, 1.0, 0.02
+        samples, 100.0, 103.0, 1.0, 75.0
     )
     assert curve == [100.5, 101.5]
     # per-bin mean of the 3-axis vector magnitude
     assert accel == pytest.approx([7.5, 3.0])
-    # response ratio normalizes out the constant-displacement f^2 growth
+    # response ratio divides by the commanded accel ApH * f (the chirp is
+    # constant velocity-amplitude, so commanded accel grows linearly in f)
     for f_c, a, r in zip(curve, accel, ratio):
-        assert r == pytest.approx(a / ((2.0 * math.pi * f_c) ** 2 * 0.02))
+        assert r == pytest.approx(a / (75.0 * f_c))
 
 
 def test_chirp_reduction_empty_capture_is_empty_not_zero():
     sc, *_ = _setup()
-    assert sc._chirp_accel_curve([], 100.0, 104.0, 5.0, 0.02) == ([], [], [])
+    assert sc._chirp_accel_curve([], 100.0, 104.0, 5.0, 75.0) == ([], [], [])
 
 
 # ---- manifest schema & append semantics --------------------------------
@@ -134,7 +135,11 @@ def test_compare_writes_manifest_per_contract():
     assert [s["value"] for s in man["sweeps"]] == [0.02, 0.05]
     for s, amp in zip(man["sweeps"], (2.0, 6.0)):
         assert s["hz_per_sec"] == 5.0
-        assert s["amplitude_mm"] == sc.compliance_amplitude_mm
+        assert s["accel_per_hz"] == 75.0
+        # wire amplitude is the displacement at freq_start
+        assert s["amplitude_mm"] == pytest.approx(
+            75.0 / (4.0 * math.pi**2 * 100.0)
+        )
         n = len(s["curve_hz"])
         assert n > 0
         assert len(s["accel_mm_s2"]) == n
@@ -144,8 +149,19 @@ def test_compare_writes_manifest_per_contract():
         for f_c, a, r in zip(
             s["curve_hz"], s["accel_mm_s2"], s["response_ratio"]
         ):
-            denom = (2.0 * math.pi * f_c) ** 2 * s["amplitude_mm"]
-            assert r == pytest.approx(a / denom)
+            assert r == pytest.approx(a / (s["accel_per_hz"] * f_c))
+
+
+@requires_tomllib
+def test_compare_defaults_one_hz_per_sec_and_75_aph():
+    sc, _gcode, _node, _path, _chip = _setup(amps=[1.0, 1.0])
+    gcmd = _gcmd(VALUES="0.02,0.05")
+    del gcmd.params["HZ_PER_SEC"]
+    sc.cmd_SERVO_COMPARE_PIN(gcmd)
+    man = _manifest(sc)
+    for s in man["sweeps"]:
+        assert s["hz_per_sec"] == 1.0
+        assert s["accel_per_hz"] == 75.0
 
 
 @requires_tomllib

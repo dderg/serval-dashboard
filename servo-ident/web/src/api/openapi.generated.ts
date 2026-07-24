@@ -925,7 +925,17 @@ export interface components {
          */
         PinCompareSweep: {
             accel_mm_s2: number[];
-            /** Format: double */
+            /**
+             * Format: double
+             * @description Excitation strength in mm/s^2 per Hz (commanded accel = ApH * f).
+             *     Absent in manifests written before the ApH cutover.
+             */
+            accel_per_hz?: number | null;
+            /**
+             * Format: double
+             * @description Displacement at freq_start (the chirp holds velocity amplitude
+             *     constant, so displacement shrinks as 1/f above it).
+             */
             amplitude_mm: number;
             curve_hz: number[];
             /** Format: double */

@@ -807,7 +807,16 @@
             },
             "type": "array"
           },
+          "accel_per_hz": {
+            "description": "Excitation strength in mm/s^2 per Hz (commanded accel = ApH * f).\nAbsent in manifests written before the ApH cutover.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "amplitude_mm": {
+            "description": "Displacement at freq_start (the chirp holds velocity amplitude\nconstant, so displacement shrinks as 1/f above it).",
             "format": "double",
             "type": "number"
           },

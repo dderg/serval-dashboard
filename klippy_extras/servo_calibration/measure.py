@@ -29,6 +29,10 @@ class MeasureCommands(CalibrationHost):
     # representable is legal. Loudness is the operator's call.
     MAX_DIFFERENTIAL_AMPLITUDE_MM = 4294.967295
     MAX_BUZZ_FREQ_HZ = 2000.0
+    # Klipper's resonance_tester convention: commanded accel = ApH * f
+    # (mm/s^2 per Hz). The endpoint chirp is constant-velocity-amplitude,
+    # which realizes exactly this profile.
+    DEFAULT_COMPARE_ACCEL_PER_HZ = 75.0
 
     cmd_SERVO_MEASURE_DIFFERENTIAL_help = (
         "Anti-phase chirp on one AWD belt pair via the engine buzz "

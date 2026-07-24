@@ -16,6 +16,8 @@ export interface PinCompareSummary {
 export interface PinCompareSweep {
   value: number;
   hz_per_sec: number;
+  /** mm/s^2 per Hz (commanded accel = ApH * f); absent in pre-ApH manifests. */
+  accel_per_hz?: number;
   amplitude_mm: number;
   curve_hz: number[];
   accel_mm_s2: number[];
@@ -50,11 +52,12 @@ export async function getPinCompare(name: string): Promise<PinCompareManifest> {
   return getJson<PinCompareManifest>(`/api/pin-compare/${encodeURIComponent(name)}`);
 }
 
-/// Stable per-sweep label: '<PARAM>=<value> @<hz_per_sec> Hz/s'. A value
-/// re-run at a different sweep rate is a distinct entry, so both the value
-/// and the rate belong in the label.
+/// Stable per-sweep label: '<PARAM>=<value> @<hz_per_sec> Hz/s', plus the
+/// excitation strength when recorded (ApH in mm/s^2 per Hz) so sweeps taken
+/// at different excitation levels stay distinguishable in the overlay.
 export function sweepLabel(param: string, sweep: PinCompareSweep): string {
-  return `${param}=${formatNumber(sweep.value)} @${formatNumber(sweep.hz_per_sec)} Hz/s`;
+  const base = `${param}=${formatNumber(sweep.value)} @${formatNumber(sweep.hz_per_sec)} Hz/s`;
+  return sweep.accel_per_hz != null ? `${base} ${formatNumber(sweep.accel_per_hz)} ApH` : base;
 }
 
 function formatNumber(v: number): string {

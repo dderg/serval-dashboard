@@ -2811,15 +2811,17 @@ class DynamicsFitCommands(MeasureCommands):
         "window. Each capture is reduced to accel-vs-frequency curves: the "
         "linear chirp maps sample time to instantaneous frequency, samples "
         "fall into ~1 Hz bins, and each bin's 3-axis vector-magnitude mean "
-        "is the raw accel. Constant-displacement excitation makes raw accel "
-        "~ f^2, so a response_ratio normalized by (2*pi*f)^2 * amplitude is "
-        "stored alongside the raw column. A comparison manifest is written "
+        "is the raw accel. The chirp excites at constant accel-per-Hz "
+        "(commanded accel = ACCEL_PER_HZ * f; the endpoint holds the "
+        "velocity amplitude constant so displacement shrinks as 1/f), and "
+        "response_ratio divides each bin by that commanded accel - 1.0 = "
+        "perfect tracking. A comparison manifest is written "
         "under <captures_root>/pin_compare/<NAME>/manifest.json (same NAME "
         "appends sweeps; mode/param must match on append) for the dashboard "
         "to overlay. Measurement only: the pre-sweep model is restored at "
         "the end (also on failure). Params MODE=X|Y PARAM=ZETA|LEAD "
         "VALUES (comma list) FREQ_START FREQ_END (Hz, required) HZ_PER_SEC "
-        "(5.0) AMPLITUDE (mm; config compliance_amplitude) RAMP DWELL (s "
+        "(1.0) ACCEL_PER_HZ (mm/s^2 per Hz, 75) RAMP DWELL (s "
         "between sweeps, 3) ACCEL_CHIP (required; config accel_chip) "
         "NAME (compare) PROFILE"
     )
@@ -2830,16 +2832,18 @@ class DynamicsFitCommands(MeasureCommands):
         freq_start: float,
         freq_end: float,
         hz_per_sec: float,
-        amplitude_mm: float,
+        accel_per_hz: float,
     ) -> tuple[list[float], list[float], list[float]]:
         """Reduce a swept-sine accel capture to accel-vs-frequency curves.
         The linear chirp maps capture time to instantaneous frequency
         (f = freq_start + hz_per_sec*(t - t0)); samples land in ~1 Hz bins
-        and each bin's 3-axis vector-magnitude mean is the raw accel. A
-        constant-displacement buzz makes raw accel ~ f^2, so a
-        response_ratio normalized by (2*pi*f)^2 * amplitude_mm is returned
-        alongside. Returns (curve_hz, accel_mm_s2, response_ratio) sorted by
-        frequency. Empty capture -> three empty lists (never a fake zero)."""
+        and each bin's 3-axis vector-magnitude mean is the raw accel. The
+        endpoint's chirp holds the velocity amplitude constant (displacement
+        scales as 1/f), so the commanded accel is accel_per_hz * f - the
+        response_ratio column divides each bin by exactly that, making 1.0
+        = perfect command tracking at every frequency. Returns (curve_hz,
+        accel_mm_s2, response_ratio) sorted by frequency. Empty capture ->
+        three empty lists (never a fake zero)."""
         if not samples:
             return [], [], []
         t0 = samples[0][0]
@@ -2863,7 +2867,7 @@ class DynamicsFitCommands(MeasureCommands):
             a = sum(bins[idx]) / len(bins[idx])
             curve_hz.append(round(f_c, 4))
             accel_mm_s2.append(a)
-            denom = (2.0 * math.pi * f_c) ** 2 * amplitude_mm
+            denom = accel_per_hz * f_c
             response_ratio.append(a / denom if denom > 0.0 else 0.0)
         return curve_hz, accel_mm_s2, response_ratio
 
@@ -2937,7 +2941,7 @@ class DynamicsFitCommands(MeasureCommands):
         freq_start: float,
         freq_end: float,
         hz_per_sec: float,
-        amplitude: float,
+        accel_per_hz: float,
         ramp: float,
         dwell_s: float,
         accel_chip: Any,
@@ -2962,11 +2966,15 @@ class DynamicsFitCommands(MeasureCommands):
             )
             if sign_cmd < 0.0:
                 sign_mask |= 1 << slot
+        # The endpoint chirp holds velocity amplitude constant (displacement
+        # ~ 1/f), so commanded accel = accel_per_hz * f exactly; the wire
+        # amplitude is the displacement at FREQ_START.
+        amplitude = accel_per_hz / (4.0 * math.pi * math.pi * freq_start)
         duration = (freq_end - freq_start) / hz_per_sec
         reactor = self.printer.get_reactor()
         gcmd.respond_info(
             "pin compare, mode %s: %s over %d values, chirp %.0f->%.0f Hz "
-            "at %.1f Hz/s, amplitude %.3f mm on %s"
+            "at %.1f Hz/s, %.0f mm/s^2 per Hz (%.4f mm at start) on %s"
             % (
                 mode,
                 param,
@@ -2974,6 +2982,7 @@ class DynamicsFitCommands(MeasureCommands):
                 freq_start,
                 freq_end,
                 hz_per_sec,
+                accel_per_hz,
                 amplitude,
                 "+".join(step_servos),
             )
@@ -3010,12 +3019,13 @@ class DynamicsFitCommands(MeasureCommands):
                     else []
                 )
                 curve_hz, accel, ratio = self._chirp_accel_curve(
-                    samples, freq_start, freq_end, hz_per_sec, amplitude
+                    samples, freq_start, freq_end, hz_per_sec, accel_per_hz
                 )
                 sweeps.append(
                     {
                         "value": value,
                         "hz_per_sec": hz_per_sec,
+                        "accel_per_hz": accel_per_hz,
                         "amplitude_mm": amplitude,
                         "curve_hz": curve_hz,
                         "accel_mm_s2": accel,
@@ -3083,15 +3093,24 @@ class DynamicsFitCommands(MeasureCommands):
                 "chirp frequencies must be between 20 and %.0f Hz"
                 % (self.MAX_BUZZ_FREQ_HZ,)
             )
-        hz_per_sec = gcmd.get_float("HZ_PER_SEC", 5.0, above=0.0)
-        amplitude = gcmd.get_float(
-            "AMPLITUDE", self.compliance_amplitude_mm, above=0.0
+        hz_per_sec = gcmd.get_float("HZ_PER_SEC", 1.0, above=0.0)
+        accel_per_hz = gcmd.get_float(
+            "ACCEL_PER_HZ", self.DEFAULT_COMPARE_ACCEL_PER_HZ, above=0.0
         )
-        if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
+        # Wire amplitude is the displacement at FREQ_START (the chirp holds
+        # velocity amplitude constant, so displacement only shrinks above).
+        start_amplitude = accel_per_hz / (4.0 * math.pi * math.pi * freq_start)
+        if start_amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
             raise gcmd.error(
-                "AMPLITUDE %.3f mm is not wire-representable (amplitude_nm "
-                "is u32; max %.1f mm)"
-                % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
+                "ACCEL_PER_HZ %.0f at FREQ_START %.0f Hz needs %.3f mm of "
+                "displacement - not wire-representable (amplitude_nm is "
+                "u32; max %.1f mm). Raise FREQ_START or lower ACCEL_PER_HZ."
+                % (
+                    accel_per_hz,
+                    freq_start,
+                    start_amplitude,
+                    self.MAX_DIFFERENTIAL_AMPLITUDE_MM,
+                )
             )
         duration = (freq_end - freq_start) / hz_per_sec
         ramp = gcmd.get_float(
@@ -3150,7 +3169,7 @@ class DynamicsFitCommands(MeasureCommands):
             freq_start,
             freq_end,
             hz_per_sec,
-            amplitude,
+            accel_per_hz,
             ramp,
             dwell_s,
             accel_chip,
