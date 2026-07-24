@@ -2,13 +2,12 @@ import { html } from "htm/preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { useQuery } from "@tanstack/preact-query";
 import { psdPlot } from "./uplot-chart";
-import { PALETTE } from "./state";
-import { listPinCompares, getPinCompare, sweepLabel } from "./api/pin-compare";
+import { PALETTE, state } from "./state";
+import { useStore } from "./store";
+import { getPinCompare, sweepLabel } from "./api/pin-compare";
 import type { PinCompareManifest } from "./api/pin-compare";
 
 // --- pin compare: overlay one resonance sweep per pin-parameter value -------
-
-const SELECTED_KEY = "servoCalPinCompareSelected";
 
 type YMode = "ratio" | "accel";
 type YScale = "log" | "linear";
@@ -97,30 +96,17 @@ function PinCompareLegend({
   </div>`;
 }
 
-/// Pin-compare overlay as a tune-tab section: hidden entirely until at
-/// least one comparison manifest exists (the tune tab only shows sections
-/// that have data), then a dropdown picks the comparison to overlay.
+/// Pin-compare overlay as a tune-tab section, driven by the runs-table
+/// selection: it appears only while a pin-compare row is selected there
+/// (state.pinCompareSelected) and shows exactly that comparison — no
+/// dropdown of its own.
 function PinCompareSection() {
-  const list = useQuery({ queryKey: ["pin-compare"], queryFn: listPinCompares });
-  const names = list.data ?? [];
-  const [selected, setSelected] = useState<string | null>(
-    () => localStorage.getItem(SELECTED_KEY)
-  );
+  useStore();
+  const active = state.pinCompareSelected;
   const [yMode, setYMode] = useState<YMode>("ratio");
   const [yScale, setYScale] = useState<YScale>("log");
   const [hidden, setHidden] = useState<Set<number>>(new Set());
 
-  // Default to the newest comparison once the list loads, and drop a stale
-  // localStorage selection that no longer exists.
-  const validNames = names.map((n) => n.name).join("|");
-  useEffect(() => {
-    if (!names.length) return;
-    if (!selected || !names.some((n) => n.name === selected)) {
-      setSelected(names[0].name);
-    }
-  }, [validNames]);
-
-  const active = selected && names.some((n) => n.name === selected) ? selected : null;
   const detail = useQuery({
     queryKey: ["pin-compare", active],
     queryFn: () => getPinCompare(active as string),
@@ -133,10 +119,6 @@ function PinCompareSection() {
     setHidden(new Set());
   }, [active]);
 
-  const onSelect = (name: string) => {
-    setSelected(name);
-    localStorage.setItem(SELECTED_KEY, name);
-  };
   const onToggle = (index: number) => {
     setHidden((prev) => {
       const next = new Set(prev);
@@ -146,24 +128,11 @@ function PinCompareSection() {
     });
   };
 
-  // No manifests (or list still loading/failed): the section stays absent.
-  if (!names.length) return null;
+  if (active == null) return null;
 
   return html`<section class="pin-compare-section">
-    <div class="section-head"><h2>pin compare</h2></div>
+    <div class="section-head"><h2>pin compare — ${active}</h2></div>
       <div class="section-tools">
-        <label>comparison
-          <select
-            value=${active ?? ""}
-            onChange=${(e: Event) => onSelect((e.target as HTMLSelectElement).value)}
-          >
-            ${names.map(
-                  (n) => html`<option key=${n.name} value=${n.name}
-                    >${n.name} — ${n.param} (${n.n_sweeps} sweeps)</option
-                  >`
-                )}
-          </select>
-        </label>
         <label>y
           <select
             value=${yMode}
@@ -194,7 +163,7 @@ function PinCompareSection() {
               hidden=${hidden}
             />
             <${PinCompareLegend} manifest=${manifest} hidden=${hidden} onToggle=${onToggle} />`
-        : html`<p class="note">select a comparison to overlay its sweeps</p>`}
+        : html`<p class="note">loading ${active}…</p>`}
   </section>`;
 }
 

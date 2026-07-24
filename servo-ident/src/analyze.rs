@@ -1198,6 +1198,13 @@ fn build_run_reusing(
     let ringdown_plan = if manifest.experiment == "ringdown" {
         let dwell_ms = plan_f64("dwell_ms")?;
         let iterations = plan_f64("iterations")?;
+        // Stops per iteration: 2 for the classic out-and-back stroke, 4 for
+        // a square lap (one stop per corner). Older manifests omit it.
+        let stops_per_iteration = manifest
+            .stroke_plan
+            .get("stops_per_iteration")
+            .and_then(Value::as_f64)
+            .unwrap_or(2.0);
         if dwell_ms <= RINGDOWN_WINDOW_MARGIN_MS {
             return Err(format!(
                 "ringdown stroke_plan.dwell_ms {dwell_ms} leaves no window \
@@ -1210,7 +1217,7 @@ fn build_run_reusing(
                 window_s: (dwell_ms - RINGDOWN_WINDOW_MARGIN_MS) / 1000.0,
                 band_hz: RINGDOWN_BAND_HZ,
             },
-            (iterations as usize) * 2,
+            (iterations * stops_per_iteration) as usize,
         ))
     } else {
         None

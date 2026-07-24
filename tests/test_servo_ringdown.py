@@ -307,3 +307,44 @@ def test_analyze_invoked_on_the_run_dir():
     ]
     assert analyze and analyze[-1][2] == run_dir
     assert sc._active_run is None, "run must be closed even on success"
+
+
+def test_square_pattern_records_four_stops_per_lap():
+    sc, gcode = make_calibration()
+    sc.cmd_SERVO_MEASURE_RINGDOWN(
+        FakeGcmd(PATTERN="SQUARE", SPEEDS="100", ITERATIONS=2)
+    )
+    manifest = _manifest_for(sc)
+    assert manifest["experiment"] == "ringdown"
+    assert manifest["axis"] == "XY"
+    plan = manifest["stroke_plan"]
+    assert plan["pattern"] == "square"
+    assert plan["stops_per_iteration"] == 4
+    assert plan["size_mm"] == 80.0, "default min(80, span)"
+    assert plan["corner_x"] == 70.0 and plan["corner_y"] == 70.0, (
+        "80 mm box centered on the (20,200) bounds center 110"
+    )
+    (step,) = manifest["steps"]
+    assert len(step["stops"]) == 8, "2 laps x 4 corner stops"
+    assert step["stops"] == sorted(step["stops"])
+    # Legs alternate X and Y between the two corner coordinates.
+    assert _step_extents(gcode, "X") == {70.0, 150.0}
+    assert _step_extents(gcode, "Y") == {70.0, 150.0}
+
+
+def test_square_leg_too_short_fails_loud():
+    sc, _ = make_calibration()
+    with pytest.raises(RuntimeError, match="raise SIZE"):
+        sc.cmd_SERVO_MEASURE_RINGDOWN(
+            FakeGcmd(PATTERN="SQUARE", SPEEDS="400", SIZE=20)
+        )
+
+
+def test_square_bypasses_post_processors_and_jerk():
+    sc, _ = make_calibration()
+    sc.cmd_SERVO_MEASURE_RINGDOWN(FakeGcmd(PATTERN="SQUARE", SPEEDS="100"))
+    engine = sc.printer.lookup_object("motion_engine")
+    calls = [c for c in engine.calls if c[0] in ("bypass", "jerk")]
+    assert ("bypass", True) in calls and ("bypass", False) in calls
+    assert any(c[0] == "jerk" and c[1] == float("inf") for c in calls)
+    assert calls[-1][0] in ("bypass", "jerk"), "restored on the way out"

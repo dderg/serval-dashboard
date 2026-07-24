@@ -208,6 +208,7 @@ interface AppState {
   stepFilter: Set<string> | null;
   motorFilter: Set<string> | null;
   accelAxisFilter: Set<string> | null;
+  pinCompareSelected: string | null;
   console: ConsoleState;
   drive: DrivePanelState;
   live: LiveState;
@@ -224,6 +225,7 @@ const state: AppState = {
   stepFilter: null,
   motorFilter: null,
   accelAxisFilter: null,
+  pinCompareSelected: null,
   console: {
     text: "",
     history: loadConsoleHistory(),

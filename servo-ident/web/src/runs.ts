@@ -25,6 +25,8 @@ import {
 import { FrfSection, RingdownSection } from "./dynamics";
 import { SectionHead, TimeDomainSection, PathSection } from "./charts-core";
 import { PinCompareSection } from "./pin-compare";
+import { listPinCompares } from "./api/pin-compare";
+import type { PinCompareSummary } from "./api/pin-compare";
 import { applyAccordionState, bindAnalysisControls, currentPageDef } from "./shell";
 import { PALETTE, INITIAL_SELECTED_RUNS, state } from "./state";
 import { notify, useStore } from "./store";
@@ -279,11 +281,50 @@ function RunRow({ run, def }: { run: RunSummary; def: PageDef }) {
   </tr>`;
 }
 
+/// A pin-compare manifest shown as one row among the runs: click selects it
+/// (single-select) and the pin-compare section below charts exactly that
+/// comparison; click again deselects and the section disappears.
+function PinCompareRow({ entry }: { entry: PinCompareSummary }) {
+  const selected = state.pinCompareSelected === entry.name;
+  return html`<tr
+    class=${selected ? "selected selectable" : "selectable"}
+    onClick=${() => {
+      state.pinCompareSelected = selected ? null : entry.name;
+      notify();
+    }}
+  >
+    <td></td>
+    <td title=${`${entry.name} — ${entry.created_utc}`}>${shortTime(entry.created_utc)}</td>
+    <td title=${`pin compare ${entry.name}`}>
+      pin_compare/${entry.name} ${entry.mode} (${entry.param}, ${entry.n_sweeps} sweeps)
+    </td>
+    <td class="diff empty">—</td>
+    <td class="run-note empty"></td>
+    <td class="actions"></td>
+  </tr>`;
+}
+
 function RunsTable() {
   useStore();
   const def = currentPageDef();
+  const compares = useQuery({
+    queryKey: ["pin-compare"],
+    queryFn: listPinCompares,
+    notifyOnChangeProps: ["data"],
+  });
   const runs = def.journal ? runsData() : pageRuns(def);
-  return runs.map((run) => html`<${RunRow} key=${run.name} run=${run} def=${def} />`);
+  const rows: { time: string; row: unknown }[] = runs.map((run) => ({
+    time: run.mtime_utc,
+    row: html`<${RunRow} key=${run.name} run=${run} def=${def} />`,
+  }));
+  for (const entry of compares.data ?? []) {
+    rows.push({
+      time: entry.created_utc,
+      row: html`<${PinCompareRow} key=${`pc:${entry.name}`} entry=${entry} />`,
+    });
+  }
+  rows.sort((a, b) => (a.time < b.time ? 1 : a.time > b.time ? -1 : 0));
+  return rows.map((r) => r.row);
 }
 
 

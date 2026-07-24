@@ -301,6 +301,43 @@ def emit_strokes_with_stop_times(
     return stops
 
 
+def emit_square_with_stop_times(
+    printer: Any,
+    gcode: Any,
+    x0: float,
+    y0: float,
+    size: float,
+    speed: float,
+    accel: float,
+    iterations: int,
+    dwell: int,
+) -> list[float]:
+    """Square laps (corner at (x0, y0), CCW) with a full stop at every
+    corner; each leg is submitted alone and its commanded-stop print-time
+    is read off the motion fence before the dwell - the ring-down analyzer
+    windows accelerometer tails from these. 4 stops per lap. The caller
+    travels to (x0, y0) first."""
+    check_reachable(gcode, size, speed, accel)
+    toolhead = printer.lookup_object("toolhead")
+    feed = int(speed * 60)
+    gcode.run_script_from_command(
+        "SET_VELOCITY_LIMIT ACCEL=%.0f\nG90" % (accel,)
+    )
+    corners = [
+        (x0 + size, y0),
+        (x0 + size, y0 + size),
+        (x0, y0 + size),
+        (x0, y0),
+    ]
+    stops: list[float] = []
+    for _ in range(iterations):
+        for cx, cy in corners:
+            gcode.run_script_from_command("G1 X%.3f Y%.3f F%d" % (cx, cy, feed))
+            stops.append(toolhead.get_last_move_time())
+            gcode.run_script_from_command("M400\nG4 P%d\nM400" % (dwell,))
+    return stops
+
+
 @dataclass
 class PatternMove:
     x: float

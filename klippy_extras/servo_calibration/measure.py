@@ -148,9 +148,12 @@ class MeasureCommands(CalibrationHost):
         "commanded-stop time is recorded. servo-cal fits the post-stop "
         "residual vibration (servo encoders + optional accelerometer) for "
         "per-mode frequency and damping ratio - the free decay a drive "
-        "cannot compensate the way it fights a steady sweep. Params "
-        "AXIS=X|Y|A|B SPEEDS ACCEL ITERATIONS DWELL_MS CRUISE_MS "
-        "ACCEL_CHIP TAG"
+        "cannot compensate the way it fights a steady sweep. "
+        "PATTERN=SQUARE drives square laps instead (full stop at every "
+        "corner, 4 stops/lap, alternating X/Y legs; SIZE= side in mm, "
+        "default min(80, bounds)) - the corner-transient variant. Params "
+        "PATTERN=STROKE|SQUARE AXIS=X|Y|A|B SPEEDS ACCEL ITERATIONS "
+        "DWELL_MS CRUISE_MS SIZE ACCEL_CHIP TAG"
     )
 
     def _ringdown_dynamics(self, gcmd: Any, engine: Any) -> tuple[float, float]:
@@ -222,6 +225,14 @@ class MeasureCommands(CalibrationHost):
         return strokes
 
     def cmd_SERVO_MEASURE_RINGDOWN(self, gcmd: Any) -> None:
+        pattern = gcmd.get("PATTERN", "STROKE").upper()
+        if pattern not in ("STROKE", "SQUARE"):
+            raise gcmd.error(
+                "PATTERN must be STROKE or SQUARE (got %r)" % (pattern,)
+            )
+        if pattern == "SQUARE":
+            self._measure_ringdown_square(gcmd)
+            return
         axis = gcmd.get("AXIS", "X").upper()
         plan = servo_strokes.build_plan(gcmd, self._kin(), self.bounds, axis)
         engine = self.printer.lookup_object("motion_engine")
@@ -316,6 +327,170 @@ class MeasureCommands(CalibrationHost):
                         step = SweepStep(
                             name,
                             {"speed": float(speed), "stroke_mm": length_mm},
+                            [],
+                            stops=stops,
+                        )
+                        if aclient is not None:
+                            assert chip_name is not None, (
+                                "accel client exists without a chip name"
+                            )
+                            step.accel = os.path.basename(
+                                self._write_accel_csv(
+                                    gcmd, aclient, chip_name, name
+                                )
+                            )
+                        run.record_step(step)
+                finally:
+                    engine.set_jerk_override(None)
+            finally:
+                engine.set_post_processor_bypass(False)
+                self._restore()
+            self._analyze_and_report(gcmd, run)
+        finally:
+            self._active_run = None
+
+    def _ringdown_square_speeds(
+        self,
+        gcmd: Any,
+        accel: float,
+        max_velocity: float,
+        size: float,
+        cruise_ms: int,
+    ) -> list[int]:
+        """SPEEDS validated against a fixed leg length: every leg (one
+        square side) must reach cruise speed and hold it for `cruise_ms`
+        before the corner stop, mirroring the stroke variant's math."""
+        speeds_raw = self._floats(gcmd.get("SPEEDS", None)) or list(self.speeds)
+        speeds: list[int] = []
+        for s in speeds_raw:
+            sv = int(round(s))
+            if sv <= 0:
+                raise gcmd.error("speed %d must be positive (mm/s)" % (sv,))
+            if sv > max_velocity:
+                raise gcmd.error(
+                    "speed %d exceeds the printer's max velocity %.0f"
+                    % (sv, max_velocity)
+                )
+            needed = sv * sv / accel + sv * cruise_ms / 1000.0
+            if needed > size:
+                raise gcmd.error(
+                    "%d mm/s needs a %.1f mm leg (%.1f mm accel+decel + "
+                    "%.1f mm cruise) but the square side is %.1f mm - "
+                    "lower SPEEDS or CRUISE_MS, or raise SIZE"
+                    % (
+                        sv,
+                        needed,
+                        sv * sv / accel,
+                        sv * cruise_ms / 1000.0,
+                        size,
+                    )
+                )
+            if sv not in speeds:
+                speeds.append(sv)
+        speeds.sort()
+        return speeds
+
+    def _measure_ringdown_square(self, gcmd: Any) -> None:
+        """Ring-down over a square path: full stop at every corner (the
+        sharpest corner a planner can command), post-processors bypassed
+        and jerk lifted exactly like the stroke variant, so each corner's
+        decel excites the raw closed-loop plant and the tail after it is
+        analyzed as a free decay. 4 stops per lap; alternating X and Y
+        legs exercise both Cartesian modes in one run."""
+        engine = self.printer.lookup_object("motion_engine")
+        accel, max_velocity = self._ringdown_dynamics(gcmd, engine)
+        iterations = gcmd.get_int("ITERATIONS", 3, minval=1)
+        dwell = gcmd.get_int(
+            "DWELL_MS",
+            max(self.dwell_ms, self.RINGDOWN_DEFAULT_DWELL_MS),
+            minval=self.RINGDOWN_MIN_DWELL_MS,
+        )
+        cruise_ms = gcmd.get_int(
+            "CRUISE_MS", self.RINGDOWN_DEFAULT_CRUISE_MS, minval=0
+        )
+        x_start, x_end, y_start, y_end = servo_strokes.xy_bounds(
+            gcmd, self.bounds
+        )
+        span = min(x_end - x_start, y_end - y_start)
+        size = gcmd.get_float("SIZE", min(80.0, span), above=0.0)
+        if size > span:
+            raise gcmd.error(
+                "SIZE %.1f mm does not fit the %.1f mm usable span"
+                % (size, span)
+            )
+        speeds = self._ringdown_square_speeds(
+            gcmd, accel, max_velocity, size, cruise_ms
+        )
+        # Square corner: lower-left of a size x size box centered in bounds.
+        x0 = (x_start + x_end) / 2.0 - size / 2.0
+        y0 = (y_start + y_end) / 2.0 - size / 2.0
+        tag = gcmd.get("TAG", "ringdown")
+        chip, chip_name = self._accel_chip(gcmd)
+        x_plan = servo_strokes.build_plan(gcmd, self._kin(), self.bounds, "X")
+        y_plan = servo_strokes.build_plan(gcmd, self._kin(), self.bounds, "Y")
+        servos = list(dict.fromkeys(x_plan.servos + y_plan.servos))
+        stroke_plan = {
+            "pattern": "square",
+            "size_mm": size,
+            "corner_x": x0,
+            "corner_y": y0,
+            "speed": None,
+            "speeds": speeds,
+            "accel": accel,
+            "iterations": iterations,
+            "stops_per_iteration": 4,
+            "dwell_ms": dwell,
+            "cruise_ms": cruise_ms,
+            "accel_chip": chip_name,
+        }
+        run = self._begin_run(gcmd, "ringdown", tag, "XY", servos, stroke_plan)
+        try:
+            self._prep("X", dwell)
+            self._prep("Y", dwell)
+            engine.set_post_processor_bypass(True)
+            try:
+                engine.set_jerk_override(float("inf"))
+                try:
+                    for i, speed in enumerate(speeds):
+                        name = "%s_v%d" % (tag, speed)
+                        gcmd.respond_info(
+                            "ringdown %d/%d: %.0f mm square at %d mm/s, "
+                            "accel %.0f mm/s^2, %d corner stops"
+                            % (
+                                i + 1,
+                                len(speeds),
+                                size,
+                                speed,
+                                accel,
+                                iterations * 4,
+                            )
+                        )
+                        self._goto_xy(x0, y0, dwell)
+                        self._start_capture(name, servos)
+                        aclient = (
+                            None
+                            if chip is None
+                            else chip.start_internal_client()
+                        )
+                        try:
+                            stops = servo_strokes.emit_square_with_stop_times(
+                                self.printer,
+                                self.gcode,
+                                x0,
+                                y0,
+                                size,
+                                float(speed),
+                                accel,
+                                iterations,
+                                dwell,
+                            )
+                            self._stop_capture()
+                        finally:
+                            if aclient is not None:
+                                aclient.finish_measurements()
+                        step = SweepStep(
+                            name,
+                            {"speed": float(speed), "stroke_mm": size},
                             [],
                             stops=stops,
                         )
