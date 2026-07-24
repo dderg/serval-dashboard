@@ -948,7 +948,7 @@ Policy, applied in order every run:
 
 1. **Compress cold payloads.** For any run dir whose newest file is older than
    `--cold-age-hours` (default **48h**), each `*.scap` is recompressed in place
-   with `zstd -19 --rm` to `*.scap.zst`. Small analysis artifacts
+   with `zstd -6 --rm` (bus-throttled; see the unit) to `*.scap.zst`. Small analysis artifacts
    (`manifest.json`, `results.json`, `plot_series.json`, …) are left readable so
    the dashboard's run list and plots keep working for compressed runs.
 2. **Budget prune.** While the total exceeds `--budget-gib` (default **8 GiB**),

@@ -4,7 +4,7 @@
 Policy (in order):
 
 1. Compress: for run dirs whose newest file mtime is older than COLD_AGE,
-   ``zstd -19 --rm`` each ``*.scap`` payload (already-``.zst`` skipped). Small
+   ``zstd -6 --rm`` each ``*.scap`` payload (already-``.zst`` skipped). Small
    analysis artifacts (manifest.json, results.json, ...) stay readable so the
    dashboard keeps working for compressed runs.
 2. Budget: while the captures root exceeds BUDGET_BYTES, delete the oldest
@@ -210,7 +210,14 @@ def plan_budget(
 
 
 def _zstd_compress(scap: Path, dry_run: bool) -> int:
-    """Compress ``scap`` in place with ``zstd -19 --rm``. Returns new size.
+    """Compress ``scap`` in place with ``zstd -6 --rm``. Returns new size.
+
+    Level 6, not 19: the RT endpoint faults on frame lateness from
+    memory-bus/SD contention that nice/ionice cannot bound (measured
+    2026-07-24: a zstd -19 pass tripped 8-42 us frame faults on an
+    otherwise idle machine). -6 costs ~10-15% compressed size for an
+    order of magnitude less CPU time; the unit additionally caps
+    bandwidth via CPUQuota.
 
     In dry-run mode nothing is written and the reported size is estimated as
     the current size (no compression performed)."""
@@ -218,7 +225,7 @@ def _zstd_compress(scap: Path, dry_run: bool) -> int:
     if dry_run:
         return scap.stat().st_size
     subprocess.run(
-        ["zstd", "-19", "--rm", "-q", "-f", str(scap)],
+        ["zstd", "-6", "--rm", "-q", "-f", str(scap)],
         check=True,
     )
     return dest.stat().st_size
