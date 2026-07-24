@@ -1198,13 +1198,24 @@ fn build_run_reusing(
     let ringdown_plan = if manifest.experiment == "ringdown" {
         let dwell_ms = plan_f64("dwell_ms")?;
         let iterations = plan_f64("iterations")?;
-        // Stops per iteration: 2 for the classic out-and-back stroke, 4 for
-        // a square lap (one stop per corner). Older manifests omit it.
-        let stops_per_iteration = manifest
-            .stroke_plan
-            .get("stops_per_iteration")
-            .and_then(Value::as_f64)
-            .unwrap_or(2.0);
+        // A square lap stops once per corner, the classic out-and-back
+        // stroke twice per iteration. Defaulting a square manifest to 2
+        // would surface as a corner-count mismatch deep in the ringdown
+        // analyzer, blaming the capture for a missing manifest field.
+        let square = manifest.stroke_plan.get("pattern").and_then(Value::as_str) == Some("square");
+        let stops_per_iteration = match manifest.stroke_plan.get("stops_per_iteration") {
+            Some(v) => v.as_f64().ok_or_else(|| {
+                format!("ringdown stroke_plan.stops_per_iteration is not a number: {v}")
+            })?,
+            None if square => {
+                return Err(
+                    "ringdown stroke_plan.pattern is \"square\" but stops_per_iteration is \
+                     missing - the analyzer cannot guess the corner count"
+                        .to_string(),
+                )
+            }
+            None => 2.0,
+        };
         if dwell_ms <= RINGDOWN_WINDOW_MARGIN_MS {
             return Err(format!(
                 "ringdown stroke_plan.dwell_ms {dwell_ms} leaves no window \

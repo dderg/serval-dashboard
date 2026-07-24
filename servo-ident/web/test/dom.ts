@@ -83,6 +83,7 @@ function installFetchStub(): { unmatched: string[] } {
     [/^\/api\/runs$/, () => json(fixture("runs"))],
     [/^\/api\/drive_state$/, () => json(fixture("drive_state"))],
     [/^\/api\/live$/, () => json(fixture("live"))],
+    [/^\/api\/pin-compare$/, () => json(fixture("pin_compare"))],
     [/^\/api\/live_tap$/, () => json(JSON.stringify({ status: "connecting" }))],
     [new RegExp(`^/api/runs/${RUN_NAME}/manifest$`), () => json(fixture("manifest"))],
     [new RegExp(`^/api/runs/${RUN_NAME}/results$`), () => json(fixture("results"))],

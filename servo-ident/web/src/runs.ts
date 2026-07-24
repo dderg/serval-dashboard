@@ -304,33 +304,37 @@ function PinCompareRow({ entry }: { entry: PinCompareSummary }) {
   </tr>`;
 }
 
-function RunsTable() {
+function RunsTable({ withPinCompares }: { withPinCompares: boolean }) {
   useStore();
   const def = currentPageDef();
   const compares = useQuery({
     queryKey: ["pin-compare"],
     queryFn: listPinCompares,
     notifyOnChangeProps: ["data"],
+    enabled: withPinCompares,
   });
   const runs = def.journal ? runsData() : pageRuns(def);
   const rows: { time: string; row: unknown }[] = runs.map((run) => ({
     time: run.mtime_utc,
     row: html`<${RunRow} key=${run.name} run=${run} def=${def} />`,
   }));
-  for (const entry of compares.data ?? []) {
-    rows.push({
-      time: entry.created_utc,
-      row: html`<${PinCompareRow} key=${`pc:${entry.name}`} entry=${entry} />`,
-    });
+  if (withPinCompares) {
+    for (const entry of compares.data ?? []) {
+      rows.push({
+        time: entry.created_utc,
+        row: html`<${PinCompareRow} key=${`pc:${entry.name}`} entry=${entry} />`,
+      });
+    }
   }
   rows.sort((a, b) => (a.time < b.time ? 1 : a.time > b.time ? -1 : 0));
   return rows.map((r) => r.row);
 }
 
-
-function RunsBody() {
+/// Only the tune page renders PinCompareSection, so only it merges the
+/// comparison rows a click there selects.
+function RunsBody({ withPinCompares = false }: { withPinCompares?: boolean }) {
   useQuery({ ...runsQuery(), notifyOnChangeProps: ["data"] });
-  return html`<${RunsTable} />`;
+  return html`<${RunsTable} withPinCompares=${withPinCompares} />`;
 }
 
 function usePageBootstrap(withCharts: boolean) {
@@ -361,7 +365,7 @@ function TunePage() {
                   <th>ambient diff vs previous</th><th>note</th><th></th>
                 </tr>
               </thead>
-              <tbody id="journal-body"><${RunsBody} /></tbody>
+              <tbody id="journal-body"><${RunsBody} withPinCompares=${true} /></tbody>
             </table>
           </div>
         </section>

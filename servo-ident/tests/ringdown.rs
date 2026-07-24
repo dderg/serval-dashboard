@@ -478,3 +478,21 @@ fn ringdown_stop_count_mismatch_fails_loud() {
     assert!(err.contains("1 stops"), "{err}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn square_manifest_without_a_stop_count_fails_loud() {
+    let dir = temp_run_dir();
+    build_ringdown_run(&dir);
+    let manifest_path = dir.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["stroke_plan"]["pattern"] = json!("square");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let err = build_run(&dir).unwrap_err();
+    assert!(err.contains("stops_per_iteration"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
