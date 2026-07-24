@@ -268,3 +268,37 @@ def test_real_zstd_roundtrip(tmp_path):
     assert (run / "a.scap.zst").exists()
     assert not (run / "a.scap").exists()
     assert plan.compress[0].saved_bytes > 0
+
+
+def test_vanished_scap_mid_scan_is_skipped(tmp_path):
+    # A concurrent prune/operator deletion may remove files between the
+    # scan and the stat/compress: the plan must skip them, not crash
+    # (regression: FileNotFoundError killed the 2026-07-24 timer run).
+    root = tmp_path / "captures"
+    root.mkdir()
+    _mkrun(root, "old", age_hours=100.0, files={"a.scap": 1000, "b.scap": 500})
+
+    calls = []
+
+    def racing_compress(scap, dry_run):
+        # First payload disappears right before compression.
+        if scap.name == "a.scap":
+            scap.unlink()
+            raise FileNotFoundError(scap)
+        calls.append(scap.name)
+        dest = scap.with_name(scap.name + ".zst")
+        dest.write_bytes(b"z")
+        scap.unlink()
+        return 1
+
+    plan = prune.build_plan(
+        root,
+        budget_bytes=10 * GIB,
+        cold_age_seconds=48 * HOUR,
+        min_keep_seconds=24 * HOUR,
+        now=time.time(),
+        dry_run=False,
+        compress_fn=racing_compress,
+    )
+    assert calls == ["b.scap"]
+    assert [a.scap.name for a in plan.compress] == ["b.scap"]

@@ -250,8 +250,14 @@ def build_plan(
     saved_total = 0
     for run in cold:
         for scap in scap_payloads(run.path):
-            before = scap.stat().st_size
-            after = compress_fn(scap, dry_run)
+            # Runs can vanish or shrink under us (operator deletion, a
+            # concurrent prune): skip missing files instead of dying -
+            # the next timer run re-plans from the surviving state.
+            try:
+                before = scap.stat().st_size
+                after = compress_fn(scap, dry_run)
+            except FileNotFoundError:
+                continue
             action = CompressAction(
                 run=run.path, scap=scap, before_bytes=before, after_bytes=after
             )
