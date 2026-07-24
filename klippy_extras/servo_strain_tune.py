@@ -704,7 +704,7 @@ class ServoStrainTune:
         for step in manifest["steps"]:
             drv = int(step["swept"]["belt"])
             offset_mm = step["swept"]["offset_um"] / 1000.0
-            path = os.path.join(run_dir, "step_%s.scap" % step["name"])
+            path = _capture_path(run_dir, step)
             try:
                 means = _rolling_elastic_means(path, pair_names)
             except ValueError as e:
@@ -776,11 +776,64 @@ def _belt_motor_names(manifest):
     ]
 
 
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def _zstd_decompress(raw):
+    """Decode a zstd frame. Prefers an in-process module (stdlib
+    ``compression.zstd`` on py3.14+, else the ``zstandard`` package) and
+    falls back to the ``zstd`` CLI so this keeps working on today's py3.13
+    bench while self-upgrading once the stdlib module lands."""
+    try:
+        from compression import zstd as _z  # type: ignore
+
+        return _z.decompress(raw)
+    except Exception:
+        pass
+    try:
+        import zstandard  # type: ignore
+
+        return zstandard.ZstdDecompressor().decompress(raw)
+    except Exception:
+        pass
+    import subprocess
+
+    proc = subprocess.run(
+        ["zstd", "-dc", "-q"],
+        input=raw,
+        stdout=subprocess.PIPE,
+        check=True,
+    )
+    return proc.stdout
+
+
+def _read_capture_bytes(path):
+    """Raw capture bytes, transparently decompressing zstd captures. The
+    compression is detected by the zstd magic, never by the file extension."""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if raw[:4] == _ZSTD_MAGIC:
+        return _zstd_decompress(raw)
+    return raw
+
+
+def _capture_path(run_dir, step):
+    """On-disk path of a step's capture. The manifest ``capture`` field is the
+    authoritative name (``.scap.zst`` for new runs); legacy runs without it
+    fall back to the historical raw ``step_<name>.scap``, then ``.scap.zst``."""
+    name = step.get("capture")
+    if name:
+        return os.path.join(run_dir, name)
+    legacy = os.path.join(run_dir, "step_%s.scap" % step["name"])
+    if os.path.exists(legacy):
+        return legacy
+    return os.path.join(run_dir, "step_%s.scap.zst" % step["name"])
+
+
 def _load_scap(path):
     import numpy as np
 
-    with open(path, "rb") as fh:
-        raw = fh.read()
+    raw = _read_capture_bytes(path)
     nl = raw.index(b"\n")
     header = json.loads(raw[:nl])
     body = raw[nl + 1 :]
@@ -872,7 +925,7 @@ def _collect_elastic_samples(run_dir, manifest):
             sweep_start = plan["y_start"]
         else:
             raise ValueError("step %s has no swept coordinate" % step["name"])
-        path = os.path.join(run_dir, "step_%s.scap" % step["name"])
+        path = _capture_path(run_dir, step)
         header, col = _load_scap(path)
         hdr_drives = {d["name"]: i for i, d in enumerate(header["drives"])}
         cpm = {d["name"]: d["counts_per_mm"] for d in header["drives"]}

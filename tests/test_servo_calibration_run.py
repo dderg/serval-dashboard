@@ -167,7 +167,7 @@ def test_manifest_records_experiment_motors_belts_and_step():
         },
     ]
     assert [s["name"] for s in m["steps"]] == ["track"]
-    assert m["steps"][0]["capture"] == "step_track.scap"
+    assert m["steps"][0]["capture"] == "step_track.scap.zst"
     assert m["steps"][0]["applied"] == []
     assert m["stroke_plan"]["speed"] == 100.0
 
@@ -595,16 +595,16 @@ def test_strain_map_raster_records_one_capture_per_line():
     caps = sc.printer.lookup_object("servo_capture").starts
     names = [os.path.basename(path) for path, _servos in caps]
     assert names == [
-        "step_xline_y030.scap",
-        "step_xline_y150.scap",
-        "step_xline_y270.scap",
-        "step_yline_x030.scap",
-        "step_yline_x150.scap",
-        "step_yline_x270.scap",
+        "step_xline_y030.scap.zst",
+        "step_xline_y150.scap.zst",
+        "step_xline_y270.scap.zst",
+        "step_yline_x030.scap.zst",
+        "step_yline_x150.scap.zst",
+        "step_yline_x270.scap.zst",
     ]
     m = _manifest(sc)
     assert m["experiment"] == "strain_map"
-    assert [s["name"] for s in m["steps"]] == [n[5:-5] for n in names]
+    assert [s["name"] for s in m["steps"]] == [n[5:-9] for n in names]
     assert m["steps"][0]["swept"] == {"y": 30.0}
     assert m["stroke_plan"]["line_spacing"] == 120.0
     g1 = [
@@ -695,7 +695,9 @@ def test_strain_response_steps_each_pair_along_one_line_and_fits():
     caps = sc.printer.lookup_object("servo_capture").starts
     names = [os.path.basename(path) for path, _servos in caps]
     assert names == [
-        "step_belt%s_step%d.scap" % (belt, i) for belt in "ab" for i in range(5)
+        "step_belt%s_step%d.scap.zst" % (belt, i)
+        for belt in "ab"
+        for i in range(5)
     ]
     m = _manifest(sc)
     assert m["experiment"] == "strain_response"
@@ -860,10 +862,10 @@ def test_tune_loops_xy_lines_until_converged():
     caps = sc.printer.lookup_object("servo_capture").starts
     names = [os.path.basename(path) for path, _servos in caps]
     assert names == [
-        "step_iter0_x.scap",
-        "step_iter0_y.scap",
-        "step_iter1_x.scap",
-        "step_iter1_y.scap",
+        "step_iter0_x.scap.zst",
+        "step_iter0_y.scap.zst",
+        "step_iter1_x.scap.zst",
+        "step_iter1_y.scap.zst",
     ]
     assert tuner.scored[0][1] == [
         ("iter0_x", "y", 150.0),

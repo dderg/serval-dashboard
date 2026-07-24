@@ -667,14 +667,14 @@ def test_fit_dynamics_iterates_pattern_captures_until_convergence():
     gcmd = FakeGcmd()
     sc.cmd_SERVO_FIT_DYNAMICS(gcmd)
     assert _capture_paths(sc) == [
-        "step_fit_r0.scap",
-        "step_fit_r1.scap",
-        "step_fit_verify.scap",
+        "step_fit_r0.scap.zst",
+        "step_fit_r1.scap.zst",
+        "step_fit_verify.scap.zst",
     ]
     assert strokes == []
     argv = _fit_argv(gcode)
     caps = [argv[i + 1] for i, a in enumerate(argv) if a == "--capture"]
-    assert [os.path.basename(c) for c in caps] == ["step_fit_verify.scap"]
+    assert [os.path.basename(c) for c in caps] == ["step_fit_verify.scap.zst"]
     engine = sc.printer.lookup_object("motion_engine")
     assert len(engine.dynamics_calls) == 2
     assert any("stays live until RESTART" in r for r in gcmd.responses)
@@ -689,12 +689,12 @@ def test_fit_dynamics_accels_sweep_identifies_without_applying():
     gcmd = FakeGcmd(ACCELS="8000,16000", MAX_SPEED="600")
     sc.cmd_SERVO_FIT_DYNAMICS(gcmd)
     assert _capture_paths(sc) == [
-        "step_fit_a8000.scap",
-        "step_fit_a16000.scap",
+        "step_fit_a8000.scap.zst",
+        "step_fit_a16000.scap.zst",
     ]
     argv = _fit_argv(gcode)
     caps = [argv[i + 1] for i, a in enumerate(argv) if a == "--capture"]
-    assert [os.path.basename(c) for c in caps] == ["step_fit_a16000.scap"]
+    assert [os.path.basename(c) for c in caps] == ["step_fit_a16000.scap.zst"]
     engine = sc.printer.lookup_object("motion_engine")
     assert engine.dynamics_calls == []
     plan = _manifest_for(sc)["stroke_plan"]

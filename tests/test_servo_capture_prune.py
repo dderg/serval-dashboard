@@ -96,6 +96,35 @@ def test_compress_only_scap_and_skips_zst(tmp_path):
     assert not (tmp_path / "cold" / "a.scap").exists()
 
 
+def test_new_naming_scap_zst_is_already_compressed(tmp_path):
+    # New captures land as step_<name>.scap.zst (compressed inline at write
+    # time). The retention pass must treat them as already compressed and only
+    # back-compress any legacy raw *.scap still on disk.
+    _mkrun(
+        tmp_path,
+        "cold",
+        age_hours=72,
+        files={
+            "step_track.scap.zst": 120,
+            "legacy.scap": 1000,
+            "manifest.json": 20,
+        },
+    )
+    plan = prune.build_plan(
+        root=tmp_path,
+        budget_bytes=100 * GIB,
+        cold_age_seconds=48 * HOUR,
+        min_keep_seconds=24 * HOUR,
+        now=time.time(),
+        dry_run=False,
+        compress_fn=_fake_compress,
+    )
+    assert [a.scap.name for a in plan.compress] == ["legacy.scap"]
+    assert (tmp_path / "cold" / "step_track.scap.zst").exists()
+    assert (tmp_path / "cold" / "legacy.scap.zst").exists()
+    assert not (tmp_path / "cold" / "legacy.scap").exists()
+
+
 # --- LRU order by newest-file mtime -----------------------------------------
 
 

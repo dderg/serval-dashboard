@@ -69,7 +69,11 @@ class ExperimentRun:
         return os.path.join(self.run_dir, "manifest.json")
 
     def step_scap(self, name: str) -> str:
-        return os.path.join(self.run_dir, "step_%s.scap" % (name,))
+        # Captures are zstd-compressed inline by kalico's writer, which keys
+        # off the `.zst` suffix. The manifest's `capture` field (recorded via
+        # os.path.basename of this path) is the single source of the on-disk
+        # name; readers detect compression by content, not extension.
+        return os.path.join(self.run_dir, "step_%s.scap.zst" % (name,))
 
     def step_accel_csv(self, name: str) -> str:
         return os.path.join(self.run_dir, "step_%s_accel.csv" % (name,))

@@ -3,7 +3,8 @@
 Command reference for tuning an A6-EC servo axis (EtherCAT). The
 `[servo_calibration]` extension registers the `SERVO_*` console commands. Each
 experiment command writes a run directory under `captures_root` (a
-`manifest.json`, one `step_<name>.scap` per step, optional accelerometer CSVs)
+`manifest.json`, one `step_<name>.scap.zst` per step — zstd-compressed inline
+by kalico's capture writer at write time — optional accelerometer CSVs)
 and then invokes the `servo-cal` Rust binary — `analyze` writes `results.json`
 with a typed verdict, `fit` writes a dynamics profile. Drive-parameter access
 comes from the kalico repo: `klippy/extras/servo_param.py` and
@@ -938,19 +939,27 @@ moved into `servo-cal`.
 ## Capture retention / disk budget
 
 Run directories accumulate under `<captures_root>`
-(`~/printer_data/logs/servo_captures` on the bench) and the raw `.scap`
-payloads are large. `scripts/servo-capture-prune` keeps the tree within a byte
-budget; `install.sh` installs it as `servo-capture-prune.service` (oneshot,
-`Nice=19` + `IOSchedulingClass=idle`) driven by `servo-capture-prune.timer`
-(`OnCalendar=daily`, `OnBootSec=15min`, `Persistent=true`).
+(`~/printer_data/logs/servo_captures` on the bench). Captures are now
+zstd-compressed **at write time** — kalico's capture writer streams each
+`step_<name>.scap.zst` through a zstd encoder as it is recorded, so no bulk
+back-compression pass runs over fresh runs (the old compress-later batch job
+saturated the memory bus and tripped RT frame faults). `scripts/servo-capture-prune`
+keeps the tree within a byte budget and back-compresses only any **legacy raw
+`*.scap`** left from before inline compression; `install.sh` installs it as
+`servo-capture-prune.service` (oneshot, `Nice=19` + `IOSchedulingClass=idle`)
+driven by `servo-capture-prune.timer` (`OnCalendar=daily`, `OnBootSec=15min`,
+`Persistent=true`).
 
 Policy, applied in order every run:
 
-1. **Compress cold payloads.** For any run dir whose newest file is older than
-   `--cold-age-hours` (default **48h**), each `*.scap` is recompressed in place
-   with `zstd -6 --rm` (bus-throttled; see the unit) to `*.scap.zst`. Small analysis artifacts
-   (`manifest.json`, `results.json`, `plot_series.json`, …) are left readable so
-   the dashboard's run list and plots keep working for compressed runs.
+1. **Back-compress legacy raw payloads.** New captures are already
+   `*.scap.zst`, so this step only touches legacy raw `*.scap` (already-`.zst`
+   files are skipped). For any run dir whose newest file is older than
+   `--cold-age-hours` (default **48h**), each remaining raw `*.scap` is
+   compressed in place with `zstd -6 --rm` (bus-throttled; see the unit) to
+   `*.scap.zst`. Small analysis artifacts (`manifest.json`, `results.json`,
+   `plot_series.json`, …) are left readable so the dashboard's run list and
+   plots keep working for compressed runs.
 2. **Budget prune.** While the total exceeds `--budget-gib` (default **8 GiB**),
    the oldest whole run dir (ordered by newest-file mtime) is deleted,
    oldest-first. `pin_compare/<name>` dirs are last-resort: they are only
@@ -978,9 +987,17 @@ edit `service/servo-capture-prune.service` in this repo and re-run
 
 ### Re-analyzing a compressed capture
 
-A compressed `.scap.zst` is **not** readable by `servo-cal` or
-`scripts/servo_capture.py` directly. Decompress it first:
+No decompression step is needed. `servo-cal` (and the dashboard it serves)
+detect zstd by the frame magic and decode `.scap.zst` transparently, so
+`analyze`, `fit`, and the strain re-fit read compressed captures directly:
 
 ```sh
-zstd -d run_dir/step_foo.scap.zst      # -> run_dir/step_foo.scap
+servo-cal analyze run_dir            # reads step_*.scap.zst in place
+```
+
+If you want a raw `.scap` for the standalone `scripts/servo_capture.py`
+inspector (which still expects raw bytes), decompress a copy by hand:
+
+```sh
+zstd -d run_dir/step_foo.scap.zst    # -> run_dir/step_foo.scap
 ```

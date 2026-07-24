@@ -205,7 +205,7 @@ def test_sweep_accel_step_naming_and_report_invocation():
     sc.cmd_SERVO_SWEEP_ACCEL(FakeGcmd(AXIS="A", ACCELS="20000,10000,10000"))
     names = [os.path.basename(p) for p, _s in _cap(sc).captures]
     # dedup + sorted ascending
-    assert names == ["step_accel_a10000.scap", "step_accel_a20000.scap"]
+    assert names == ["step_accel_a10000.scap.zst", "step_accel_a20000.scap.zst"]
     manifest = _manifest_for(sc)
     assert manifest["experiment"] == "accel_sweep"
     assert [s["name"] for s in manifest["steps"]] == [
