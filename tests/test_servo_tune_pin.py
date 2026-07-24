@@ -342,3 +342,27 @@ def test_tune_pin_accel_empty_capture_scores_nothing():
     report = " ".join(gcmd.responses)
     assert "pin sweep accel" not in report
     assert node.live_dynamics_profile != path
+
+
+@requires_tomllib
+def test_set_compliance_pin_declares_the_complete_set():
+    # PIN=Y on a baseline with BOTH modes pinned must leave only Y pinned:
+    # PIN= is declarative (the full pinned set), matching PIN=0 = empty.
+    sc, _gcode, _path = _make_set_calibration()
+    sc.cmd_SERVO_SET_COMPLIANCE(
+        FakeGcmd(
+            X_FREQ="216.8",
+            Y_FREQ="131.5",
+            PIN="XY",
+            X_PEAK="300",
+            Y_PEAK="200",
+        )
+    )
+    sc.cmd_SERVO_SET_COMPLIANCE(
+        FakeGcmd(Y_FREQ="130.2", PIN="Y", Y_PEAK="204.1", ZETA="0.035")
+    )
+    engine = sc.printer.lookup_object("motion_engine")
+    call = engine.dynamics_calls[-1]
+    pin_mass, pin_zeta = call[6], call[7]
+    assert pin_mass[0] == 0.0 and pin_zeta[0] == 0.0, "X pin must clear"
+    assert pin_mass[1] > 0.0 and pin_zeta[1] == pytest.approx(0.035)

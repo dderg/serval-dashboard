@@ -1802,9 +1802,13 @@ class DynamicsFitCommands(MeasureCommands):
         updated: dict[str, Any],
         pin: dict[str, Any],
         changed: list[str],
+        partial: bool = False,
     ) -> None:
         """Apply the pin request onto ``updated`` (already carrying the
-        baseline pin state), mutating pin_mass/pin_zeta/pin_lead_us."""
+        baseline pin state), mutating pin_mass/pin_zeta/pin_lead_us.
+        By default the request DECLARES the complete pinned set (unnamed
+        modes revert to plain); ``partial=True`` mutates only the named
+        modes - used by SERVO_TUNE_PIN's per-mode accumulation."""
         modes = pin["modes"]
         if not modes:
             # explicit PIN=0: clear every pin, keep compliance untouched
@@ -1823,6 +1827,14 @@ class DynamicsFitCommands(MeasureCommands):
         updated["pin_lead_us"] = pin["pin_lead_us"]
         for mode_i, mode in enumerate(updated["modes"]):
             if mode not in modes:
+                if partial:
+                    continue
+                # PIN= declares the complete pinned set: unnamed modes
+                # revert to plain, matching PIN=0 clearing everything.
+                if updated["pin_mass"][mode_i] > 0.0:
+                    changed.append("%s: pin off" % (mode,))
+                updated["pin_mass"][mode_i] = 0.0
+                updated["pin_zeta"][mode_i] = 0.0
                 continue
             if not updated["compliance"][mode_i] > 0.0:
                 raise gcmd.error(
@@ -3347,7 +3359,7 @@ class DynamicsFitCommands(MeasureCommands):
                     "zetas": {mode: zeta_coarse[0]},
                     "pin_lead_us": working.get("pin_lead_us", 0.0),
                 }
-                self._apply_pin(gcmd, working, pin, [])
+                self._apply_pin(gcmd, working, pin, [], partial=True)
                 _rows, coarse_win, _cres, _crd = self._run_pin_staircase(
                     gcmd,
                     node,
