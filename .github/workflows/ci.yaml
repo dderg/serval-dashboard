@@ -55,5 +55,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uvx ruff check klippy_extras tests
-      - run: uvx ruff format --check klippy_extras tests
+      # Pinned: bare `uvx ruff` tracks the latest release, so a new ruff
+      # turning a rule on by default turns this gate red on every open PR at
+      # once, for code none of them touched. Bump deliberately.
+      - run: uvx ruff@0.15.21 check klippy_extras tests
+      - run: uvx ruff@0.15.21 format --check klippy_extras tests
