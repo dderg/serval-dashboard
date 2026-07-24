@@ -149,11 +149,13 @@ class MeasureCommands(CalibrationHost):
         "residual vibration (servo encoders + optional accelerometer) for "
         "per-mode frequency and damping ratio - the free decay a drive "
         "cannot compensate the way it fights a steady sweep. "
-        "PATTERN=SQUARE drives square laps instead (full stop at every "
-        "corner, 4 stops/lap, alternating X/Y legs; SIZE= side in mm, "
-        "default min(80, bounds)) - the corner-transient variant. Params "
-        "PATTERN=STROKE|SQUARE AXIS=X|Y|A|B SPEEDS ACCEL ITERATIONS "
-        "DWELL_MS CRUISE_MS SIZE ACCEL_CHIP TAG"
+        "PATTERN=SQUARE drives square laps with FULL-SPEED corners "
+        "instead (corner budget raised to the leg speed: every 90 degree "
+        "corner is an instantaneous direction flip; 4 corners/lap, "
+        "alternating X/Y legs, only the final corner stops; SIZE= side "
+        "in mm, default min(80, bounds)) - the corner-transient variant. "
+        "Params PATTERN=STROKE|SQUARE AXIS=X|Y|A|B SPEEDS ACCEL "
+        "ITERATIONS DWELL_MS CRUISE_MS SIZE ACCEL_CHIP TAG"
     )
 
     def _ringdown_dynamics(self, gcmd: Any, engine: Any) -> tuple[float, float]:
@@ -391,12 +393,15 @@ class MeasureCommands(CalibrationHost):
         return speeds
 
     def _measure_ringdown_square(self, gcmd: Any) -> None:
-        """Ring-down over a square path: full stop at every corner (the
-        sharpest corner a planner can command), post-processors bypassed
-        and jerk lifted exactly like the stroke variant, so each corner's
-        decel excites the raw closed-loop plant and the tail after it is
-        analyzed as a free decay. 4 stops per lap; alternating X and Y
-        legs exercise both Cartesian modes in one run."""
+        """Ring-down over a square path with FULL-SPEED corners: the
+        planner's corner budget is raised to the leg speed so every 90
+        degree corner is an instantaneous velocity-direction flip - the
+        real corner transient, not a stop. Post-processors bypassed and
+        jerk lifted exactly like the stroke variant. Corner print-times
+        are analytic (constant-|v| legs last exactly size/speed) anchored
+        on the pre-lap standstill fence; the analyzer windows each
+        corner's ring from them, and only the final corner is a full
+        stop. 4 corners per lap, alternating X and Y legs."""
         engine = self.printer.lookup_object("motion_engine")
         accel, max_velocity = self._ringdown_dynamics(gcmd, engine)
         iterations = gcmd.get_int("ITERATIONS", 3, minval=1)
@@ -455,7 +460,7 @@ class MeasureCommands(CalibrationHost):
                         name = "%s_v%d" % (tag, speed)
                         gcmd.respond_info(
                             "ringdown %d/%d: %.0f mm square at %d mm/s, "
-                            "accel %.0f mm/s^2, %d corner stops"
+                            "accel %.0f mm/s^2, %d flowing corners"
                             % (
                                 i + 1,
                                 len(speeds),
@@ -473,7 +478,7 @@ class MeasureCommands(CalibrationHost):
                             else chip.start_internal_client()
                         )
                         try:
-                            stops = servo_strokes.emit_square_with_stop_times(
+                            stops = servo_strokes.emit_square_flowing(
                                 self.printer,
                                 self.gcode,
                                 x0,

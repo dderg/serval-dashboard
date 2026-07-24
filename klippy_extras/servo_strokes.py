@@ -301,7 +301,7 @@ def emit_strokes_with_stop_times(
     return stops
 
 
-def emit_square_with_stop_times(
+def emit_square_flowing(
     printer: Any,
     gcode: Any,
     x0: float,
@@ -312,29 +312,47 @@ def emit_square_with_stop_times(
     iterations: int,
     dwell: int,
 ) -> list[float]:
-    """Square laps (corner at (x0, y0), CCW) with a full stop at every
-    corner; each leg is submitted alone and its commanded-stop print-time
-    is read off the motion fence before the dwell - the ring-down analyzer
-    windows accelerometer tails from these. 4 stops per lap. The caller
-    travels to (x0, y0) first."""
+    """Square laps (corner at (x0, y0), CCW) with FULL-SPEED corners:
+    SQUARE_CORNER_VELOCITY is raised to the leg speed so the planner
+    carries |v| through every 90 degree corner - an instantaneous
+    velocity-direction flip, the sharpest corner the machine can command.
+    Returns the analytic print-time of every corner (4 per lap; the last
+    entry is the final full stop), anchored on the pre-lap standstill
+    fence: constant-speed legs last exactly size/speed, the first leg
+    adds the spin-up v/(2a) and the last the spin-down v/(2a). A trailing
+    dwell keeps the capture open past the final stop's ring. The caller
+    travels to (x0, y0) first and restores velocity limits afterwards."""
     check_reachable(gcode, size, speed, accel)
     toolhead = printer.lookup_object("toolhead")
     feed = int(speed * 60)
     gcode.run_script_from_command(
-        "SET_VELOCITY_LIMIT ACCEL=%.0f\nG90" % (accel,)
+        "SET_VELOCITY_LIMIT ACCEL=%.0f SQUARE_CORNER_VELOCITY=%.0f\nG90"
+        % (accel, speed)
     )
+    # Machine is parked at (x0, y0): the fence read is free and anchors
+    # the analytic corner times on the planner's own clock.
+    t0 = toolhead.get_last_move_time()
     corners = [
         (x0 + size, y0),
         (x0 + size, y0 + size),
         (x0, y0 + size),
         (x0, y0),
     ]
-    stops: list[float] = []
+    lines = []
     for _ in range(iterations):
         for cx, cy in corners:
-            gcode.run_script_from_command("G1 X%.3f Y%.3f F%d" % (cx, cy, feed))
-            stops.append(toolhead.get_last_move_time())
-            gcode.run_script_from_command("M400\nG4 P%d\nM400" % (dwell,))
+            lines.append("G1 X%.3f Y%.3f F%d" % (cx, cy, feed))
+    lines += ["M400", "G4 P%d" % (dwell,), "M400"]
+    gcode.run_script_from_command("\n".join(lines))
+    leg = size / speed
+    spin = speed / (2.0 * accel)
+    n = 4 * iterations
+    stops: list[float] = []
+    t = t0 + spin + leg  # spin-up + first leg
+    for _ in range(n):
+        stops.append(t)
+        t += leg
+    stops[-1] += spin  # the last leg ends in the spin-down to a stop
     return stops
 
 

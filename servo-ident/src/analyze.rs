@@ -1260,6 +1260,23 @@ fn build_run_reusing(
         };
         if let Some((opts, expected_strokes)) = &ringdown_plan {
             let accel_path = step.accel.as_ref().map(|a| dir.join(a));
+            // Flowing square (PATTERN=SQUARE): corners never stop, so the
+            // tail windows come from analytic corner times built from the
+            // plan geometry and this step's leg speed.
+            let flow =
+                if manifest.stroke_plan.get("pattern").and_then(Value::as_str) == Some("square") {
+                    let size = plan_f64("size_mm")?;
+                    let accel = plan_f64("accel")?;
+                    let speed = step
+                        .swept_value("speed")
+                        .ok_or_else(|| format!("square step {:?} records no speed", step.name))?;
+                    Some(crate::ringdown::FlowPlan {
+                        leg_s: size / speed,
+                        spin_s: speed / (2.0 * accel),
+                    })
+                } else {
+                    None
+                };
             let (rr, pr) = compute_step_ringdown(
                 &cap,
                 &step.name,
@@ -1269,6 +1286,7 @@ fn build_run_reusing(
                 step.stops.as_deref(),
                 *expected_strokes,
                 opts,
+                flow.as_ref(),
             )?;
             if rr
                 .sources

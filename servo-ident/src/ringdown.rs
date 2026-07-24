@@ -36,6 +36,16 @@ pub struct RingdownOptions {
     pub window_s: f64,
     pub band_hz: (f64, f64),
 }
+/// Timing plan for a flowing-square step (`PATTERN=SQUARE`): the motion is
+/// one continuous polyline with full-speed corners, so tails cannot come
+/// from standstill segments — corner times are analytic instead. Constant
+/// -|v| legs last exactly `leg_s`; the first leg adds the spin-up
+/// `spin_s = v/(2a)` and the last the spin-down.
+#[derive(Debug, Clone, Copy)]
+pub struct FlowPlan {
+    pub leg_s: f64,
+    pub spin_s: f64,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct DecayFit {
@@ -796,8 +806,11 @@ pub fn ringdown_verdict_reason(steps: &[&RingdownResult]) -> String {
 /// Analyze one ringdown step capture (plus its optional accelerometer CSV)
 /// into per-source aggregated modes and plot payloads. `stops_pt` are the
 /// per-stroke commanded-stop print-times klippy recorded; they window the
-/// accelerometer tails, while servo tails come from the capture's own
-/// target-motion segments.
+/// accelerometer tails. Servo tails come from the capture's own
+/// target-motion segments — except with a `flow` plan (flowing square),
+/// where corners never stop and the tails are windowed from analytic
+/// corner times instead.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_step_ringdown(
     cap: &Scap,
     name: &str,
@@ -807,6 +820,7 @@ pub fn compute_step_ringdown(
     stops_pt: Option<&[f64]>,
     expected_strokes: usize,
     opts: &RingdownOptions,
+    flow: Option<&FlowPlan>,
 ) -> Result<(RingdownResult, PlotRingdown), String> {
     let fs = cap.fs();
     let guard = (opts.guard_s * fs).round() as usize;
@@ -817,7 +831,7 @@ pub fn compute_step_ringdown(
     if ref_segments.is_empty() {
         return Err(format!("step {name:?}: capture holds no strokes"));
     }
-    if ref_segments.len() != expected_strokes {
+    if flow.is_none() && ref_segments.len() != expected_strokes {
         return Err(format!(
             "step {name:?}: capture holds {} strokes but the stroke plan \
              commanded {expected_strokes}",
@@ -833,13 +847,79 @@ pub fn compute_step_ringdown(
             ));
         }
     }
+    // Flowing square: one continuous motion segment; corner sample indices
+    // are analytic from the plan, cross-checked against the segment's real
+    // span so a planner that failed to hold corner speed fails loud
+    // instead of silently mis-windowing every tail.
+    let flow_ranges: Option<Vec<Range<usize>>> = match flow {
+        None => None,
+        Some(fp) => {
+            if ref_segments.len() != 1 {
+                return Err(format!(
+                    "step {name:?}: a flowing square is one continuous \
+                     motion but the capture holds {} segments — corners \
+                     stopped (SQUARE_CORNER_VELOCITY not honored?)",
+                    ref_segments.len()
+                ));
+            }
+            let (seg_start, seg_end) = ref_segments[0];
+            let n = expected_strokes;
+            let predicted_s = n as f64 * fp.leg_s + 2.0 * fp.spin_s;
+            let actual_s = (seg_end - seg_start) as f64 / fs;
+            if (actual_s - predicted_s).abs() > 0.05 * predicted_s + 0.05 {
+                return Err(format!(
+                    "step {name:?}: commanded motion spans {actual_s:.3}s \
+                     but the square plan predicts {predicted_s:.3}s — the \
+                     planner did not carry the legs at constant speed, so \
+                     the analytic corner times are wrong"
+                ));
+            }
+            let mut corner_idx: Vec<usize> = (0..n)
+                .map(|k| {
+                    seg_start + ((fp.spin_s + (k as f64 + 1.0) * fp.leg_s) * fs).round() as usize
+                })
+                .collect();
+            // The last corner is the final full stop — pin it to the
+            // segment's own end rather than the analytic estimate.
+            *corner_idx.last_mut().expect("n >= 1") = seg_end;
+            let n_records = cap.n_records;
+            let mut out = Vec::new();
+            for (i, &c) in corner_idx.iter().enumerate() {
+                let start = c + guard;
+                let cap_end = if i + 1 < corner_idx.len() {
+                    corner_idx[i + 1].saturating_sub(guard)
+                } else {
+                    n_records
+                };
+                let end = (start + max_len).min(cap_end);
+                if end > start {
+                    out.push(start..end);
+                }
+            }
+            if out.len() != n {
+                return Err(format!(
+                    "step {name:?}: only {} of {n} corner windows are \
+                     usable — legs too short for the {}ms guard",
+                    out.len(),
+                    (opts.guard_s * 1000.0) as i64
+                ));
+            }
+            let min_len = out.iter().map(Range::len).min().unwrap_or(0);
+            for r in &mut out {
+                r.end = r.start + min_len;
+            }
+            Some(out)
+        }
+    };
 
     let combined = match belts {
         Some(spec) => Some(crate::combine::compute_corexy_combine(cap, spec, axis)?),
         None => None,
     };
     if let Some(c) = &combined {
-        let ranges = tail_ranges(&ref_segments, c.on_ferr.len(), guard, max_len);
+        let ranges = flow_ranges
+            .clone()
+            .unwrap_or_else(|| tail_ranges(&ref_segments, c.on_ferr.len(), guard, max_len));
         let tails: Vec<Vec<f64>> = ranges
             .iter()
             .map(|r| c.on_ferr[r.clone()].iter().map(|&v| v * 1000.0).collect())
@@ -861,12 +941,14 @@ pub fn compute_step_ringdown(
             ));
         }
         let segs = stroke_segments(cap, idx)?;
-        if segs.is_empty() {
+        if flow_ranges.is_none() && segs.is_empty() {
             continue;
         }
         let ferr = cap.read_i64(idx, "following_error")?;
         let um_per_count = 1000.0 / drive.counts_per_mm;
-        let ranges = tail_ranges(&segs, ferr.len(), guard, max_len);
+        let ranges = flow_ranges
+            .clone()
+            .unwrap_or_else(|| tail_ranges(&segs, ferr.len(), guard, max_len));
         let tails: Vec<Vec<f64>> = ranges
             .iter()
             .map(|r| {

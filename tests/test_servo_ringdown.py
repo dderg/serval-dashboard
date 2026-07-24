@@ -309,7 +309,7 @@ def test_analyze_invoked_on_the_run_dir():
     assert sc._active_run is None, "run must be closed even on success"
 
 
-def test_square_pattern_records_four_stops_per_lap():
+def test_square_pattern_flows_corners_and_records_analytic_stops():
     sc, gcode = make_calibration()
     sc.cmd_SERVO_MEASURE_RINGDOWN(
         FakeGcmd(PATTERN="SQUARE", SPEEDS="100", ITERATIONS=2)
@@ -324,9 +324,23 @@ def test_square_pattern_records_four_stops_per_lap():
     assert plan["corner_x"] == 70.0 and plan["corner_y"] == 70.0, (
         "80 mm box centered on the (20,200) bounds center 110"
     )
+    # The corner budget is raised to the leg speed so corners flow.
+    scv_lines = [
+        line
+        for s in gcode.scripts
+        if isinstance(s, str)
+        for line in s.splitlines()
+        if "SQUARE_CORNER_VELOCITY" in line
+    ]
+    assert scv_lines == [
+        "SET_VELOCITY_LIMIT ACCEL=25000 SQUARE_CORNER_VELOCITY=100"
+    ]
     (step,) = manifest["steps"]
-    assert len(step["stops"]) == 8, "2 laps x 4 corner stops"
-    assert step["stops"] == sorted(step["stops"])
+    # Analytic corner times anchored on the pre-lap fence (t0=0 in the
+    # fake): leg 80/100=0.8 s, spin 100/(2*25000)=0.002 s.
+    expected = [0.802 + 0.8 * k for k in range(8)]
+    expected[-1] += 0.002
+    assert step["stops"] == pytest.approx(expected)
     # Legs alternate X and Y between the two corner coordinates.
     assert _step_extents(gcode, "X") == {70.0, 150.0}
     assert _step_extents(gcode, "Y") == {70.0, 150.0}
