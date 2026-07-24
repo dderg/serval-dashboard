@@ -512,13 +512,13 @@ mode keeps its current value. On a coupled node the per-mode terms
 compose through the frame (`G = F⁺·diag(c)·F`), so per-axis
 frequencies map correctly onto CoreXY motors.
 
-`PIN=XY|X|Y|0` declares the **complete** pinned set: named modes switch
-to **pin-rotor** (mode A), unnamed modes revert to plain, and `PIN=0`
-clears every pin — so `PIN=Y` on a profile that had both pinned leaves
-only Y pinned. In mode A the endpoint holds the rotor on the planner
-path and cancels the belt reaction with a predictive torque, so the
-toolhead rings at the locked-rotor `f_b` where a standard input shaper
-applies. Pin needs
+`PIN=XY|X|Y|0` switches the **named** mode(s) to **pin-rotor** (mode A)
+and touches nothing else: `PIN=X` then `PIN=Y` compose without
+unpinning each other. To unpin one mode, clear all pins with `PIN=0`
+and re-pin what should remain (e.g. `PIN=0`, then `PIN=Y …`). In mode
+A the endpoint holds the rotor on the planner path and cancels the
+belt reaction with a predictive torque, so the toolhead rings at the
+locked-rotor `f_b` where a standard input shaper applies. Pin needs
 the mode's compliance as its frequency source, so set `X_FREQ`/`Y_FREQ`
 in the same call (or apply it to an existing profile). Each pinned mode
 also needs its FRF **peak** frequency — `X_PEAK`/`Y_PEAK` in Hz,

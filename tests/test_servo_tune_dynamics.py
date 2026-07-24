@@ -1114,7 +1114,29 @@ def test_set_compliance_pin_zero_clears_but_keeps_compliance():
 
 
 @requires_tomllib
-def test_set_compliance_pin_y_unpins_x():
+def test_set_compliance_sequential_pins_compose():
+    sc, _gcode, _path = make_calibration()
+    sc.cmd_SERVO_SET_COMPLIANCE(
+        FakeGcmd(
+            {
+                "X_FREQ": 190.0,
+                "Y_FREQ": 120.0,
+                "PIN": "X",
+                "X_PEAK": 260.0,
+            }
+        )
+    )
+    # PIN=Y mutates only Y; X's pin from the previous call must persist.
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "Y", "Y_PEAK": 200.0}))
+    engine = sc.printer.lookup_object("motion_engine")
+    pin_mass = engine.dynamics_calls[-1][6]
+    pin_x = BASELINE_MASS[0] * (1.0 - (190.0 / 260.0) ** 2)
+    pin_y = BASELINE_MASS[1] * (1.0 - (120.0 / 200.0) ** 2)
+    assert pin_mass == pytest.approx([pin_x, pin_y])
+
+
+@requires_tomllib
+def test_set_compliance_unpin_one_mode_via_clear_and_repin():
     sc, _gcode, _path = make_calibration()
     sc.cmd_SERVO_SET_COMPLIANCE(
         FakeGcmd(
@@ -1127,7 +1149,8 @@ def test_set_compliance_pin_y_unpins_x():
             }
         )
     )
-    # PIN=Y declares the complete pinned set: X reverts to plain.
+    # The documented unpin path: PIN=0 clears all, then re-pin Y only.
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "0"}))
     sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "Y", "Y_PEAK": 200.0}))
     engine = sc.printer.lookup_object("motion_engine")
     pin_mass = engine.dynamics_calls[-1][6]
