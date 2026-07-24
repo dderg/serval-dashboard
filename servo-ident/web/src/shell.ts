@@ -13,7 +13,6 @@ import { TunePage, JournalPage } from "./runs";
 import { MOONRAKER_KEY, MOONRAKER_HEALTH_POLL_MS, RT_HEALTH_POLL_MS, PSD_MAX_FREQ_KEY, MOTOR_VIEW_KEY, PAGE_DEFS, DEFAULT_PAGE, state } from "./state";
 import type { PageDef } from "./state";
 import { StrainPage } from "./strain";
-import { PinComparePage } from "./pin-compare";
 
 // --- page shell ---------------------------------------------------------------
 
@@ -263,7 +262,6 @@ function PageOutlet() {
       aside=${html`<${ConsolePanel} templates=${def.templates} /><${LaunchpadPad} />`}
     />`;
   if (def.journal) return html`<${JournalPage} />`;
-  if (def.pinCompare) return html`<${PinComparePage} />`;
   if (def.docs) return html`<${DocsPage} />`;
   return html`<${TunePage} />`;
 }

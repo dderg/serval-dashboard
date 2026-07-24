@@ -97,7 +97,10 @@ function PinCompareLegend({
   </div>`;
 }
 
-function PinCompareView() {
+/// Pin-compare overlay as a tune-tab section: hidden entirely until at
+/// least one comparison manifest exists (the tune tab only shows sections
+/// that have data), then a dropdown picks the comparison to overlay.
+function PinCompareSection() {
   const list = useQuery({ queryKey: ["pin-compare"], queryFn: listPinCompares });
   const names = list.data ?? [];
   const [selected, setSelected] = useState<string | null>(
@@ -143,18 +146,18 @@ function PinCompareView() {
     });
   };
 
-  return html`<main class="analysis">
-    <section class="section">
-      <div class="section-head"><h2>pin compare</h2></div>
+  // No manifests (or list still loading/failed): the section stays absent.
+  if (!names.length) return null;
+
+  return html`<section class="pin-compare-section">
+    <div class="section-head"><h2>pin compare</h2></div>
       <div class="section-tools">
         <label>comparison
           <select
             value=${active ?? ""}
             onChange=${(e: Event) => onSelect((e.target as HTMLSelectElement).value)}
           >
-            ${names.length === 0
-              ? html`<option value="">no comparisons</option>`
-              : names.map(
+            ${names.map(
                   (n) => html`<option key=${n.name} value=${n.name}
                     >${n.name} — ${n.param} (${n.n_sweeps} sweeps)</option
                   >`
@@ -180,9 +183,6 @@ function PinCompareView() {
           </select>
         </label>
       </div>
-      ${list.error
-        ? html`<p class="note">failed to load comparisons: ${String(list.error)}</p>`
-        : null}
       ${detail.error
         ? html`<p class="note">failed to load ${active}: ${String(detail.error)}</p>`
         : null}
@@ -194,17 +194,8 @@ function PinCompareView() {
               hidden=${hidden}
             />
             <${PinCompareLegend} manifest=${manifest} hidden=${hidden} onToggle=${onToggle} />`
-        : names.length
-          ? html`<p class="note">select a comparison to overlay its sweeps</p>`
-          : html`<p class="note">
-              no pin comparisons yet — run SERVO_PIN_COMPARE_SWEEP to create one
-            </p>`}
-    </section>
-  </main>`;
+        : html`<p class="note">select a comparison to overlay its sweeps</p>`}
+  </section>`;
 }
 
-function PinComparePage() {
-  return html`<div class="workspace single"><${PinCompareView} /></div>`;
-}
-
-export { PinComparePage, sweepColor };
+export { PinCompareSection, sweepColor };

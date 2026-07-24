@@ -24,6 +24,7 @@ import {
 } from "./metrics";
 import { FrfSection, RingdownSection } from "./dynamics";
 import { SectionHead, TimeDomainSection, PathSection } from "./charts-core";
+import { PinCompareSection } from "./pin-compare";
 import { applyAccordionState, bindAnalysisControls, currentPageDef } from "./shell";
 import { PALETTE, INITIAL_SELECTED_RUNS, state } from "./state";
 import { notify, useStore } from "./store";
@@ -327,6 +328,7 @@ function TunePage() {
         <${SweepMetricsSection} />
         <${PathSection} />
         <${FrfSection} />
+        <${PinCompareSection} />
         <${RingdownSection} />
         <${PsdSection} />
         <${AccelPsdSection} />

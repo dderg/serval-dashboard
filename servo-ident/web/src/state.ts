@@ -49,7 +49,6 @@ interface PageDef {
   live?: boolean;
   journal?: boolean;
   docs?: boolean;
-  pinCompare?: boolean;
 }
 
 const PAGE_DEFS: Record<string, PageDef> = {
@@ -120,11 +119,6 @@ const PAGE_DEFS: Record<string, PageDef> = {
   journal: {
     label: "journal",
     journal: true,
-  },
-  compare: {
-    label: "compare",
-    pinCompare: true,
-    intro: "overlay resonance sweeps across pin-parameter values",
   },
   docs: {
     label: "docs",
