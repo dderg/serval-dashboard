@@ -110,7 +110,9 @@ class MeasureCommands(CalibrationHost):
             )
             self._start_capture(name, pair_names)
             try:
-                engine.resonance_buzz(
+                self._resonance_buzz(
+                    gcmd,
+                    engine,
                     handle,
                     (1 << slots[0]) | (1 << slots[1]),
                     1 << slots[1],

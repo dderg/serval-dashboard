@@ -567,6 +567,26 @@ class CalibrationHost:
     def _prep(self, axis: str, dwell: int) -> None:
         servo_strokes.prep(self.printer, self.gcode, axis, dwell)
 
+    def _resonance_buzz(
+        self, gcmd: Any, engine: Any, handle: int, *args: int
+    ) -> None:
+        """engine.resonance_buzz with endpoint rejections turned into
+        recoverable gcmd errors instead of RuntimeError (which Klipper
+        escalates to a full shutdown). -828 means the torque gate is not
+        operation-enabled - typically the idle timeout's M84 parked the
+        servos between commands."""
+        try:
+            engine.resonance_buzz(handle, *args)
+        except RuntimeError as e:
+            hint = ""
+            if "-828" in str(e):
+                hint = (
+                    " (drives not operation-enabled - motors were likely "
+                    "disabled by the idle timeout; rerun the command, or "
+                    "home/move first to re-energize)"
+                )
+            raise gcmd.error("resonance buzz rejected: %s%s" % (e, hint))
+
     def _restore(self) -> None:
         self.gcode.run_script_from_command("RESET_VELOCITY_LIMIT")
 

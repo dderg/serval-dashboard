@@ -502,9 +502,32 @@ def scalar_fit_drive(gcmd: Any, kin: Any) -> str | None:
 def prep(printer: Any, gcode: Any, axis: str, dwell: int) -> None:
     curtime = printer.get_reactor().monotonic()
     toolhead = printer.lookup_object("toolhead")
-    homed = toolhead.get_kinematics().get_status(curtime)["homed_axes"]
+    kin = toolhead.get_kinematics()
+    homed = kin.get_status(curtime)["homed_axes"]
     lines = []
     if axis.lower() not in homed:
         lines.append("G28 %s" % (axis,))
+    else:
+        # Homed but possibly parked: servo lanes keep their homing across
+        # M84 / idle-timeout (absolute encoders), so G28 is rightly skipped
+        # - but torque is off and a subsequent buzz would be rejected by
+        # the endpoint (drive not operation-enabled). Re-energize the
+        # axis's motors the same way homing does; motor_enable_group also
+        # resyncs parked servo positions from the encoders.
+        deltas = [0.0, 0.0, 0.0]
+        deltas["xyz".index(axis.lower())] = 1.0
+        names: list[str] = []
+        for rail in kin.active_rails(*deltas):
+            steppers = rail.get_steppers()
+            if steppers:
+                names.extend(s.get_name() for s in steppers)
+            else:
+                names.append(rail.get_name())
+        stepper_enable = printer.lookup_object("stepper_enable")
+        if any(
+            not stepper_enable.lookup_enable(n).is_motor_enabled()
+            for n in names
+        ):
+            stepper_enable.motor_enable_group(names)
     lines += ["M400", "G4 P%d" % (dwell,), "M400"]
     gcode.run_script_from_command("\n".join(lines))

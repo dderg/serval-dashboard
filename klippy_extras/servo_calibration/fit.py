@@ -2079,7 +2079,9 @@ class DynamicsFitCommands(MeasureCommands):
                 )
                 self._start_capture(mode, step_servos)
                 try:
-                    engine.resonance_buzz(
+                    self._resonance_buzz(
+                        gcmd,
+                        engine,
                         handle,
                         slot_mask,
                         sign_mask,
@@ -2527,6 +2529,7 @@ class DynamicsFitCommands(MeasureCommands):
         )
         self._prep("X", 0)
         self._prep("Y", 0)
+        toolhead = self.printer.lookup_object("toolhead")
         tone_end = 0.0
         accels: list[float | None] = []
         try:
@@ -2537,13 +2540,21 @@ class DynamicsFitCommands(MeasureCommands):
                 now = reactor.monotonic()
                 if now < tone_end:
                     reactor.pause(tone_end + 0.1)
+                # Buzz dwells are invisible to the toolhead, so a long
+                # staircase looks idle to idle_timeout - whose M84 would
+                # yank torque mid-sweep (observed on the bench: the disable
+                # landed one second after an 11-step run). Advancing the
+                # print time each step keeps the machine "busy".
+                toolhead.get_last_move_time()
                 updated = self._pin_sweep_model(baseline, mode_i, param, value)
                 send_dynamics_model(engine, handle, updated)
                 step_name = "v%d" % (i,)
                 # Tone covers this dwell only; generously oversized (it is
                 # duration-bounded and lapses harmlessly after the capture
                 # stops - the next step re-streams and starts its own).
-                engine.resonance_buzz(
+                self._resonance_buzz(
+                    gcmd,
+                    engine,
                     handle,
                     slot_mask,
                     sign_mask,
@@ -2969,13 +2980,19 @@ class DynamicsFitCommands(MeasureCommands):
         )
         self._prep("X", 0)
         self._prep("Y", 0)
+        toolhead = self.printer.lookup_object("toolhead")
         sweeps: list[dict[str, Any]] = []
         try:
             for i, value in enumerate(values):
+                # Keep idle_timeout from parking the servos mid-comparison
+                # (chirp motion is invisible to the toolhead).
+                toolhead.get_last_move_time()
                 updated = self._pin_sweep_model(baseline, mode_i, param, value)
                 send_dynamics_model(engine, handle, updated)
                 aclient = accel_chip.start_internal_client()
-                engine.resonance_buzz(
+                self._resonance_buzz(
+                    gcmd,
+                    engine,
                     handle,
                     slot_mask,
                     sign_mask,
