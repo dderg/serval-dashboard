@@ -68,6 +68,8 @@ pub struct Manifest {
     pub version: i64,
     pub experiment: String,
     #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
     pub tag: String,
     #[serde(default)]
     pub axis: Option<String>,

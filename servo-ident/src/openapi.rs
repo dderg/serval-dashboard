@@ -15,8 +15,7 @@ use serde_json::{json, Map, Value};
 use crate::demo::DriveStatePayload;
 use crate::results::{PlotSeries, Results};
 use crate::serve::{
-    DeleteResponse, LiveStatus, NoteBody, NoteResponse, PinCompareManifest, PinCompareSummary,
-    RunPath, RunSummary,
+    DeleteResponse, LiveStatus, NoteBody, NoteResponse, PinCompare, RunPath, RunSummary,
 };
 use crate::strain::StrainMap;
 
@@ -298,11 +297,7 @@ pub fn document() -> Value {
     let note_request = schema_ref::<NoteBody>(&mut generator);
     let note_response = schema_ref::<NoteResponse<'static>>(&mut generator);
     let delete_response = schema_ref::<DeleteResponse<'static>>(&mut generator);
-    let pin_compare_list = json!({
-        "type": "array",
-        "items": schema_ref::<PinCompareSummary>(&mut generator),
-    });
-    let pin_compare_manifest = schema_ref::<PinCompareManifest>(&mut generator);
+    let pin_compare = schema_ref::<PinCompare>(&mut generator);
 
     let openapi_doc = free_form("This OpenAPI 3.1 document.");
     let manifest = json!({ "$ref": "#/components/schemas/Manifest" });
@@ -338,27 +333,15 @@ pub fn document() -> Value {
     );
 
     paths.insert(
-        "/api/pin-compare".into(),
+        "/api/runs/{name}/pin_compare".into(),
         json!({
             "get": {
-                "summary": "List pin-parameter comparisons, newest first.",
+                "summary": "Pin-parameter comparison curves of a pin_compare run.",
+                "parameters": [path_name_param("Run name.")],
                 "responses": {
-                    "200": ok("Comparison summaries, newest first.", pin_compare_list),
-                    "500": error_ref("ServerError"),
-                },
-            }
-        }),
-    );
-
-    paths.insert(
-        "/api/pin-compare/{name}".into(),
-        json!({
-            "get": {
-                "summary": "Full pin-parameter comparison manifest with every sweep's curves.",
-                "parameters": [path_name_param("Comparison name.")],
-                "responses": {
-                    "200": ok("The comparison manifest, verbatim.", pin_compare_manifest),
+                    "200": ok("The run's pin_compare manifest block.", pin_compare),
                     "404": error_ref("NotFound"),
+                    "500": error_ref("ServerError"),
                 },
             }
         }),

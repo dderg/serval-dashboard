@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 import pytest
 from fakes import FakeConfig, FakeKin, FakeNode, FakeReactor, FakeToolhead
@@ -226,6 +227,40 @@ def test_machinery_writes_are_suppressed_from_the_journal():
     servo_param.record_param_write("motor_a", "0x2001.0x31", 1)
     writes = servo_param.drain_param_writes()
     assert [(w["addr"], w["value"]) for w in writes] == [("0x2001.0x31", 1)]
+
+
+def test_same_second_runs_of_one_tag_get_their_own_directories(monkeypatch):
+    """The run directory stamps to the second, so two quick commands with
+    one tag used to share a directory and the second manifest clobbered the
+    first. Two commands are two runs."""
+    sc, _ = make_sc()
+    monkeypatch.setattr(time, "strftime", lambda _fmt: "20260725_101500")
+    first_dir, first_stamp = sc._run_dir("cal")
+    second_dir, second_stamp = sc._run_dir("cal")
+    assert os.path.basename(first_dir) == "cal_20260725_101500"
+    assert os.path.basename(second_dir) == "cal_20260725_101500_2"
+    # The stamp is the directory's identity, not the bare second: callers
+    # name captures and written profiles after it.
+    assert first_stamp == "20260725_101500"
+    assert second_stamp == "20260725_101500_2"
+    for run_dir, tag in ((first_dir, "a"), (second_dir, "b")):
+        with open(os.path.join(run_dir, "manifest.json"), "w") as f:
+            json.dump({"tag": tag}, f)
+    for run_dir, tag in ((first_dir, "a"), (second_dir, "b")):
+        with open(os.path.join(run_dir, "manifest.json")) as f:
+            assert json.load(f)["tag"] == tag
+
+
+def test_run_dir_refuses_to_reuse_a_directory_when_it_runs_out_of_names(
+    monkeypatch,
+):
+    sc, _ = make_sc()
+    monkeypatch.setattr(time, "strftime", lambda _fmt: "20260725_101500")
+    monkeypatch.setattr(servo_calibration.host, "RUN_DIR_COLLISION_LIMIT", 2)
+    sc._run_dir("cal")
+    sc._run_dir("cal")
+    with pytest.raises(RuntimeError, match="refusing to reuse"):
+        sc._run_dir("cal")
 
 
 def test_verdict_one_liner_names_step_and_run_dir():

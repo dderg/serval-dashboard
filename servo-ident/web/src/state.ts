@@ -62,6 +62,8 @@ const PAGE_DEFS: Record<string, PageDef> = {
       "differential",
       "ringdown",
       "compliance",
+      "pin_compare",
+      "pin_sweep",
     ],
     charts: ["psd", "time", "path", "frf", "ringdown"],
     intro:
@@ -208,7 +210,6 @@ interface AppState {
   stepFilter: Set<string> | null;
   motorFilter: Set<string> | null;
   accelAxisFilter: Set<string> | null;
-  pinCompareSelected: string | null;
   console: ConsoleState;
   drive: DrivePanelState;
   live: LiveState;
@@ -225,7 +226,6 @@ const state: AppState = {
   stepFilter: null,
   motorFilter: null,
   accelAxisFilter: null,
-  pinCompareSelected: null,
   console: {
     text: "",
     history: loadConsoleHistory(),

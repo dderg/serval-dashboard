@@ -21,6 +21,10 @@ from .dynamics import parse_dynamics_profile
 from .params import NOTCH_MODE_ADDR, NOTCH_READBACK, SYNC_LOSS_COUNT_ADDR
 from .sweep import ExperimentRun, SweepEngine, SweepStep, _OverrideGcmd
 
+# A second's worth of same-tag runs; past that the timestamp is not the
+# problem and reusing someone else's directory is not the answer.
+RUN_DIR_COLLISION_LIMIT = 512
+
 
 class CalibrationHost:
     def __init__(self, config: Any):
@@ -130,11 +134,28 @@ class CalibrationHost:
         return self.printer.lookup_object("servo_capture")
 
     def _run_dir(self, tag: str) -> tuple[str, str]:
-        stamp = time.strftime("%Y%m%d_%H%M%S")
+        """A fresh directory per invocation, and the returned stamp IS that
+        directory's identity - callers name captures and profiles after it.
+        The timestamp only resolves to the second, so two runs of one tag
+        inside the same second collide; the loser gains a counter instead of
+        reusing the directory, because two commands are two runs and never
+        one merged pile of captures. Creating the directory is what detects
+        the collision, so a concurrent writer loses the same way."""
         root = os.path.expanduser(self.captures_root)
-        run_dir = os.path.join(root, "%s_%s" % (tag, stamp))
-        os.makedirs(run_dir, exist_ok=True)
-        return run_dir, stamp
+        second = time.strftime("%Y%m%d_%H%M%S")
+        for attempt in range(1, RUN_DIR_COLLISION_LIMIT + 1):
+            stamp = second if attempt == 1 else "%s_%d" % (second, attempt)
+            run_dir = os.path.join(root, "%s_%s" % (tag, stamp))
+            try:
+                os.makedirs(run_dir)
+            except FileExistsError:
+                continue
+            return run_dir, stamp
+        raise self.printer.command_error(
+            "no free run directory for tag %r at %s under %s after %d "
+            "attempts - refusing to reuse an existing run"
+            % (tag, second, root, RUN_DIR_COLLISION_LIMIT)
+        )
 
     def _resolve_motor(self, servo: str) -> Any:
         from .. import servo_axis

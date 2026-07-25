@@ -230,6 +230,124 @@ fn missing_run_is_404_with_reason_body() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// A pin comparison is an ordinary run: the same `<captures_root>/<name>`
+/// layout every other experiment uses, with the sweep curves in a
+/// `pin_compare` manifest block.
+fn write_pin_compare_run(run_dir: &Path, tag: &str) {
+    std::fs::create_dir_all(run_dir).unwrap();
+    let manifest = serde_json::json!({
+        "version": 1,
+        "experiment": "pin_compare",
+        "command": format!("SERVO_COMPARE_PIN MODE=X PARAM=ZETA NAME={tag}"),
+        "tag": tag,
+        "axis": "X",
+        "steps": [],
+        "pin_compare": {
+            "mode": "x",
+            "param": "ZETA",
+            "freq_start": 100.0,
+            "freq_end": 104.0,
+            "baseline_profile": "/cfg/baseline.toml",
+            "sweeps": [{
+                "value": 0.02,
+                "hz_per_sec": 5.0,
+                "accel_per_hz": 75.0,
+                "amplitude_mm": 0.019,
+                "curve_hz": [100.5, 101.5],
+                "accel_mm_s2": [2.0, 3.0],
+                "response_ratio": [0.5, 0.75],
+            }],
+        },
+    });
+    std::fs::write(
+        run_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn run_summaries_carry_the_command_that_made_the_run() {
+    let (root, _run_dirs) = demo_root("command");
+    let port = spawn_server(root.clone());
+
+    let resp = request(port, "GET", "/api/runs");
+    assert_eq!(resp.status, 200);
+    let runs: Value = serde_json::from_str(&resp.body).unwrap();
+    for run in runs.as_array().unwrap() {
+        let command = run["command"].as_str().expect("command is a string");
+        assert!(
+            command.starts_with("SERVO_CALIBRATE_GAINS "),
+            "{command:?} is not the manifest's command line"
+        );
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A manifest without a `command` (anything written before the field
+/// existed) still lists — the column is simply blank.
+#[test]
+fn a_run_without_a_recorded_command_lists_with_a_null_command() {
+    let root = temp_dir("no_command");
+    write_bare_manifest(&root.join("bare_run"), "bare");
+    let port = spawn_server(root.clone());
+
+    let resp = request(port, "GET", "/api/runs");
+    assert_eq!(resp.status, 200);
+    let runs: Value = serde_json::from_str(&resp.body).unwrap();
+    assert_eq!(runs[0]["command"], Value::Null);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_pin_comparison_lists_as_an_ordinary_run_and_serves_its_curves() {
+    let root = temp_dir("pin_compare");
+    write_pin_compare_run(&root.join("cmp_20260725_101500"), "cmp");
+    let port = spawn_server(root.clone());
+
+    let listed: Value = serde_json::from_str(&request(port, "GET", "/api/runs").body).unwrap();
+    let row = &listed[0];
+    assert_eq!(row["name"], Value::from("cmp_20260725_101500"));
+    assert_eq!(row["experiment"], Value::from("pin_compare"));
+    assert_eq!(row["tag"], Value::from("cmp"));
+    assert_eq!(row["axis"], Value::from("X"));
+    assert_eq!(row["has_results"], Value::Bool(false));
+    assert_eq!(
+        row["command"],
+        Value::from("SERVO_COMPARE_PIN MODE=X PARAM=ZETA NAME=cmp")
+    );
+
+    let resp = request(port, "GET", "/api/runs/cmp_20260725_101500/pin_compare");
+    assert_eq!(resp.status, 200);
+    let block: Value = serde_json::from_str(&resp.body).unwrap();
+    assert_eq!(block["param"], Value::from("ZETA"));
+    assert_eq!(block["mode"], Value::from("x"));
+    assert_eq!(block["sweeps"].as_array().unwrap().len(), 1);
+    assert_eq!(block["sweeps"][0]["accel_per_hz"], Value::from(75.0));
+    assert_eq!(block["sweeps"][0]["response_ratio"][1], Value::from(0.75));
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn the_pin_compare_endpoint_404s_for_a_run_that_is_not_a_comparison() {
+    let root = temp_dir("pin_compare_absent");
+    write_bare_manifest(&root.join("plain_run"), "plain");
+    let port = spawn_server(root.clone());
+
+    let resp = request(port, "GET", "/api/runs/plain_run/pin_compare");
+    assert_eq!(resp.status, 404);
+    let parsed: Value = serde_json::from_str(&resp.body).expect("404 body is json");
+    assert!(parsed["error"]
+        .as_str()
+        .unwrap()
+        .contains("not a pin comparison"));
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn directory_traversal_run_name_is_rejected() {
     let (root, _run_dirs) = demo_root("traversal");

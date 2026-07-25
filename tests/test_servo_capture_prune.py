@@ -150,49 +150,6 @@ def test_lru_uses_newest_file_mtime(tmp_path):
     assert order == ["b", "a"]  # a is now "newer" than b
 
 
-# --- pin_compare last -------------------------------------------------------
-
-
-def test_pin_compare_deleted_last(tmp_path):
-    _mkrun(tmp_path, "run_new", age_hours=100, files={"a.scap": 10})
-    _mkrun(
-        tmp_path,
-        "pin_compare/very_old",
-        age_hours=500,
-        files={"manifest.json": 10},
-    )
-    runs = prune.scan_runs(tmp_path)
-    order = prune.deletion_order(runs)
-    # pin_compare is oldest but must come last
-    assert order[-1].is_pin_compare
-    assert order[0].path.name == "run_new"
-
-
-def test_budget_prunes_ordinary_before_pin_compare(tmp_path):
-    _mkrun(tmp_path, "old_run", age_hours=10, files={"a.scap": 600})
-    _mkrun(tmp_path, "new_run", age_hours=10, files={"a.scap": 600})
-    _mkrun(
-        tmp_path,
-        "pin_compare/pc",
-        age_hours=500,
-        files={"manifest.json": 600},
-    )
-    plan = prune.build_plan(
-        root=tmp_path,
-        budget_bytes=1000,  # bytes; total is 1800
-        cold_age_seconds=48 * HOUR,
-        min_keep_seconds=1 * HOUR,
-        now=time.time(),
-        dry_run=True,
-        compress_fn=_fake_compress,
-    )
-    # Need to drop 1 dir; ordinary run chosen, pin_compare untouched
-    assert not plan.refused
-    deleted = [r.path.name for r in plan.delete]
-    assert "pc" not in deleted
-    assert deleted[0] in {"old_run", "new_run"}
-
-
 # --- min-keep refusal -------------------------------------------------------
 
 

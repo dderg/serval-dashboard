@@ -92,9 +92,29 @@ def _gcmd(**kw):
     return FakeGcmd(**base)
 
 
-def _manifest(sc, name="cmp"):
-    with open(sc._compare_manifest_path(name)) as f:
+def _run_dirs(sc):
+    root = sc.captures_root
+    return sorted(
+        os.path.join(root, d)
+        for d in os.listdir(root)
+        if os.path.isdir(os.path.join(root, d))
+    )
+
+
+def _manifest(sc):
+    dirs = _run_dirs(sc)
+    assert len(dirs) == 1, dirs
+    with open(os.path.join(dirs[0], "manifest.json")) as f:
         return json.load(f)
+
+
+def _compare_at(run_dir):
+    with open(os.path.join(run_dir, "manifest.json")) as f:
+        return json.load(f)["pin_compare"]
+
+
+def _compare(sc):
+    return _manifest(sc)["pin_compare"]
 
 
 # ---- reduction / normalization math -----------------------------------
@@ -165,23 +185,33 @@ def test_chirp_reduction_empty_capture_is_empty_not_zero():
     assert sc._chirp_accel_curve([], 100.0, 104.0, 5.0, 75.0) == ([], [], [])
 
 
-# ---- manifest schema & append semantics --------------------------------
+# ---- the run and its pin_compare block ---------------------------------
 
 
 @requires_tomllib
-def test_compare_writes_manifest_per_contract():
+def test_compare_writes_an_ordinary_run():
     sc, _gcode, _node, path, _chip = _setup(amps=[2.0, 6.0])
     sc.cmd_SERVO_COMPARE_PIN(_gcmd())
     man = _manifest(sc)
-    assert man["name"] == "cmp"
-    assert man["mode"] == "x"
-    assert man["param"] == "ZETA"
-    assert man["freq_start"] == 100.0
-    assert man["freq_end"] == 104.0
-    assert man["baseline_profile"] == path
+    # Indistinguishable from any other calibration run at the top level:
+    # that is what puts it in the dashboard's runs table as one more row.
+    assert man["experiment"] == "pin_compare"
+    assert man["tag"] == "cmp"
+    assert man["axis"] == "X"
+    assert man["command"].startswith("FAKE_CMD ")
     assert isinstance(man["created_utc"], str) and man["created_utc"]
-    assert [s["value"] for s in man["sweeps"]] == [0.02, 0.05]
-    for s, amp in zip(man["sweeps"], (2.0, 6.0)):
+    assert man["steps"] == []
+    assert man["stroke_plan"]["param"] == "ZETA"
+    assert man["stroke_plan"]["freq_start"] == 100.0
+
+    cmp_block = man["pin_compare"]
+    assert cmp_block["mode"] == "x"
+    assert cmp_block["param"] == "ZETA"
+    assert cmp_block["freq_start"] == 100.0
+    assert cmp_block["freq_end"] == 104.0
+    assert cmp_block["baseline_profile"] == path
+    assert [s["value"] for s in cmp_block["sweeps"]] == [0.02, 0.05]
+    for s, amp in zip(cmp_block["sweeps"], (2.0, 6.0)):
         assert s["hz_per_sec"] == 5.0
         assert s["accel_per_hz"] == 75.0
         # wire amplitude is the displacement at freq_start
@@ -207,45 +237,45 @@ def test_compare_defaults_one_hz_per_sec_and_75_aph():
     gcmd = _gcmd(VALUES="0.02,0.05")
     del gcmd.params["HZ_PER_SEC"]
     sc.cmd_SERVO_COMPARE_PIN(gcmd)
-    man = _manifest(sc)
-    for s in man["sweeps"]:
+    for s in _compare(sc)["sweeps"]:
         assert s["hz_per_sec"] == 1.0
         assert s["accel_per_hz"] == 75.0
 
 
 @requires_tomllib
-def test_compare_reports_peak_and_manifest_location():
+def test_compare_reports_peak_and_run_dir():
     sc, _gcode, _node, _path, _chip = _setup(amps=[2.0, 6.0])
     gcmd = _gcmd()
     sc.cmd_SERVO_COMPARE_PIN(gcmd)
     report = " ".join(gcmd.responses)
     assert "peak response" in report
-    assert sc._compare_manifest_path("cmp") in report
+    assert _run_dirs(sc)[0] in report
 
 
 @requires_tomllib
-def test_compare_appends_same_name():
+def test_each_invocation_is_its_own_run():
+    """The regression: two back-to-back comparisons under one NAME merged
+    into a single NAME-keyed manifest that accumulated both sets of sweeps.
+    They are two runs now, each holding only what it measured - including
+    when both land inside the same run-directory second."""
     sc, _gcode, _node, _path, _chip = _setup(amps=[1.0, 1.0, 1.0, 1.0])
     sc.cmd_SERVO_COMPARE_PIN(_gcmd(VALUES="0.02,0.05"))
     sc.cmd_SERVO_COMPARE_PIN(_gcmd(VALUES="0.1,0.2"))
-    man = _manifest(sc)
-    assert [s["value"] for s in man["sweeps"]] == [0.02, 0.05, 0.1, 0.2]
+    dirs = _run_dirs(sc)
+    assert len(dirs) == 2, "one command, one run - never a merge"
+    assert sorted(
+        [s["value"] for s in _compare_at(d)["sweeps"]] for d in dirs
+    ) == [[0.02, 0.05], [0.1, 0.2]]
 
 
 @requires_tomllib
-def test_compare_append_param_mismatch_errors():
+def test_a_second_run_may_sweep_a_different_param_or_mode():
+    """Nothing to match against any more: separate runs, separate settings."""
     sc, _gcode, _node, _path, _chip = _setup(amps=[1.0, 1.0, 1.0, 1.0])
     sc.cmd_SERVO_COMPARE_PIN(_gcmd(PARAM="ZETA", VALUES="0.02,0.05"))
-    with pytest.raises(Exception, match="cannot append"):
-        sc.cmd_SERVO_COMPARE_PIN(_gcmd(PARAM="LEAD", VALUES="100,200"))
-
-
-@requires_tomllib
-def test_compare_append_mode_mismatch_errors():
-    sc, _gcode, _node, _path, _chip = _setup(amps=[1.0, 1.0, 1.0, 1.0])
-    sc.cmd_SERVO_COMPARE_PIN(_gcmd(MODE="X"))
-    with pytest.raises(Exception, match="cannot append"):
-        sc.cmd_SERVO_COMPARE_PIN(_gcmd(MODE="Y"))
+    sc.cmd_SERVO_COMPARE_PIN(_gcmd(PARAM="LEAD", VALUES="100,200"))
+    params = sorted(_compare_at(d)["param"] for d in _run_dirs(sc))
+    assert params == ["LEAD", "ZETA"]
 
 
 # ---- streaming, baseline restore, required params ----------------------
@@ -282,8 +312,8 @@ def test_compare_restores_baseline_on_failure_mid_sweep():
     assert engine.dynamics_calls[-1][7] == [0.05, 0.0]
     assert engine.dynamics_calls[-1][8] == 100.0
     assert node.live_dynamics_profile == path
-    # nothing persisted on a failed run
-    assert not os.path.exists(sc._compare_manifest_path("cmp"))
+    # the crashed run keeps the sweeps it did finish, and no more
+    assert [s["value"] for s in _compare(sc)["sweeps"]] == [0.02]
 
 
 @requires_tomllib

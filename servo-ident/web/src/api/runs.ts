@@ -1,5 +1,7 @@
 import { client, unwrap } from "./client";
 
+import type { components } from "./openapi.generated";
+
 export async function listRuns() {
   return unwrap(await client.GET("/api/runs"));
 }
@@ -22,6 +24,10 @@ export async function getRunPath(name: string) {
 
 export async function getRunStrain(name: string) {
   return unwrap(await client.GET("/api/runs/{name}/strain", { params: { path: { name } } }));
+}
+
+export async function getRunPinCompare(name: string) {
+  return unwrap(await client.GET("/api/runs/{name}/pin_compare", { params: { path: { name } } }));
 }
 
 export async function postRunAnalyze(name: string) {
@@ -51,5 +57,7 @@ export type PlotSeries = Awaited<ReturnType<typeof getRunPlotSeries>>;
 export type PlotStep = PlotSeries["steps"][number];
 export type RunPath = Awaited<ReturnType<typeof getRunPath>>;
 export type StrainMap = Awaited<ReturnType<typeof getRunStrain>>;
+export type PinCompare = components["schemas"]["PinCompare"];
+export type PinCompareSweep = components["schemas"]["PinCompareSweep"];
 export type NoteResponse = Awaited<ReturnType<typeof postRunNote>>;
 export type DeleteResponse = Awaited<ReturnType<typeof deleteRun>>;

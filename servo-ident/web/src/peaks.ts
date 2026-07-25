@@ -1,4 +1,4 @@
-import { ensurePlotSeries, pageRuns } from "./queries/runs";
+import { ensurePlotSeries, pageRuns, runData } from "./queries/runs";
 import { drawTimeDomain } from "./charts-core";
 import { renderFrfCharts, renderRingdownCharts } from "./dynamics";
 import { renderMetricsTable, renderSweepMetricsChart, renderPsdChart, renderAccelPsdChart, visibleStepNames, renderStepChips, renderMotorChips } from "./metrics";
@@ -18,6 +18,9 @@ async function redrawCharts() {
   const plots: PlotSeries[] = [];
   const okNames: string[] = [];
   for (const n of names) {
+    // A run with no analyzer results has no plot_series to fetch — a
+    // pin comparison charts straight off its own manifest instead.
+    if (!runData(n)?.has_results) continue;
     try {
       plots.push(await ensurePlotSeries(n));
       okNames.push(n);

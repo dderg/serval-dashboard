@@ -16,7 +16,6 @@ from typing import Any
 
 from ... import structured_log
 from .. import servo_axis, servo_strokes
-from .common import _utc_now
 from .dynamics import (
     DYNAMICS_TERM_KEYS,
     PIN_LEAD_US_MAX,
@@ -2369,8 +2368,27 @@ class DynamicsFitCommands(MeasureCommands):
             updated["pin_lead_us"] = value
         return updated
 
+    @staticmethod
+    def _pin_step_name(param: str, index: int, value: float) -> str:
+        """Capture/step name for one staircase rung.
+
+        The name is what the dashboard prints in chart legends and what the
+        capture file on disk is called, so it carries the swept value -
+        a legend reading "v0 v1 v2 v3 v4" tells a reader nothing about
+        which zeta produced which curve. The leading index stays for stable
+        ordering and to keep names unique when two rungs round to the same
+        text. '.' becomes 'p' and '-' becomes 'm' because this ends up as a
+        filename stem next to a .scap extension.
+        """
+        text = ("%g" % (value,)).replace(".", "p").replace("-", "m")
+        return "v%d_%s%s" % (index, param.lower(), text)
+
     def _pin_sweep_scores(
-        self, gcmd: Any, results: dict[str, Any], values: list[float]
+        self,
+        gcmd: Any,
+        results: dict[str, Any],
+        values: list[float],
+        param: str,
     ) -> list[tuple[float, float | None]]:
         """Read the settled pin-residual magnitude the analyzer already
         produces per step (drives[*].metrics.pin_residual_mm, the settled-
@@ -2399,7 +2417,7 @@ class DynamicsFitCommands(MeasureCommands):
         torque_ref = max(step_torque.values(), default=0)
         rows: list[tuple[float, float | None]] = []
         for i, value in enumerate(values):
-            name = "v%d" % (i,)
+            name = self._pin_step_name(param, i, value)
             step = by_name.get(name)
             residual_mm: float | None = None
             if step is not None and (
@@ -2463,31 +2481,44 @@ class DynamicsFitCommands(MeasureCommands):
 
     @staticmethod
     def _pick_pin_value(
-        scored: list[tuple[float, float | None]], param: str, zeta_tol: float
-    ) -> tuple[float, float]:
+        rows: list[tuple[float, float | None, float | None]],
+        param: str,
+        zeta_tol: float,
+    ) -> tuple[float, float | None, str]:
         """Choose the applied value from a scored staircase.
 
-        LEAD takes the plain residual minimum. ZETA does not: zeta is the
-        predictor's inverse gain (Q = 1/2zeta at f_b), so a residual
-        minimum is the point where the ROTOR tracks the dwell tone best,
-        which is not the same as the point where the coupled toolhead mode
-        is most completely cancelled. Under-driving the pin leaves both the
-        coupled and the locked-rotor resonance standing - two input-shaper
-        spikes where an unpinned machine had one - so among values that
-        score within ``zeta_tol`` of the best residual, the LOWEST zeta (the
-        most cancellation) is the honest pick. Exact ties would otherwise
-        resolve by list order."""
-        usable = [(v, r) for v, r in scored if r is not None]
+        Scores on the TOOLHEAD accelerometer whenever one was fitted, and
+        only falls back to the drive-side residual when it was not. The
+        residual is the mode-projected following error at the dwell tone:
+        it says how well the rotor holds its own commanded path, which is
+        the pin's mechanism, not its purpose. The purpose is a quiet
+        toolhead, and the two disagree in practice - on the bench the
+        residual picked LEAD=0 while the accelerometer picked LEAD=600,
+        and 600 was plainly better on the machine.
+
+        For ZETA the winner is additionally the LOWEST value scoring within
+        ``zeta_tol`` of the best, not the outright best. Zeta is the
+        predictor's inverse gain (|tau_pin| = m_L*a/2zeta at f_b, exactly
+        Q), and under-driving the pin leaves the coupled resonance standing
+        beside the new locked-rotor one - two input-shaper spikes where an
+        unpinned machine had one, which is worse than no pin at all. LEAD
+        is not a gain, so it takes the outright minimum.
+
+        Returns (value, score, metric) where metric names what decided it.
+        """
+        by_accel = [(v, a) for v, _r, a in rows if a is not None]
+        metric = "accel" if by_accel else "residual"
+        usable = by_accel or [(v, r) for v, r, _a in rows if r is not None]
         if not usable:
             raise ValueError("no scored steps")
-        best_value, best_res = min(usable, key=lambda t: t[1])
+        best_value, best_score = min(usable, key=lambda t: t[1])
         if param != "ZETA":
-            return best_value, best_res
-        ceiling = best_res * (1.0 + zeta_tol)
-        for value, res in sorted(usable):
-            if res <= ceiling:
-                return value, res
-        return best_value, best_res
+            return best_value, best_score, metric
+        ceiling = best_score * (1.0 + zeta_tol)
+        for value, score in sorted(usable):
+            if score <= ceiling:
+                return value, score, metric
+        return best_value, best_score, metric
 
     def _run_pin_staircase(
         self,
@@ -2511,6 +2542,7 @@ class DynamicsFitCommands(MeasureCommands):
         name: str,
         accel_chip: Any = None,
         zeta_tol: float = 0.15,
+        accel_name: str = "accel_chip",
     ) -> tuple[
         list[tuple[float, float | None, float | None]], float, float, str
     ]:
@@ -2595,7 +2627,7 @@ class DynamicsFitCommands(MeasureCommands):
                 toolhead.get_last_move_time()
                 updated = self._pin_sweep_model(baseline, mode_i, param, value)
                 send_dynamics_model(engine, handle, updated)
-                step_name = "v%d" % (i,)
+                step_name = self._pin_step_name(param, i, value)
                 # Tone covers this dwell only; generously oversized (it is
                 # duration-bounded and lapses harmlessly after the capture
                 # stops - the next step re-streams and starts its own).
@@ -2631,6 +2663,7 @@ class DynamicsFitCommands(MeasureCommands):
                     self._stop_capture()
                     if aclient is not None:
                         aclient.finish_measurements()
+                accel_csv: str | None = None
                 if aclient is None:
                     accels.append(None)
                 else:
@@ -2640,6 +2673,18 @@ class DynamicsFitCommands(MeasureCommands):
                         else []
                     )
                     accels.append(self._pin_accel_amplitude(samples, freq))
+                    # Keep the samples, not just the scalar at the tone. The
+                    # analyzer turns this CSV into the per-step accel PSD the
+                    # dashboard already renders beside the following-error
+                    # PSD, which is how a reader sees whether the pin
+                    # collapsed the coupled spike or merely added a second
+                    # one - something a single amplitude cannot show.
+                    if samples:
+                        accel_csv = os.path.basename(
+                            self._write_accel_csv(
+                                gcmd, aclient, accel_name, step_name
+                            )
+                        )
                 run.record_step(
                     SweepStep(
                         step_name,
@@ -2649,6 +2694,7 @@ class DynamicsFitCommands(MeasureCommands):
                             "t_end_s": round(reactor.monotonic(), 3),
                         },
                         [],
+                        accel=accel_csv,
                     )
                 )
             results = self._run_analyze(gcmd, run)
@@ -2659,31 +2705,40 @@ class DynamicsFitCommands(MeasureCommands):
                 node.set_live_dynamics_profile(profile_path)
             finally:
                 self._active_run = None
-        scored = self._pin_sweep_scores(gcmd, results, values)
+        scored = self._pin_sweep_scores(gcmd, results, values, param)
         rows = [(v, r, a) for (v, r), a in zip(scored, accels)]
-        best_value, best_res = self._pick_pin_value(scored, param, zeta_tol)
+        best_value, best_score, metric = self._pick_pin_value(
+            rows, param, zeta_tol
+        )
         if param == "ZETA" and best_value == min(values):
             gcmd.respond_info(
                 "pin sweep (mode %s): ZETA settled on the ladder floor %g - "
                 "the useful value may be lower still; re-run with a lower "
                 "ZETA_COARSE floor to find out" % (mode, best_value)
             )
-        accel_scored = [(v, a) for v, _r, a in rows if a is not None]
-        if accel_scored:
-            best_accel_value, best_accel = min(accel_scored, key=lambda t: t[1])
+        residual_scored = [(v, r) for v, r, _a in rows if r is not None]
+        if metric == "accel" and residual_scored:
+            res_value, _res = min(residual_scored, key=lambda t: t[1])
             note = ""
-            if best_accel_value != best_value:
+            if res_value != best_value:
                 note = (
-                    " | NOTE: accel minimum (%s=%g) disagrees with the "
-                    "residual verdict (%s=%g); residual still picks the "
-                    "applied value"
-                    % (param, best_accel_value, param, best_value)
+                    " | the drive-side residual would have picked %s=%g "
+                    "instead; it scores how well the rotor holds its own "
+                    "path, not how quiet the toolhead is" % (param, res_value)
                 )
             gcmd.respond_info(
-                "pin sweep accel (mode %s): accel minimum at %s=%g "
-                "(%.1f mm/s^2)%s"
-                % (mode, param, best_accel_value, best_accel, note)
+                "pin sweep (mode %s): %s=%g picked on toolhead accel "
+                "(%.1f mm/s^2)%s" % (mode, param, best_value, best_score, note)
             )
+        elif metric == "residual":
+            gcmd.respond_info(
+                "pin sweep (mode %s): %s=%g picked on the drive-side "
+                "residual (%.2f um) - no accel_chip, so the toolhead was "
+                "never measured" % (mode, param, best_value, best_score * 1e3)
+            )
+        best_res = next(
+            (r for v, r, _a in rows if v == best_value and r is not None), None
+        )
         return rows, best_value, best_res, run.run_dir
 
     def cmd_SERVO_SWEEP_PIN(self, gcmd: Any) -> None:
@@ -2735,7 +2790,7 @@ class DynamicsFitCommands(MeasureCommands):
                 "ethercat_node %s has no engine handle" % (node.name,)
             )
         engine = self.printer.lookup_object("motion_engine")
-        accel_chip, _accel_name = self._accel_chip(gcmd)
+        accel_chip, accel_name = self._accel_chip(gcmd)
         profile_path, baseline = self._load_baseline_dynamics(gcmd, node)
         if mode not in baseline["modes"]:
             raise gcmd.error(
@@ -2782,6 +2837,7 @@ class DynamicsFitCommands(MeasureCommands):
             name,
             accel_chip,
             gcmd.get_float("ZETA_TOL", 0.15, minval=0.0),
+            accel_name,
         )
         accel_on = any(a is not None for _v, _r, a in rows)
 
@@ -2867,10 +2923,12 @@ class DynamicsFitCommands(MeasureCommands):
         "(commanded accel = ACCEL_PER_HZ * f; the endpoint holds the "
         "velocity amplitude constant so displacement shrinks as 1/f), and "
         "response_ratio divides each bin by that commanded accel - 1.0 = "
-        "perfect tracking. A comparison manifest is written "
-        "under <captures_root>/pin_compare/<NAME>/manifest.json (same NAME "
-        "appends sweeps; mode/param must match on append) for the dashboard "
-        "to overlay. Measurement only: the pre-sweep model is restored at "
+        "perfect tracking. Every invocation is its own run, exactly like "
+        "every other calibration command: the sweeps land in the "
+        "pin_compare block of <captures_root>/<NAME>_<stamp>/manifest.json "
+        "for the dashboard to overlay, and re-using NAME makes a second, "
+        "separate run - sweeps are never merged across invocations. "
+        "Measurement only: the pre-sweep model is restored at "
         "the end (also on failure). Params MODE=X|Y PARAM=ZETA|LEAD "
         "VALUES (comma list) FREQ_START FREQ_END (Hz, required) HZ_PER_SEC "
         "(1.0) ACCEL_PER_HZ (mm/s^2 per Hz, 75) RAMP DWELL (s "
@@ -2933,57 +2991,6 @@ class DynamicsFitCommands(MeasureCommands):
             response_ratio.append(a / denom if denom > 0.0 else 0.0)
         return curve_hz, accel_mm_s2, response_ratio
 
-    def _compare_manifest_path(self, name: str) -> str:
-        root = os.path.expanduser(self.captures_root)
-        return os.path.join(root, "pin_compare", name, "manifest.json")
-
-    def _append_compare_manifest(
-        self,
-        gcmd: Any,
-        path: str,
-        name: str,
-        mode: str,
-        param: str,
-        freq_start: float,
-        freq_end: float,
-        baseline_profile: str | None,
-        new_sweeps: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Write (or append to) the pin-compare manifest per contract. A
-        same-NAME manifest appends its sweeps; a mode/param mismatch on
-        append is an error (the overlay would compare unlike runs)."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if os.path.exists(path):
-            with open(path) as f:
-                manifest = json.load(f)
-            if manifest.get("mode") != mode or manifest.get("param") != param:
-                raise gcmd.error(
-                    "pin-compare manifest %s already holds mode=%s param=%s "
-                    "- cannot append mode=%s param=%s (use a new NAME)"
-                    % (
-                        path,
-                        manifest.get("mode"),
-                        manifest.get("param"),
-                        mode,
-                        param,
-                    )
-                )
-            manifest["sweeps"].extend(new_sweeps)
-        else:
-            manifest = {
-                "name": name,
-                "created_utc": _utc_now(),
-                "mode": mode,
-                "param": param,
-                "freq_start": freq_start,
-                "freq_end": freq_end,
-                "baseline_profile": baseline_profile,
-                "sweeps": list(new_sweeps),
-            }
-        with open(path, "w") as f:
-            json.dump(manifest, f)
-        return manifest
-
     def _run_compare_sweep(
         self,
         gcmd: Any,
@@ -3007,12 +3014,14 @@ class DynamicsFitCommands(MeasureCommands):
         ramp: float,
         dwell_s: float,
         accel_chip: Any,
-    ) -> list[dict[str, Any]]:
+        run: ExperimentRun,
+    ) -> None:
         """One chirp per value: re-stream the model, buzz FREQ_START->
         FREQ_END in the mode's frame pattern, capture the accelerometer over
         the sweep, and reduce to curves. Restores the passed baseline model
         at the end (also on failure), matching the staircase discipline.
-        Returns the list of per-value sweep dicts (contract shape)."""
+        Each reduced sweep is appended to the run's pin_compare block and
+        the manifest rewritten, so a crash keeps whatever was measured."""
         row = spatial["frame"][spatial["modes"].index(mode)]
         slot_mask = 0
         sign_mask = 0
@@ -3052,7 +3061,7 @@ class DynamicsFitCommands(MeasureCommands):
         self._prep("X", 0)
         self._prep("Y", 0)
         toolhead = self.printer.lookup_object("toolhead")
-        sweeps: list[dict[str, Any]] = []
+        sweeps = run.manifest["pin_compare"]["sweeps"]
         try:
             for i, value in enumerate(values):
                 # Keep idle_timeout from parking the servos mid-comparison
@@ -3094,6 +3103,7 @@ class DynamicsFitCommands(MeasureCommands):
                         "response_ratio": ratio,
                     }
                 )
+                run.write()
                 if ratio:
                     pk = max(range(len(ratio)), key=lambda k: ratio[k])
                     gcmd.respond_info(
@@ -3112,7 +3122,6 @@ class DynamicsFitCommands(MeasureCommands):
             # Restore the pre-sweep model (also on failure).
             send_dynamics_model(engine, handle, baseline)
             node.set_live_dynamics_profile(profile_path)
-        return sweeps
 
     def cmd_SERVO_COMPARE_PIN(self, gcmd: Any) -> None:
         if tomllib is None:
@@ -3213,64 +3222,73 @@ class DynamicsFitCommands(MeasureCommands):
             invert_for[servo] = bool(
                 getattr(self._resolve_motor(servo), "invert_direction", False)
             )
-        sweeps = self._run_compare_sweep(
-            gcmd,
-            node,
-            handle,
-            engine,
-            servos,
-            slot_for,
-            invert_for,
-            spatial,
-            baseline,
-            profile_path,
-            mode,
-            mode_i,
-            param,
-            values,
-            freq_start,
-            freq_end,
-            hz_per_sec,
-            accel_per_hz,
-            ramp,
-            dwell_s,
-            accel_chip,
+        stroke_plan = {
+            "mode": mode,
+            "param": param,
+            "values": values,
+            "freq_start": freq_start,
+            "freq_end": freq_end,
+            "hz_per_sec": hz_per_sec,
+            "accel_per_hz": accel_per_hz,
+            "amplitude": start_amplitude,
+            "duration": duration,
+            "ramp": ramp,
+            "dwell_s": dwell_s,
+        }
+        run = self._begin_run(
+            gcmd, "pin_compare", name, mode.upper(), servos, stroke_plan
         )
-        path = self._compare_manifest_path(name)
-        manifest = self._append_compare_manifest(
-            gcmd,
-            path,
-            name,
-            mode,
-            param,
-            freq_start,
-            freq_end,
-            profile_path,
-            sweeps,
-        )
+        run.manifest["pin_compare"] = {
+            "mode": mode,
+            "param": param,
+            "freq_start": freq_start,
+            "freq_end": freq_end,
+            "baseline_profile": profile_path,
+            "sweeps": [],
+        }
+        run.write()
+        try:
+            self._run_compare_sweep(
+                gcmd,
+                node,
+                handle,
+                engine,
+                servos,
+                slot_for,
+                invert_for,
+                spatial,
+                baseline,
+                profile_path,
+                mode,
+                mode_i,
+                param,
+                values,
+                freq_start,
+                freq_end,
+                hz_per_sec,
+                accel_per_hz,
+                ramp,
+                dwell_s,
+                accel_chip,
+                run,
+            )
+        finally:
+            self._active_run = None
+        sweeps = run.manifest["pin_compare"]["sweeps"]
         structured_log.event(
             "calibration",
             "pin_compare",
-            compare_name=name,
+            run_dir=run.run_dir,
             mode=mode,
             param=param,
             values=values,
             freq_start=freq_start,
             freq_end=freq_end,
-            n_sweeps=len(manifest["sweeps"]),
-            manifest=path,
+            n_sweeps=len(sweeps),
         )
         gcmd.respond_info(
-            "pin compare %s (mode %s, %s): %d sweep(s) this run, %d total "
-            "in manifest %s"
-            % (
-                name,
-                mode,
-                param,
-                len(sweeps),
-                len(manifest["sweeps"]),
-                path,
-            )
+            "pin compare %s (mode %s, %s): %d sweep(s) in run %s"
+            % (name, mode, param, len(sweeps), run.run_dir)
         )
 
     cmd_SERVO_TUNE_PIN_help = (
@@ -3353,7 +3371,7 @@ class DynamicsFitCommands(MeasureCommands):
                 "ethercat_node %s has no engine handle" % (node.name,)
             )
         engine = self.printer.lookup_object("motion_engine")
-        accel_chip, _accel_name = self._accel_chip(gcmd)
+        accel_chip, accel_name = self._accel_chip(gcmd)
         profile_path, baseline = self._load_baseline_dynamics(gcmd, node)
         missing = [m for m in modes if m not in baseline["modes"]]
         if missing:
@@ -3472,6 +3490,7 @@ class DynamicsFitCommands(MeasureCommands):
                     name,
                     accel_chip,
                     zeta_tol,
+                    accel_name,
                 )
                 working["pin_zeta"][mode_i] = coarse_win
                 fine_lo = coarse_win / 1.6
@@ -3500,6 +3519,7 @@ class DynamicsFitCommands(MeasureCommands):
                     name,
                     accel_chip,
                     zeta_tol,
+                    accel_name,
                 )
                 working["pin_zeta"][mode_i] = fine_win
                 summary[mode] = {
@@ -3534,6 +3554,8 @@ class DynamicsFitCommands(MeasureCommands):
                 amplitude,
                 name,
                 accel_chip,
+                zeta_tol,
+                accel_name,
             )
             working["pin_lead_us"] = lead_win
             out_path = self._write_dynamics_toml(

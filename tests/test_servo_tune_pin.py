@@ -314,10 +314,11 @@ def test_tune_pin_scores_accel_on_every_ladder_stage():
     )
     sc.cmd_SERVO_TUNE_PIN(gcmd)
     report = " ".join(gcmd.responses)
-    # one accel-minimum line per staircase stage (coarse, fine, lead)
-    assert report.count("pin sweep accel (mode x)") == 3
-    assert "accel minimum at ZETA=" in report
-    assert "accel minimum at LEAD=" in report
+    # every staircase stage (coarse zeta, fine zeta, lead) is decided on
+    # the toolhead, not the drive-side residual
+    assert report.count("picked on toolhead accel") == 3
+    assert "picked ZETA=" in report
+    assert "picked LEAD=" in report
     # a client was started for every scored step across all stages
     chip = sc.printer.lookup_object("adxl345 tool")
     assert len(chip.clients) == n_steps

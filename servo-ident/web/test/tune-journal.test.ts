@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { registerDom, installFetchStub, installDomHarness, indexHtmlBody, nextFrame, settleDom, RUN_NAME } from "./dom";
+import { registerDom, installFetchStub, installDomHarness, indexHtmlBody, nextFrame, settleDom, settleUntilStable, RUN_NAME } from "./dom";
 import type * as ApiMod from "../src/api";
 import type * as ClientMod from "../src/queries/client";
 import type * as RunsQueryMod from "../src/queries/runs";
@@ -89,14 +89,22 @@ beforeAll(async () => {
   await driveQ.fetchDriveState();
   await loadRuns();
   render(html`<${client.QueryRoot}><${runs.TunePage} /><//>`, pageRoot());
-  await settle();
-  await settle();
+  // The chart assertions below snapshot the chart DOM, so they need uPlot
+  // fully constructed — not merely a couple of settle rounds spent, and not
+  // merely the first canvas to appear.
+  await settleUntilStable(
+    () => document.querySelectorAll("canvas").length,
+    "tune page charts mounted",
+  );
 });
 
 afterAll(() => {
   render(null as unknown as VNode, pageRoot());
   cleanup();
   globalThis.fetch = baseFetch;
+  // The observer is a module global; leaving it subscribed means the next
+  // file's startRunsPolling early-returns onto ours and never polls.
+  runs.stopRunsPolling();
 });
 
 test("tune page renders the full body with the expected controls, ids and classes", () => {

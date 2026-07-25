@@ -210,6 +210,13 @@ td.diff {
   color: var(--warn);
 }
 td.diff.empty { color: #4d5761; }
+td.run-command {
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dim);
+}
+td.run-command.empty { color: #4d5761; }
 td.actions button { padding: 1px 7px; font-size: 11px; }
 .runs-wrap td, .journal-wrap td { overflow: hidden; text-overflow: ellipsis; }
 .col-resizer {

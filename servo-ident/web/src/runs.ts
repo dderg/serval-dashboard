@@ -24,17 +24,21 @@ import {
 } from "./metrics";
 import { FrfSection, RingdownSection } from "./dynamics";
 import { SectionHead, TimeDomainSection, PathSection } from "./charts-core";
-import { PinCompareSection } from "./pin-compare";
-import { listPinCompares } from "./api/pin-compare";
-import type { PinCompareSummary } from "./api/pin-compare";
+import { PinCompareSection, PIN_COMPARE_EXPERIMENT } from "./pin-compare";
 import { applyAccordionState, bindAnalysisControls, currentPageDef } from "./shell";
 import { PALETTE, INITIAL_SELECTED_RUNS, state } from "./state";
 import { notify, useStore } from "./store";
 import type { PageDef } from "./state";
 import type { RunSummary } from "./api/runs";
 
+/// A run is worth selecting when it has something to chart: analyzer
+/// results, or — for a comparison — the curves its own manifest carries.
+function chartable(run: RunSummary): boolean {
+  return run.has_results || run.experiment === PIN_COMPARE_EXPERIMENT;
+}
+
 function toggleRunSelection(run: RunSummary, ev: MouseEvent) {
-  if (!run.has_results) return;
+  if (!chartable(run)) return;
   if (ev.shiftKey) {
     if (state.selected.has(run.name)) {
       state.selected.delete(run.name);
@@ -78,7 +82,7 @@ function DotCell({ run }: { run: RunSummary }) {
     ? html`<span class="swatch" style=${{ background: runColor(run.name) }}></span>`
     : null;
   const pinned = state.pinned.has(run.name);
-  const pin = run.has_results
+  const pin = chartable(run)
     ? html`<button
         class=${pinned ? "pin-toggle pinned" : "pin-toggle"}
         title=${pinned
@@ -214,9 +218,9 @@ function ContextMenu() {
       ${label}
     </button>`;
   return html`<div class="context-menu" style=${style} ref=${ref}>
-    ${run.has_results ? item(pinned ? "unpin" : "pin", () => togglePin(run)) : null}
+    ${chartable(run) ? item(pinned ? "unpin" : "pin", () => togglePin(run)) : null}
     ${item("→ console", () => loadRerunForm(run.name), { disabled: !detail?.manifest })}
-    ${!run.has_results ? item("analyze", () => analyze.mutate(run.name)) : null}
+    ${chartable(run) ? null : item("analyze", () => analyze.mutate(run.name))}
     ${item("delete", () => del.mutate(run.name), { danger: true })}
   </div>`;
 }
@@ -235,7 +239,7 @@ function RunRow({ run, def }: { run: RunSummary; def: PageDef }) {
   const diff = manifest ? ambientDiff(prevManifest, manifest) : "";
   const cls = [
     state.selected.has(run.name) ? "selected" : "",
-    run.has_results ? "selectable" : "",
+    chartable(run) ? "selectable" : "",
   ]
     .filter(Boolean)
     .join("");
@@ -254,6 +258,9 @@ function RunRow({ run, def }: { run: RunSummary; def: PageDef }) {
         ? `${run.experiment}/${run.tag}${run.axis ? " " + run.axis : ""}`
         : `${run.tag}${run.axis ? " " + run.axis : ""}`}
     </td>
+    <td class=${run.command ? "run-command" : "run-command empty"} title=${run.command || null}>
+      ${run.command || "—"}
+    </td>
     <td class=${diff ? "diff" : "diff empty"} title=${diff || null}>${diff || "—"}</td>
     <${NoteCell} run=${run} />
     <td class="actions">
@@ -267,7 +274,7 @@ function RunRow({ run, def }: { run: RunSummary; def: PageDef }) {
       >
         → console
       </button>
-      ${run.has_results
+      ${chartable(run)
         ? null
         : html`<button
             onClick=${(e: MouseEvent) => {
@@ -281,60 +288,16 @@ function RunRow({ run, def }: { run: RunSummary; def: PageDef }) {
   </tr>`;
 }
 
-/// A pin-compare manifest shown as one row among the runs: click selects it
-/// (single-select) and the pin-compare section below charts exactly that
-/// comparison; click again deselects and the section disappears.
-function PinCompareRow({ entry }: { entry: PinCompareSummary }) {
-  const selected = state.pinCompareSelected === entry.name;
-  return html`<tr
-    class=${selected ? "selected selectable" : "selectable"}
-    onClick=${() => {
-      state.pinCompareSelected = selected ? null : entry.name;
-      notify();
-    }}
-  >
-    <td></td>
-    <td title=${`${entry.name} — ${entry.created_utc}`}>${shortTime(entry.created_utc)}</td>
-    <td title=${`pin compare ${entry.name}`}>
-      pin_compare/${entry.name} ${entry.mode} (${entry.param}, ${entry.n_sweeps} sweeps)
-    </td>
-    <td class="diff empty">—</td>
-    <td class="run-note empty"></td>
-    <td class="actions"></td>
-  </tr>`;
-}
-
-function RunsTable({ withPinCompares }: { withPinCompares: boolean }) {
+function RunsTable() {
   useStore();
   const def = currentPageDef();
-  const compares = useQuery({
-    queryKey: ["pin-compare"],
-    queryFn: listPinCompares,
-    notifyOnChangeProps: ["data"],
-    enabled: withPinCompares,
-  });
   const runs = def.journal ? runsData() : pageRuns(def);
-  const rows: { time: string; row: unknown }[] = runs.map((run) => ({
-    time: run.mtime_utc,
-    row: html`<${RunRow} key=${run.name} run=${run} def=${def} />`,
-  }));
-  if (withPinCompares) {
-    for (const entry of compares.data ?? []) {
-      rows.push({
-        time: entry.created_utc,
-        row: html`<${PinCompareRow} key=${`pc:${entry.name}`} entry=${entry} />`,
-      });
-    }
-  }
-  rows.sort((a, b) => (a.time < b.time ? 1 : a.time > b.time ? -1 : 0));
-  return rows.map((r) => r.row);
+  return runs.map((run) => html`<${RunRow} key=${run.name} run=${run} def=${def} />`);
 }
 
-/// Only the tune page renders PinCompareSection, so only it merges the
-/// comparison rows a click there selects.
-function RunsBody({ withPinCompares = false }: { withPinCompares?: boolean }) {
+function RunsBody() {
   useQuery({ ...runsQuery(), notifyOnChangeProps: ["data"] });
-  return html`<${RunsTable} withPinCompares=${withPinCompares} />`;
+  return html`<${RunsTable} />`;
 }
 
 function usePageBootstrap(withCharts: boolean) {
@@ -361,11 +324,11 @@ function TunePage() {
             <table>
               <thead>
                 <tr>
-                  <th></th><th>time</th><th>tag</th>
+                  <th></th><th>time</th><th>tag</th><th>command</th>
                   <th>ambient diff vs previous</th><th>note</th><th></th>
                 </tr>
               </thead>
-              <tbody id="journal-body"><${RunsBody} withPinCompares=${true} /></tbody>
+              <tbody id="journal-body"><${RunsBody} /></tbody>
             </table>
           </div>
         </section>
@@ -401,7 +364,7 @@ function JournalPage() {
             <table>
               <thead>
                 <tr>
-                  <th></th><th>time</th><th>experiment/tag</th>
+                  <th></th><th>time</th><th>experiment/tag</th><th>command</th>
                   <th>ambient diff vs previous</th><th>note</th><th></th>
                 </tr>
               </thead>
@@ -467,4 +430,4 @@ function autoSelectInitialRuns() {
 }
 
 export { selectedRunNames, runColor, TunePage, JournalPage };
-export { startRunsPolling } from "./queries/runs";
+export { startRunsPolling, stopRunsPolling } from "./queries/runs";

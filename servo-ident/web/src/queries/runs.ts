@@ -7,6 +7,7 @@ import {
   getRunManifest,
   getRunResults,
   getRunPlotSeries,
+  getRunPinCompare,
   postRunNote,
   postRunAnalyze,
   deleteRun as apiDeleteRun,
@@ -20,6 +21,7 @@ export const runKeys = {
   run: (name: string) => ["runs", name] as const,
   detail: (name: string) => ["runs", name, "detail"] as const,
   plot: (name: string) => ["runs", name, "plot"] as const,
+  pinCompare: (name: string) => ["runs", name, "pin_compare"] as const,
 };
 
 export interface RunDetail {
@@ -103,6 +105,7 @@ function runsUnchanged(prev: RunSummary[], next: RunSummary[]): boolean {
         run.experiment === current.experiment &&
         run.tag === current.tag &&
         run.axis === current.axis &&
+        run.command === current.command &&
         run.has_results === current.has_results &&
         verdictsMatch &&
         run.note === current.note
@@ -129,7 +132,12 @@ export function runsQuery() {
   return { queryKey: runKeys.all, queryFn: fetchRuns };
 }
 
+export function runPinCompareQuery(name: string) {
+  return { queryKey: runKeys.pinCompare(name), queryFn: () => getRunPinCompare(name) };
+}
+
 let runsObserver: QueryObserver<RunSummary[]> | null = null;
+let unsubscribeRuns: (() => void) | null = null;
 
 export function startRunsPolling(onData?: (runs: RunSummary[]) => void) {
   if (runsObserver) return;
@@ -139,12 +147,25 @@ export function startRunsPolling(onData?: (runs: RunSummary[]) => void) {
     refetchIntervalInBackground: false,
   });
   let lastData: RunSummary[] | undefined;
-  runsObserver.subscribe((result) => {
+  unsubscribeRuns = runsObserver.subscribe((result) => {
     if (onData && result.isSuccess && result.data && result.data !== lastData) {
       lastData = result.data;
       onData(result.data);
     }
   });
+}
+
+/// Drop the polling observer so the next `startRunsPolling` builds a fresh
+/// one. Without this the observer is a process-global with no way out: after
+/// anything detaches it from the cache (`queryClient.clear()`), the guard in
+/// `startRunsPolling` still sees it and early-returns, so the next caller
+/// silently gets no polling at all — its runs query never resolves and the
+/// page never reconciles. The app itself starts polling once and never stops,
+/// but a test process runs many pages through one module instance.
+export function stopRunsPolling() {
+  unsubscribeRuns?.();
+  unsubscribeRuns = null;
+  runsObserver = null;
 }
 
 export function useSaveNote() {

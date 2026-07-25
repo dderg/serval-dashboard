@@ -292,7 +292,9 @@ def test_pin_sweep_manifest_records_steps():
         manifest = json.load(f)
     assert manifest["experiment"] == "pin_sweep"
     steps = manifest["steps"]
-    assert [s["name"] for s in steps] == ["v0", "v1"]
+    # Step names carry the swept value: the dashboard prints them as chart
+    # legends, where "v0 v1" identified nothing.
+    assert [s["name"] for s in steps] == ["v0_zeta0p02", "v1_zeta0p04"]
     assert [s["swept"]["value"] for s in steps] == [0.02, 0.04]
     for s in steps:
         assert s["swept"]["t_end_s"] >= s["swept"]["t_start_s"]
@@ -353,12 +355,12 @@ def test_pin_sweep_scores_gate_unexcited_steps():
 
     results = {
         "steps": [
-            step("v0", 0.005, 400),
-            step("v1", 0.002, 380),
-            step("v2", 0.00001, 12),  # unexcited: 3% of the run's torque
+            step("v0_zeta0p02", 0.005, 400),
+            step("v1_zeta0p05", 0.002, 380),
+            step("v2_zeta0p1", 0.00001, 12),  # unexcited: 3% of run torque
         ]
     }
-    rows = sc._pin_sweep_scores(gcmd, results, [0.02, 0.05, 0.1])
+    rows = sc._pin_sweep_scores(gcmd, results, [0.02, 0.05, 0.1], "ZETA")
     assert rows[0][1] == 0.005
     assert rows[1][1] == 0.002
     assert rows[2][1] is None, "unexcited step must not score"
@@ -401,17 +403,19 @@ def test_pin_sweep_reports_accel_column_and_minimum():
     # per-step accel values flow into the table (mm/s^2 at the tone)
     assert "3.0 mm/s^2" in report
     assert "1.0 mm/s^2" in report
-    # residual verdict unchanged, plus an accel-minimum line that agrees
-    assert "minimum at ZETA=0.06" in report
-    assert "accel minimum at ZETA=0.06" in report
-    assert "1.0 mm/s^2" in report
-    assert "disagrees" not in report
+    # both metrics land on the same rung, so there is nothing to arbitrate
+    assert "picked ZETA=0.06" in report
+    assert "picked on toolhead accel" in report
+    assert "would have picked" not in report
 
 
 @requires_tomllib
-def test_pin_sweep_accel_disagreement_is_flagged():
+def test_pin_sweep_applies_the_accel_winner_over_the_residual():
     # residual minimum at ZETA=0.06 (idx 2) but accel minimum at ZETA=0.02
-    # (idx 0): the disagreement is stated and the residual still applies.
+    # (idx 0). The toolhead wins: the residual scores how well the rotor
+    # holds its own path, which is the pin's mechanism, not its purpose.
+    # On the bench the residual picked LEAD=0 while the accelerometer
+    # picked LEAD=600, and 600 was plainly the better machine.
     sc, _gcode, node, path = _setup(
         residuals=[5.0e-3, 2.0e-3, 1.0e-3, 3.0e-3],
         accel_amps=[1.0, 3.0, 4.0, 5.0],
@@ -427,11 +431,11 @@ def test_pin_sweep_accel_disagreement_is_flagged():
     )
     sc.cmd_SERVO_SWEEP_PIN(gcmd)
     report = " ".join(gcmd.responses)
-    assert "accel minimum at ZETA=0.02" in report
-    assert "disagrees" in report
-    assert "residual still picks" in report
-    # the applied value is still the residual winner (X_ZETA=0.06)
-    assert "X_ZETA=0.06" in report
+    assert "picked ZETA=0.02" in report
+    assert "picked on toolhead accel" in report
+    # the residual's dissent is reported, not silently dropped
+    assert "would have picked ZETA=0.06" in report
+    assert "X_ZETA=0.02" in report
 
 
 @requires_tomllib
@@ -456,3 +460,55 @@ def test_pin_sweep_accel_empty_capture_reports_na():
     assert "/ n/a" in report
     assert "3.0 mm/s^2" in report
     assert "2.0 mm/s^2" in report
+
+
+@requires_tomllib
+def test_pin_sweep_writes_per_step_accel_csv_for_the_psd():
+    # The scalar amplitude at the tone cannot show whether the pin
+    # collapsed the coupled spike or merely added a second one - that needs
+    # the spectrum. Keeping the samples is what makes analyze.rs emit
+    # step.psd.accel, which the dashboard already renders beside the
+    # following-error PSD.
+    sc, _gcode, _node, _path = _setup(
+        residuals=[2.0e-3, 1.0e-3],
+        accel_amps=[3.0, 1.0],
+        accel_freq=130.0,
+    )
+    gcmd = FakeGcmd(
+        MODE="X",
+        FREQ="130",
+        PARAM="ZETA",
+        VALUES="0.02,0.04",
+        DWELL="1",
+        ACCEL_CHIP="adxl345 tool",
+    )
+    sc.cmd_SERVO_SWEEP_PIN(gcmd)
+    cap = sc.printer.lookup_object("servo_capture")
+    run_dir = os.path.dirname(cap.starts[0][0])
+    with open(os.path.join(run_dir, "manifest.json")) as f:
+        steps = json.load(f)["steps"]
+    assert [s["accel"] for s in steps] == [
+        "step_v0_zeta0p02_accel.csv",
+        "step_v1_zeta0p04_accel.csv",
+    ]
+    for step in steps:
+        path = os.path.join(run_dir, step["accel"])
+        with open(path) as f:
+            head, first = f.readline().strip(), f.readline().strip()
+        # the exact shape analyze.rs:read_accel_csv parses
+        assert head == "#time,accel_x,accel_y,accel_z"
+        assert len(first.split(",")) == 4
+
+
+@requires_tomllib
+def test_pin_sweep_without_an_accel_chip_records_no_accel_file():
+    # No accelerometer means no spectrum to keep - the step must say so
+    # rather than naming a file that was never written.
+    sc, _gcode, _node, _path = _setup(residuals=[2.0e-3, 1.0e-3])
+    gcmd = FakeGcmd(MODE="X", FREQ="130", VALUES="0.02,0.04", DWELL="1")
+    sc.cmd_SERVO_SWEEP_PIN(gcmd)
+    cap = sc.printer.lookup_object("servo_capture")
+    run_dir = os.path.dirname(cap.starts[0][0])
+    with open(os.path.join(run_dir, "manifest.json")) as f:
+        steps = json.load(f)["steps"]
+    assert [s["accel"] for s in steps] == [None, None]

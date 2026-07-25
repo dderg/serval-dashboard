@@ -8,8 +8,7 @@ Policy (in order):
    analysis artifacts (manifest.json, results.json, ...) stay readable so the
    dashboard keeps working for compressed runs.
 2. Budget: while the captures root exceeds BUDGET_BYTES, delete the oldest
-   whole run dir (ordered by newest-file mtime), oldest first. ``pin_compare``
-   dirs are last-resort and only touched after ordinary runs are exhausted.
+   whole run dir (ordered by newest-file mtime), oldest first.
    Nothing newer than MIN_KEEP_AGE is ever deleted; if the budget cannot be met
    without touching those, the pass refuses (deletes nothing) and exits nonzero
    with a loud message.
@@ -32,7 +31,6 @@ from pathlib import Path
 DEFAULT_BUDGET_GIB = 8.0
 DEFAULT_COLD_AGE_HOURS = 48.0
 DEFAULT_MIN_KEEP_HOURS = 24.0
-PIN_COMPARE_DIRNAME = "pin_compare"
 
 
 class PruneError(RuntimeError):
@@ -42,7 +40,6 @@ class PruneError(RuntimeError):
 @dataclass
 class RunDir:
     path: Path
-    is_pin_compare: bool
     newest_mtime: float
     size_bytes: int
 
@@ -102,35 +99,16 @@ def newest_mtime(path: Path) -> float:
 
 
 def scan_runs(root: Path) -> list[RunDir]:
-    """Enumerate ordinary run dirs and pin_compare run dirs under ``root``."""
-    runs: list[RunDir] = []
-    pin_compare_root = root / PIN_COMPARE_DIRNAME
-    for child in sorted(root.iterdir()):
-        if not child.is_dir():
-            continue
-        if child == pin_compare_root:
-            continue
-        runs.append(
-            RunDir(
-                path=child,
-                is_pin_compare=False,
-                newest_mtime=newest_mtime(child),
-                size_bytes=dir_size(child),
-            )
+    """Enumerate the run dirs under ``root``."""
+    return [
+        RunDir(
+            path=child,
+            newest_mtime=newest_mtime(child),
+            size_bytes=dir_size(child),
         )
-    if pin_compare_root.is_dir():
-        for child in sorted(pin_compare_root.iterdir()):
-            if not child.is_dir():
-                continue
-            runs.append(
-                RunDir(
-                    path=child,
-                    is_pin_compare=True,
-                    newest_mtime=newest_mtime(child),
-                    size_bytes=dir_size(child),
-                )
-            )
-    return runs
+        for child in sorted(root.iterdir())
+        if child.is_dir()
+    ]
 
 
 def select_cold_runs(
@@ -150,16 +128,8 @@ def scap_payloads(run_dir: Path) -> list[Path]:
 
 
 def deletion_order(runs: list[RunDir]) -> list[RunDir]:
-    """Oldest-first by newest-file mtime; ordinary runs before pin_compare."""
-    ordinary = sorted(
-        (r for r in runs if not r.is_pin_compare),
-        key=lambda r: r.newest_mtime,
-    )
-    pin = sorted(
-        (r for r in runs if r.is_pin_compare),
-        key=lambda r: r.newest_mtime,
-    )
-    return ordinary + pin
+    """Oldest-first by newest-file mtime."""
+    return sorted(runs, key=lambda r: r.newest_mtime)
 
 
 def plan_budget(
@@ -331,9 +301,8 @@ def render_plan(plan: PrunePlan, dry_run: bool) -> str:
     elif plan.delete:
         lines.append(f"  delete:        {len(plan.delete)} run dir(s)")
         for run in plan.delete:
-            kind = "pin_compare" if run.is_pin_compare else "run"
             lines.append(
-                f"    {run.path.name} ({kind}, {_fmt_bytes(run.size_bytes)})"
+                f"    {run.path.name} ({_fmt_bytes(run.size_bytes)})"
             )
         lines.append(f"  total after:   {_fmt_bytes(plan.total_after)}")
     else:

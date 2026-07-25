@@ -699,6 +699,13 @@ physical spike directly. Suggested use: set `FREQ` to the old coupled peak
 toolhead accel there. Steps whose capture yields no samples report `n/a`,
 never a fake zero (the same honesty rule as the residual column).
 
+A pin staircase is an ordinary run on the dashboard's tune tab. Each step's
+capture yields a following-error PSD, and — whenever the step recorded an
+accelerometer capture — a toolhead accel PSD in the section below it, both
+clipped to the same frequency ceiling so one spike lines up across the two
+charts. The step names carry the swept value (`v0_zeta0p005`), so the chart
+legends and the step chips read as the ladder.
+
 #### SERVO_COMPARE_PIN
 Sweeps one pin-rotor parameter (`ZETA` or `LEAD`) across a list of values
 and compares the **toolhead accelerometer response curve** each value
@@ -724,19 +731,26 @@ commanded accel — 1.0 means perfect command tracking, and peaks mark the
 resonances. Per value the command reports the peak-response frequency and
 its ratio.
 
-Results are written to a comparison manifest at
-`<captures_root>/pin_compare/<NAME>/manifest.json`
-(`{name, created_utc, mode, param, freq_start, freq_end, baseline_profile,
+Each invocation is an **ordinary run** — the same
+`<captures_root>/<NAME>_<stamp>/manifest.json` every other calibration
+command writes, with `experiment: "pin_compare"`, the originating command
+line, and the usual ambient/motor/`git_rev` block, so a comparison is one
+more row in the dashboard's runs table and takes a note like any other run.
+The curves live in that manifest's `pin_compare` block
+(`{mode, param, freq_start, freq_end, baseline_profile,
 sweeps:[{value, hz_per_sec, accel_per_hz, amplitude_mm, curve_hz,
 accel_mm_s2, response_ratio}]}` — `amplitude_mm` is the derived displacement
-at `FREQ_START`). Re-invoking with the same `NAME` **appends** its sweeps
-to the existing manifest (build a comparison incrementally across runs); a
-`mode`/`param` mismatch on append errors rather than mixing unlike curves.
-The dashboard reads it over `GET /api/pin-compare` (list) and
-`GET /api/pin-compare/<name>` (full manifest) to overlay the curves.
+at `FREQ_START`), appended and rewritten after each value so a crash keeps
+whatever was measured. Re-using a `NAME` produces a **second, separate
+run**; sweeps are never merged across invocations. The dashboard overlays
+them from `GET /api/runs/<name>/pin_compare`, and plots raw `accel_mm_s2` on
+a zero-based linear axis — spike height is the comparison.
 
 Measurement only — the pre-sweep model is restored at the end (also on any
-failure mid-sweep), and a failed run persists nothing. Params: `MODE=X|Y`
+failure mid-sweep). Every check that can reject the command (mode, param,
+frequency bounds, amplitude representability, accelerometer, baseline
+profile) runs **before** the first excitation, so measured curves are never
+discarded at write time. Params: `MODE=X|Y`
 (required, exactly one mode) `PARAM=ZETA|LEAD` (required) `VALUES` (comma
 list, nonempty, each validated by the `SERVO_SET_COMPLIANCE`
 `ZETA`/`PIN_LEAD_US` rules) `FREQ_START` `FREQ_END` (Hz, required,
@@ -922,7 +936,7 @@ Schemas: [servo-cal-contracts.md](servo-cal-contracts.md).
 | `SERVO_SWEEP_INERTIA` | `servo-cal analyze` | run dir + `results.json` (no automated pick, so `APPLY=1` always errors) |
 | `SERVO_SWEEP_ACCEL` | `servo-cal analyze` | run dir + `results.json` verdict (max non-railing accel); `APPLY=1` verifies at the recommended accel (no SDO write) |
 | `SERVO_SWEEP_PIN` | `servo-cal analyze` | run dir + `results.json` (per-step settled pin-residual magnitude; prints the `value → µm` table + winning `SERVO_SET_COMPLIANCE` line; nothing applied) |
-| `SERVO_COMPARE_PIN` | host-side chirp reduction (no `servo-cal`) | `<captures_root>/pin_compare/<NAME>/manifest.json` — one accel-vs-frequency curve (raw `accel_mm_s2` + normalized `response_ratio`) per swept value; same `NAME` appends; dashboard overlays via `/api/pin-compare`; nothing applied |
+| `SERVO_COMPARE_PIN` | host-side chirp reduction (no `servo-cal`) | run dir + a `pin_compare` manifest block — one accel-vs-frequency curve (raw `accel_mm_s2` + normalized `response_ratio`) per swept value; one invocation is one run (re-using `NAME` never merges); dashboard overlays via `/api/runs/<name>/pin_compare`; nothing applied |
 | `SERVO_TUNE_PIN` | `servo-cal analyze` (per staircase) | run dir(s) + tuned `dynamics_<name>_<stamp>.toml` (per-mode coarse→fine `ZETA` + shared `LEAD` staircases; model stays live until RESTART; restores pre-tune model on failure) |
 | `SERVO_FIT_DYNAMICS`, `SERVO_CALIBRATE_INERTIA_RATIO` | `servo-cal fit` | run dir + `~/printer_data/config/servo_dynamics/dynamics_<name>_<stamp>.toml` + C00.06 |
 | `SERVO_TUNE_DYNAMICS` | `servo-cal fit --response ferr` (per capture) | run dir + tuned `dynamics_<name>_<stamp>.toml` when a pass beats the baseline (search is host-side; tuned model stays live until RESTART) |
@@ -967,8 +981,7 @@ Policy, applied in order every run:
    plots keep working for compressed runs.
 2. **Budget prune.** While the total exceeds `--budget-gib` (default **8 GiB**),
    the oldest whole run dir (ordered by newest-file mtime) is deleted,
-   oldest-first. `pin_compare/<name>` dirs are last-resort: they are only
-   touched after every ordinary run has been exhausted.
+   oldest-first.
 3. **Min-keep floor.** Nothing newer than `--min-keep-hours` (default **24h**)
    is ever deleted. If the budget cannot be met without deleting a dir inside
    that window, the prune pass refuses — it deletes **nothing** and exits
