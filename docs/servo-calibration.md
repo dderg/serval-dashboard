@@ -762,6 +762,10 @@ has **not migrated away** from where the failing steps park theirs, the
 frequency is flagged as likely still off; and a winner at the ladder floor
 says the useful frequency may be lower still (the score is monotone until
 saturation, so an edge win means "extend", not "done").
+`f_b` and `ζ` are coupled — a `FREQ` ladder runs at one fixed `ζ`, and the
+ideal `ζ` shifts with the frequency — so after settling `f_b`, re-run the
+`ZETA` ladder at the new frequency (and if `ζ` moves materially, re-check
+`FREQ` once); each sweep can look converged alone while the pair is not.
 
 Each invocation is an **ordinary run** — the same
 `<captures_root>/<NAME>_<stamp>/manifest.json` every other calibration
