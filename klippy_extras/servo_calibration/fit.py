@@ -2411,19 +2411,34 @@ class DynamicsFitCommands(MeasureCommands):
         return updated
 
     @staticmethod
-    def _pin_step_name(param: str, index: int, value: float) -> str:
+    def _pin_step_name(param: str, value: float) -> str:
         """Capture/step name for one staircase rung.
 
         The name is what the dashboard prints in chart legends and what the
-        capture file on disk is called, so it carries the swept value -
-        a legend reading "v0 v1 v2 v3 v4" tells a reader nothing about
-        which zeta produced which curve. The leading index stays for stable
-        ordering and to keep names unique when two rungs round to the same
-        text. '.' becomes 'p' and '-' becomes 'm' because this ends up as a
+        capture file on disk is called, so it is the swept value and nothing
+        else: the same zeta produces the same step name in every run, which
+        is what lets curves line up across runs with different value lists.
+        '.' becomes 'p' and '-' becomes 'm' because this ends up as a
         filename stem next to a .scap extension.
         """
         text = ("%g" % (value,)).replace(".", "p").replace("-", "m")
-        return "v%d_%s%s" % (index, param.lower(), text)
+        return "%s%s" % (param.lower(), text)
+
+    def _pin_step_names(
+        self, gcmd: Any, param: str, values: list[float]
+    ) -> list[str]:
+        """Names for a whole sweep, refusing collisions up front - two
+        values rendering to one name would silently share a capture file."""
+        names = [self._pin_step_name(param, v) for v in values]
+        seen: dict[str, float] = {}
+        for v, n in zip(values, names):
+            if n in seen:
+                raise gcmd.error(
+                    "VALUES entries %g and %g produce the same step name "
+                    "%r - remove the duplicate" % (seen[n], v, n)
+                )
+            seen[n] = v
+        return names
 
     def _pin_sweep_scores(
         self,
@@ -2458,8 +2473,9 @@ class DynamicsFitCommands(MeasureCommands):
             step_torque[name] = peak
         torque_ref = max(step_torque.values(), default=0)
         rows: list[tuple[float, float | None]] = []
+        step_names = self._pin_step_names(gcmd, param, values)
         for i, value in enumerate(values):
-            name = self._pin_step_name(param, i, value)
+            name = step_names[i]
             step = by_name.get(name)
             residual_mm: float | None = None
             if step is not None and (
@@ -2654,6 +2670,7 @@ class DynamicsFitCommands(MeasureCommands):
                 toolhead = self.printer.lookup_object("toolhead")
                 tone_end = 0.0
                 accels: list[float | None] = []
+                step_names = self._pin_step_names(gcmd, param, values)
                 for i, value in enumerate(values):
                     # The endpoint refuses a new buzz while one is armed: wait
                     # out the previous step's tone tail (it is oversized past
@@ -2671,7 +2688,7 @@ class DynamicsFitCommands(MeasureCommands):
                         baseline, mode_i, param, value
                     )
                     send_dynamics_model(engine, handle, updated)
-                    step_name = self._pin_step_name(param, i, value)
+                    step_name = step_names[i]
                     # Tone covers this dwell only; generously oversized (it is
                     # duration-bounded and lapses harmlessly after the capture
                     # stops - the next step re-streams and starts its own).
@@ -3052,6 +3069,7 @@ class DynamicsFitCommands(MeasureCommands):
         self._prep("X", 0)
         self._prep("Y", 0)
         toolhead = self.printer.lookup_object("toolhead")
+        step_names = self._pin_step_names(gcmd, param, values)
         try:
             for i, value in enumerate(values):
                 # Keep idle_timeout from parking the servos mid-comparison
@@ -3059,7 +3077,7 @@ class DynamicsFitCommands(MeasureCommands):
                 toolhead.get_last_move_time()
                 updated = self._pin_sweep_model(baseline, mode_i, param, value)
                 send_dynamics_model(engine, handle, updated)
-                step_name = self._pin_step_name(param, i, value)
+                step_name = step_names[i]
                 aclient = accel_chip.start_internal_client()
                 t_start = round(reactor.monotonic(), 3)
                 # Drive capture and accel capture both span the whole chirp,

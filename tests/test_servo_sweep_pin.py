@@ -294,7 +294,7 @@ def test_pin_sweep_manifest_records_steps():
     steps = manifest["steps"]
     # Step names carry the swept value: the dashboard prints them as chart
     # legends, where "v0 v1" identified nothing.
-    assert [s["name"] for s in steps] == ["v0_zeta0p02", "v1_zeta0p04"]
+    assert [s["name"] for s in steps] == ["zeta0p02", "zeta0p04"]
     assert [s["swept"]["value"] for s in steps] == [0.02, 0.04]
     for s in steps:
         assert s["swept"]["t_end_s"] >= s["swept"]["t_start_s"]
@@ -355,15 +355,25 @@ def test_pin_sweep_scores_gate_unexcited_steps():
 
     results = {
         "steps": [
-            step("v0_zeta0p02", 0.005, 400),
-            step("v1_zeta0p05", 0.002, 380),
-            step("v2_zeta0p1", 0.00001, 12),  # unexcited: 3% of run torque
+            step("zeta0p02", 0.005, 400),
+            step("zeta0p05", 0.002, 380),
+            step("zeta0p1", 0.00001, 12),  # unexcited: 3% of run torque
         ]
     }
     rows = sc._pin_sweep_scores(gcmd, results, [0.02, 0.05, 0.1], "ZETA")
     assert rows[0][1] == 0.005
     assert rows[1][1] == 0.002
     assert rows[2][1] is None, "unexcited step must not score"
+
+
+@requires_tomllib
+def test_duplicate_values_refuse_before_any_motion():
+    # Step names are the swept value alone (so the same zeta lines up
+    # across runs); two values rendering to one name would silently share
+    # a capture file, so the sweep must refuse up front.
+    sc, _gcode, _node, _path = _setup()
+    with pytest.raises(Exception, match="same step name 'zeta0p02'"):
+        sc._pin_step_names(FakeGcmd({}), "ZETA", [0.02, 0.05, 0.02])
 
 
 @requires_tomllib
@@ -488,8 +498,8 @@ def test_pin_sweep_writes_per_step_accel_csv_for_the_psd():
     with open(os.path.join(run_dir, "manifest.json")) as f:
         steps = json.load(f)["steps"]
     assert [s["accel"] for s in steps] == [
-        "step_v0_zeta0p02_accel.csv",
-        "step_v1_zeta0p04_accel.csv",
+        "step_zeta0p02_accel.csv",
+        "step_zeta0p04_accel.csv",
     ]
     for step in steps:
         path = os.path.join(run_dir, step["accel"])

@@ -144,7 +144,7 @@ def test_compare_writes_an_ordinary_run():
     # ordinary step per swept value, named for the value so the chart
     # legends say which zeta produced which trace.
     steps = man["steps"]
-    assert [s["name"] for s in steps] == ["v0_zeta0p02", "v1_zeta0p05"]
+    assert [s["name"] for s in steps] == ["zeta0p02", "zeta0p05"]
     assert [s["swept"]["value"] for s in steps] == [0.02, 0.05]
     for step in steps:
         assert step["swept"]["t_end_s"] >= step["swept"]["t_start_s"]
@@ -161,15 +161,15 @@ def test_every_sweep_starts_its_own_drive_capture():
     # comparison had none at all while it only reduced the accelerometer,
     # which is why the following-error PSD came up empty.
     assert [p for p, _servos in cap.starts] == [
-        os.path.join(run_dir, "step_v0_zeta0p02.scap.zst"),
-        os.path.join(run_dir, "step_v1_zeta0p05.scap.zst"),
+        os.path.join(run_dir, "step_zeta0p02.scap.zst"),
+        os.path.join(run_dir, "step_zeta0p05.scap.zst"),
     ]
     assert [servos for _p, servos in cap.starts] == [["motor_a"]] * 2
     # started and stopped around each sweep, never left running across one
     assert cap.events == ["capture_start", "capture_stop"] * 2
     assert [s["capture"] for s in _steps(run_dir)] == [
-        "step_v0_zeta0p02.scap.zst",
-        "step_v1_zeta0p05.scap.zst",
+        "step_zeta0p02.scap.zst",
+        "step_zeta0p05.scap.zst",
     ]
 
 
@@ -180,8 +180,8 @@ def test_every_sweep_writes_the_accel_csv_the_analyzer_parses():
     run_dir = _run_dirs(sc)[0]
     steps = _steps(run_dir)
     assert [s["accel"] for s in steps] == [
-        "step_v0_zeta0p02_accel.csv",
-        "step_v1_zeta0p05_accel.csv",
+        "step_zeta0p02_accel.csv",
+        "step_zeta0p05_accel.csv",
     ]
     for step, client in zip(steps, chip.clients):
         with open(os.path.join(run_dir, step["accel"])) as f:
@@ -206,7 +206,7 @@ def test_a_sweep_that_captured_nothing_fails_loudly():
     with pytest.raises(Exception, match="measured no data"):
         sc.cmd_SERVO_COMPARE_PIN(_gcmd(VALUES="0.02,0.05"))
     assert node.live_dynamics_profile == path
-    assert [s["name"] for s in _steps(_run_dirs(sc)[0])] == ["v0_zeta0p02"]
+    assert [s["name"] for s in _steps(_run_dirs(sc)[0])] == ["zeta0p02"]
 
 
 @requires_tomllib
@@ -232,8 +232,8 @@ def test_compare_reports_each_sweep_and_the_run_dir():
     # says the capture landed. No peak or ratio: nothing is reduced here
     # any more, and a single-bin amplitude means nothing on a chirp.
     n = len(chip.clients[0].samples)
-    assert "step v0_zeta0p02 captured %d accel samples" % (n,) in report
-    assert "step v1_zeta0p05 captured %d accel samples" % (n,) in report
+    assert "step zeta0p02 captured %d accel samples" % (n,) in report
+    assert "step zeta0p05 captured %d accel samples" % (n,) in report
     assert _run_dirs(sc)[0] in report
 
 
@@ -263,8 +263,8 @@ def test_a_second_run_may_sweep_a_different_param_or_mode():
     runs = [_manifest_at(d) for d in _run_dirs(sc)]
     assert sorted(m["stroke_plan"]["param"] for m in runs) == ["LEAD", "ZETA"]
     assert sorted([s["name"] for s in m["steps"]] for m in runs) == [
-        ["v0_lead100", "v1_lead200"],
-        ["v0_zeta0p02", "v1_zeta0p05"],
+        ["lead100", "lead200"],
+        ["zeta0p02", "zeta0p05"],
     ]
 
 
@@ -303,7 +303,7 @@ def test_compare_restores_baseline_on_failure_mid_sweep():
     assert engine.dynamics_calls[-1][8] == 100.0
     assert node.live_dynamics_profile == path
     # the crashed run keeps the steps it did finish, and no more
-    assert [s["name"] for s in _steps(_run_dirs(sc)[0])] == ["v0_zeta0p02"]
+    assert [s["name"] for s in _steps(_run_dirs(sc)[0])] == ["zeta0p02"]
 
 
 @requires_tomllib
