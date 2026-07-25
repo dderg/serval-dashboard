@@ -27,7 +27,8 @@ klippy_extras/          python modules symlinked into klippy/extras
   servo_strain_tune.py  strain map measurement/build/fit (runtime comp stays in kalico)
 fixtures/servo_captures/  committed .scap.gz fixtures (demo + tests)
 tests/                  pytest suite (needs a kalico checkout, see tests/conftest.py)
-service/                servo-cal.service + launcher installed by install.sh
+service/                servo-cal.service + launcher, servo-capture-prune.service/.timer, installed by install.sh
+scripts/                servo-capture-prune retention tool (compress cold + budget prune; see docs/servo-calibration.md)
 docs/                   dashboard / calibration / tuning docs
 ```
 

@@ -25,9 +25,14 @@ class MeasureCommands(CalibrationHost):
         name = gcmd.get("NAME", "track")
         self._measure_tracking(gcmd, axis, name)
 
-    MAX_DIFFERENTIAL_AMPLITUDE_MM = 0.5
+    # Hard limit only: the wire carries amplitude_nm as u32, so anything
+    # representable is legal. Loudness is the operator's call.
+    MAX_DIFFERENTIAL_AMPLITUDE_MM = 4294.967295
     MAX_BUZZ_FREQ_HZ = 2000.0
-    MAX_BUZZ_DURATION_S = 300.0
+    # Klipper's resonance_tester convention: commanded accel = ApH * f
+    # (mm/s^2 per Hz). The endpoint chirp is constant-velocity-amplitude,
+    # which realizes exactly this profile.
+    DEFAULT_COMPARE_ACCEL_PER_HZ = 75.0
 
     cmd_SERVO_MEASURE_DIFFERENTIAL_help = (
         "Anti-phase chirp on one AWD belt pair via the engine buzz "
@@ -62,20 +67,14 @@ class MeasureCommands(CalibrationHost):
         amplitude = gcmd.get_float("AMPLITUDE", 0.05, above=0.0)
         if amplitude > self.MAX_DIFFERENTIAL_AMPLITUDE_MM:
             raise gcmd.error(
-                "AMPLITUDE %.3f mm exceeds the %.1f mm differential ceiling "
-                "(belt strain between the pair is twice the amplitude)"
+                "AMPLITUDE %.3f mm is not wire-representable "
+                "(amplitude_nm is u32; max %.1f mm)"
                 % (amplitude, self.MAX_DIFFERENTIAL_AMPLITUDE_MM)
             )
         hz_per_sec = gcmd.get_float("HZ_PER_SEC", 5.0, above=0.0)
         duration = gcmd.get_float("DURATION", 0.0, minval=0.0)
         if duration <= 0.0:
             duration = max(abs(freq_end - freq_start) / hz_per_sec, 0.5)
-        if duration > self.MAX_BUZZ_DURATION_S:
-            raise gcmd.error(
-                "sweep duration %.0f s exceeds the %.0f s buzz ceiling; "
-                "raise HZ_PER_SEC or narrow the frequency band"
-                % (duration, self.MAX_BUZZ_DURATION_S)
-            )
         ramp = gcmd.get_float(
             "RAMP",
             min(0.1 * duration, 3.0 / min(freq_start, freq_end)),
@@ -94,10 +93,9 @@ class MeasureCommands(CalibrationHost):
             "amplitude": amplitude,
             "dwell_ms": dwell,
         }
-        run = self._begin_run(
+        with self._run_scope(
             gcmd, "differential", name, belt, pair_names, stroke_plan
-        )
-        try:
+        ) as run:
             self._prep("X", dwell)
             self._prep("Y", dwell)
             gcmd.respond_info(
@@ -115,7 +113,9 @@ class MeasureCommands(CalibrationHost):
             )
             self._start_capture(name, pair_names)
             try:
-                engine.resonance_buzz(
+                self._resonance_buzz(
+                    gcmd,
+                    engine,
                     handle,
                     (1 << slots[0]) | (1 << slots[1]),
                     1 << slots[1],
@@ -130,9 +130,6 @@ class MeasureCommands(CalibrationHost):
             finally:
                 self._stop_capture()
             run.record_step(SweepStep(name, {}, []))
-            self._analyze_and_report(gcmd, run)
-        finally:
-            self._active_run = None
 
     RINGDOWN_MIN_DWELL_MS = 500
     RINGDOWN_DEFAULT_DWELL_MS = 1500
@@ -147,8 +144,15 @@ class MeasureCommands(CalibrationHost):
         "commanded-stop time is recorded. servo-cal fits the post-stop "
         "residual vibration (servo encoders + optional accelerometer) for "
         "per-mode frequency and damping ratio - the free decay a drive "
-        "cannot compensate the way it fights a steady sweep. Params "
-        "AXIS=X|Y|A|B SPEEDS ACCEL ITERATIONS DWELL_MS CRUISE_MS "
+        "cannot compensate the way it fights a steady sweep. "
+        "PATTERN=SQUARE drives continuous square laps instead: the "
+        "planner rounds each corner within the configured "
+        "corner-deviation budget (never overridden here - the same "
+        "transient a print corner produces), 4 corners/lap alternating "
+        "X/Y legs, only the final corner stops; corner times are read "
+        "off the capture's commanded reversals. SIZE= side in mm "
+        "(default min(80, bounds)). Params PATTERN=STROKE|SQUARE "
+        "AXIS=X|Y|A|B SPEEDS ACCEL ITERATIONS DWELL_MS CRUISE_MS SIZE "
         "ACCEL_CHIP TAG"
     )
 
@@ -221,6 +225,14 @@ class MeasureCommands(CalibrationHost):
         return strokes
 
     def cmd_SERVO_MEASURE_RINGDOWN(self, gcmd: Any) -> None:
+        pattern = gcmd.get("PATTERN", "STROKE").upper()
+        if pattern not in ("STROKE", "SQUARE"):
+            raise gcmd.error(
+                "PATTERN must be STROKE or SQUARE (got %r)" % (pattern,)
+            )
+        if pattern == "SQUARE":
+            self._measure_ringdown_square(gcmd)
+            return
         axis = gcmd.get("AXIS", "X").upper()
         plan = servo_strokes.build_plan(gcmd, self._kin(), self.bounds, axis)
         engine = self.printer.lookup_object("motion_engine")
@@ -250,7 +262,7 @@ class MeasureCommands(CalibrationHost):
             "cruise_ms": cruise_ms,
             "accel_chip": chip_name,
         }
-        run = self._begin_run(
+        with self._run_scope(
             gcmd,
             "ringdown",
             tag,
@@ -258,8 +270,7 @@ class MeasureCommands(CalibrationHost):
             servos,
             stroke_plan,
             self._corexy_rails(gcmd, axis),
-        )
-        try:
+        ) as run:
             for prep_axis in plan.prep:
                 self._prep(prep_axis, dwell)
             engine.set_post_processor_bypass(True)
@@ -333,9 +344,179 @@ class MeasureCommands(CalibrationHost):
             finally:
                 engine.set_post_processor_bypass(False)
                 self._restore()
-            self._analyze_and_report(gcmd, run)
-        finally:
-            self._active_run = None
+
+    def _ringdown_square_speeds(
+        self,
+        gcmd: Any,
+        accel: float,
+        max_velocity: float,
+        size: float,
+        cruise_ms: int,
+    ) -> list[int]:
+        """SPEEDS validated against a fixed leg length: every leg (one
+        square side) must reach cruise speed and hold it for `cruise_ms`
+        before the corner stop, mirroring the stroke variant's math."""
+        speeds_raw = self._floats(gcmd.get("SPEEDS", None)) or list(self.speeds)
+        speeds: list[int] = []
+        for s in speeds_raw:
+            sv = int(round(s))
+            if sv <= 0:
+                raise gcmd.error("speed %d must be positive (mm/s)" % (sv,))
+            if sv > max_velocity:
+                raise gcmd.error(
+                    "speed %d exceeds the printer's max velocity %.0f"
+                    % (sv, max_velocity)
+                )
+            needed = sv * sv / accel + sv * cruise_ms / 1000.0
+            if needed > size:
+                raise gcmd.error(
+                    "%d mm/s needs a %.1f mm leg (%.1f mm accel+decel + "
+                    "%.1f mm cruise) but the square side is %.1f mm - "
+                    "lower SPEEDS or CRUISE_MS, or raise SIZE"
+                    % (
+                        sv,
+                        needed,
+                        sv * sv / accel,
+                        sv * cruise_ms / 1000.0,
+                        size,
+                    )
+                )
+            if sv not in speeds:
+                speeds.append(sv)
+        speeds.sort()
+        return speeds
+
+    def _measure_ringdown_square(self, gcmd: Any) -> None:
+        """Ring-down over a continuous square path: the planner rounds
+        each 90 degree corner within the corner-deviation budget from the
+        user's config - the same transient a real print corner produces
+        (kalico has no instantaneous corners; SQUARE_CORNER_VELOCITY is
+        only an alias for that budget, and this command deliberately
+        never overrides it). Post-processors bypassed and jerk lifted
+        exactly like the stroke variant. Corner times are not modelled:
+        the analyzer reads them off the capture's commanded target
+        reversals, and the recorded motion-start fence anchors the
+        accelerometer tails. 4 corners per lap, alternating X and Y
+        legs; only the final corner is a full stop."""
+        engine = self.printer.lookup_object("motion_engine")
+        accel, max_velocity = self._ringdown_dynamics(gcmd, engine)
+        iterations = gcmd.get_int("ITERATIONS", 3, minval=1)
+        dwell = gcmd.get_int(
+            "DWELL_MS",
+            max(self.dwell_ms, self.RINGDOWN_DEFAULT_DWELL_MS),
+            minval=self.RINGDOWN_MIN_DWELL_MS,
+        )
+        cruise_ms = gcmd.get_int(
+            "CRUISE_MS", self.RINGDOWN_DEFAULT_CRUISE_MS, minval=0
+        )
+        x_start, x_end, y_start, y_end = servo_strokes.xy_bounds(
+            gcmd, self.bounds
+        )
+        span = min(x_end - x_start, y_end - y_start)
+        size = gcmd.get_float("SIZE", min(80.0, span), above=0.0)
+        if size > span:
+            raise gcmd.error(
+                "SIZE %.1f mm does not fit the %.1f mm usable span"
+                % (size, span)
+            )
+        speeds = self._ringdown_square_speeds(
+            gcmd, accel, max_velocity, size, cruise_ms
+        )
+        # Square corner: lower-left of a size x size box centered in bounds.
+        x0 = (x_start + x_end) / 2.0 - size / 2.0
+        y0 = (y_start + y_end) / 2.0 - size / 2.0
+        tag = gcmd.get("TAG", "ringdown")
+        chip, chip_name = self._accel_chip(gcmd)
+        x_plan = servo_strokes.build_plan(gcmd, self._kin(), self.bounds, "X")
+        y_plan = servo_strokes.build_plan(gcmd, self._kin(), self.bounds, "Y")
+        servos = list(dict.fromkeys(x_plan.servos + y_plan.servos))
+        stroke_plan = {
+            "pattern": "square",
+            "size_mm": size,
+            "corner_x": x0,
+            "corner_y": y0,
+            "speed": None,
+            "speeds": speeds,
+            "accel": accel,
+            "iterations": iterations,
+            "stops_per_iteration": 4,
+            "dwell_ms": dwell,
+            "cruise_ms": cruise_ms,
+            "accel_chip": chip_name,
+        }
+        with self._run_scope(
+            gcmd, "ringdown", tag, "XY", servos, stroke_plan
+        ) as run:
+            self._prep("X", dwell)
+            self._prep("Y", dwell)
+            engine.set_post_processor_bypass(True)
+            try:
+                engine.set_jerk_override(float("inf"))
+                try:
+                    for i, speed in enumerate(speeds):
+                        name = "%s_v%d" % (tag, speed)
+                        gcmd.respond_info(
+                            "ringdown %d/%d: %.0f mm square at %d mm/s, "
+                            "accel %.0f mm/s^2, %d print-like corners"
+                            % (
+                                i + 1,
+                                len(speeds),
+                                size,
+                                speed,
+                                accel,
+                                iterations * 4,
+                            )
+                        )
+                        self._goto_xy(x0, y0, dwell)
+                        self._start_capture(name, servos)
+                        aclient = (
+                            None
+                            if chip is None
+                            else chip.start_internal_client()
+                        )
+                        try:
+                            t0 = servo_strokes.emit_square_flowing(
+                                self.printer,
+                                self.gcode,
+                                x0,
+                                y0,
+                                size,
+                                float(speed),
+                                accel,
+                                iterations,
+                                dwell,
+                            )
+                            self._stop_capture()
+                        finally:
+                            if aclient is not None:
+                                aclient.finish_measurements()
+                        step = SweepStep(
+                            name,
+                            {
+                                "speed": float(speed),
+                                "stroke_mm": size,
+                                # Anchor for the analyzer: maps its
+                                # reversal-detected corner indices onto the
+                                # accel CSV's print-time axis.
+                                "motion_start_pt": t0,
+                            },
+                            [],
+                        )
+                        if aclient is not None:
+                            assert chip_name is not None, (
+                                "accel client exists without a chip name"
+                            )
+                            step.accel = os.path.basename(
+                                self._write_accel_csv(
+                                    gcmd, aclient, chip_name, name
+                                )
+                            )
+                        run.record_step(step)
+                finally:
+                    engine.set_jerk_override(None)
+            finally:
+                engine.set_post_processor_bypass(False)
+                self._restore()
 
     MAX_DAMPER_CLAMP_TENTHS = 300.0
     MAX_DAMPER_LEAD_US = 5000.0
@@ -472,15 +653,6 @@ class MeasureCommands(CalibrationHost):
                 "map" % (zero_x, zero_y)
             )
             sync.run(gcmd)
-        run = self._begin_run(
-            gcmd,
-            "strain_map",
-            tag,
-            "XY",
-            servos,
-            stroke_plan,
-            self._corexy_rails(gcmd, "X"),
-        )
         lines = [
             ("X", x_start, x_end, "y", level)
             for level in self._raster_levels(y_start, y_end, spacing)
@@ -488,7 +660,15 @@ class MeasureCommands(CalibrationHost):
             ("Y", y_start, y_end, "x", level)
             for level in self._raster_levels(x_start, x_end, spacing)
         ]
-        try:
+        with self._run_scope(
+            gcmd,
+            "strain_map",
+            tag,
+            "XY",
+            servos,
+            stroke_plan,
+            self._corexy_rails(gcmd, "X"),
+        ) as run:
             self._prep("X", dwell)
             self._prep("Y", dwell)
             for i, (axis, start, end, fixed_axis, level) in enumerate(lines):
@@ -514,8 +694,6 @@ class MeasureCommands(CalibrationHost):
                 "strain map raster complete: %d lines in %s"
                 % (len(lines), run.run_dir)
             )
-        finally:
-            self._active_run = None
 
     STRAIN_RESPONSE_STEPS = (0.0, 1.0, -1.0, 2.0, -2.0)
     MAX_STRAIN_STEP_UM = servo_strain_tune.MAX_STRAIN_STEP_UM
@@ -590,50 +768,54 @@ class MeasureCommands(CalibrationHost):
                 )
             self._goto_xy(zero_x, zero_y, dwell)
             sync.run(gcmd)
-        run = self._begin_run(
-            gcmd,
-            "strain_response",
-            tag,
-            "XY",
-            servos,
-            stroke_plan,
-            self._corexy_rails(gcmd, "X"),
-        )
         reactor = self.printer.get_reactor()
         total = session.pair_count() * len(steps_um)
         try:
-            self._prep("X", dwell)
-            self._goto_xy(x_start, line_y, dwell)
-            for belt_idx in range(session.pair_count()):
-                for step_idx, value_um in enumerate(steps_um):
-                    slew_s = session.apply(belt_idx, value_um)
-                    reactor.pause(reactor.monotonic() + settle + slew_s)
-                    name = "belt%s_step%d" % ("ab"[belt_idx], step_idx)
-                    gcmd.respond_info(
-                        "strain response %d/%d: belt %s at %+.0f um"
-                        % (
-                            belt_idx * len(steps_um) + step_idx + 1,
-                            total,
-                            "AB"[belt_idx],
-                            value_um,
+            with self._run_scope(
+                gcmd,
+                "strain_response",
+                tag,
+                "XY",
+                servos,
+                stroke_plan,
+                self._corexy_rails(gcmd, "X"),
+            ) as run:
+                self._prep("X", dwell)
+                self._goto_xy(x_start, line_y, dwell)
+                for belt_idx in range(session.pair_count()):
+                    for step_idx, value_um in enumerate(steps_um):
+                        slew_s = session.apply(belt_idx, value_um)
+                        reactor.pause(reactor.monotonic() + settle + slew_s)
+                        name = "belt%s_step%d" % ("ab"[belt_idx], step_idx)
+                        gcmd.respond_info(
+                            "strain response %d/%d: belt %s at %+.0f um"
+                            % (
+                                belt_idx * len(steps_um) + step_idx + 1,
+                                total,
+                                "AB"[belt_idx],
+                                value_um,
+                            )
                         )
-                    )
-                    self._start_capture(name, servos)
-                    self._strokes("X", x_start, x_end, speed, accel, 1, dwell)
-                    self._stop_capture()
-                    run.record_step(
-                        SweepStep(
-                            name,
-                            {"belt": float(belt_idx), "offset_um": value_um},
-                            [],
+                        self._start_capture(name, servos)
+                        self._strokes(
+                            "X", x_start, x_end, speed, accel, 1, dwell
                         )
-                    )
-                slew_s = session.apply(belt_idx, 0.0)
-                reactor.pause(reactor.monotonic() + slew_s)
-            self._restore()
+                        self._stop_capture()
+                        run.record_step(
+                            SweepStep(
+                                name,
+                                {
+                                    "belt": float(belt_idx),
+                                    "offset_um": value_um,
+                                },
+                                [],
+                            )
+                        )
+                    slew_s = session.apply(belt_idx, 0.0)
+                    reactor.pause(reactor.monotonic() + slew_s)
+                self._restore()
         finally:
             session.clear()
-            self._active_run = None
         comp.fit_strain_response(gcmd, run.run_dir)
 
     TUNE_MAX_ITERS = 5
@@ -717,7 +899,10 @@ class MeasureCommands(CalibrationHost):
                 )
             self._goto_xy(zero_xy[0], zero_xy[1], dwell)
             sync.run(gcmd)
-        run = self._begin_run(
+        reactor = self.printer.get_reactor()
+        converged = False
+        results = None
+        with self._run_scope(
             gcmd,
             "strain_tune",
             tag,
@@ -725,11 +910,7 @@ class MeasureCommands(CalibrationHost):
             servos,
             stroke_plan,
             self._corexy_rails(gcmd, "X"),
-        )
-        reactor = self.printer.get_reactor()
-        converged = False
-        results = None
-        try:
+        ) as run:
             self._prep("X", dwell)
             self._prep("Y", dwell)
             for iteration in range(max_iters):
@@ -796,8 +977,6 @@ class MeasureCommands(CalibrationHost):
                     break
                 tuner.apply(results)
             self._restore()
-        finally:
-            self._active_run = None
         if not converged:
             raise gcmd.error(
                 "did not converge within %d iterations — last measured %s; "
@@ -877,7 +1056,7 @@ class MeasureCommands(CalibrationHost):
             self._reject_pattern_stroke_bounds(gcmd)
         kin = self._kin()
         servos, belts_rails, axis = self._grid_servos(gcmd, kin)
-        self._begin_run(
+        with self._run_scope(
             gcmd,
             "inertia_grid",
             name,
@@ -885,14 +1064,9 @@ class MeasureCommands(CalibrationHost):
             servos,
             self._grid_stroke_plan(gcmd),
             belts_rails,
-        )
-        try:
+        ) as run:
             self._measure_inertia(gcmd, name)
-            run = self._active_run
-            assert run is not None, "inertia grid ran outside its run"
             run.record_step(SweepStep(name, {}, []))
-        finally:
-            self._active_run = None
 
     def _measure_inertia(self, gcmd: Any, name: str) -> None:
         kin = self._kin()

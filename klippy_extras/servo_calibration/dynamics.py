@@ -20,6 +20,11 @@ TUNE_RELATIVE_CLAMP = 0.4
 TUNE_MASS_FLOOR_FRACTION = 0.10
 TUNE_ZERO_FLOOR_STEPS = {"VISCOUS": 0.05, "COULOMB": 5.0}
 FF_LEAD_US_MAX = 10_000.0
+# Endpoint ceiling for the belt-compliance term 1/omega_b^2: 1/(2*pi*20 Hz)^2.
+# A mode softer than 20 Hz is a typo, not a belt. Must match
+# COMPLIANCE_MAX_S2 in kalico's ethercat-rt/src/dynamics.rs.
+COMPLIANCE_MAX_S2 = 6.34e-5
+PIN_LEAD_US_MAX = 10_000.0
 
 
 def parse_dynamics_profile(text: str) -> dict[str, Any]:
@@ -28,11 +33,18 @@ def parse_dynamics_profile(text: str) -> dict[str, Any]:
             "parsing dynamics profiles requires Python 3.11+ (tomllib)"
         )
     data = tomllib.loads(text)
-    if data.get("version") != 6:
+    version = data.get("version")
+    if version not in (6, 7, 8):
         raise ValueError(
-            "dynamics profile version must be 6 (got %r) - refit with "
-            "SERVO_FIT_DYNAMICS" % (data.get("version"),)
+            "dynamics profile version must be 6, 7, or 8 (got %r) - refit "
+            "with SERVO_FIT_DYNAMICS" % (version,)
         )
+    if version == 6 and "compliance" in data:
+        raise ValueError("profile compliance requires version 7")
+    if version != 8:
+        for key in ("pin_mass", "pin_zeta", "pin_lead_us"):
+            if key in data:
+                raise ValueError("profile %s requires version 8" % (key,))
     for key in ("direction_split", "orientation"):
         if key in data:
             raise ValueError(
@@ -68,6 +80,22 @@ def parse_dynamics_profile(text: str) -> dict[str, Any]:
             raise ValueError(
                 "profile %s must list %d per-mode values" % (key, n_modes)
             )
+    compliance = data.get("compliance", [0.0] * n_modes)
+    if not isinstance(compliance, list) or len(compliance) != n_modes:
+        raise ValueError(
+            "profile compliance must list %d per-mode values" % (n_modes,)
+        )
+    for v in compliance:
+        if (
+            isinstance(v, bool)
+            or not isinstance(v, (int, float))
+            or not math.isfinite(v)
+            or not (0.0 <= v <= COMPLIANCE_MAX_S2)
+        ):
+            raise ValueError(
+                "profile compliance values must be finite numbers in "
+                "[0, %g] s^2 (got %r)" % (COMPLIANCE_MAX_S2, v)
+            )
     ff_lead_us = data.get("ff_lead_us", 0.0)
     if (
         isinstance(ff_lead_us, bool)
@@ -78,6 +106,64 @@ def parse_dynamics_profile(text: str) -> dict[str, Any]:
         raise ValueError(
             "profile ff_lead_us must be a finite number in [0, %g] (got %r)"
             % (FF_LEAD_US_MAX, ff_lead_us)
+        )
+    has_pin_mass = "pin_mass" in data
+    has_pin_zeta = "pin_zeta" in data
+    if has_pin_mass != has_pin_zeta:
+        raise ValueError(
+            "profile pin_mass and pin_zeta must both be present or both absent"
+        )
+    pin_mass = data.get("pin_mass", [0.0] * n_modes)
+    if not isinstance(pin_mass, list) or len(pin_mass) != n_modes:
+        raise ValueError(
+            "profile pin_mass must list %d per-mode values" % (n_modes,)
+        )
+    for v in pin_mass:
+        if (
+            isinstance(v, bool)
+            or not isinstance(v, (int, float))
+            or not math.isfinite(v)
+            or v < 0.0
+        ):
+            raise ValueError(
+                "profile pin_mass values must be finite numbers >= 0 (got %r)"
+                % (v,)
+            )
+    pin_zeta = data.get("pin_zeta", [0.0] * n_modes)
+    if not isinstance(pin_zeta, list) or len(pin_zeta) != n_modes:
+        raise ValueError(
+            "profile pin_zeta must list %d per-mode values" % (n_modes,)
+        )
+    for v in pin_zeta:
+        # No upper cap: zeta >= 1 is a legitimate overdamped predictor (the
+        # endpoint evaluates all three damping regimes). Hard invariants
+        # are finiteness and sign only.
+        if (
+            isinstance(v, bool)
+            or not isinstance(v, (int, float))
+            or not math.isfinite(v)
+            or v < 0.0
+        ):
+            raise ValueError(
+                "profile pin_zeta values must be finite numbers >= 0 "
+                "(got %r)" % (v,)
+            )
+    for k, m in enumerate(pin_mass):
+        if m > 0.0 and not compliance[k] > 0.0:
+            raise ValueError(
+                "profile pin_mass for mode %d requires compliance[%d] > 0"
+                % (k, k)
+            )
+    pin_lead_us = data.get("pin_lead_us", 0.0)
+    if (
+        isinstance(pin_lead_us, bool)
+        or not isinstance(pin_lead_us, (int, float))
+        or not math.isfinite(pin_lead_us)
+        or not (0.0 <= pin_lead_us <= PIN_LEAD_US_MAX)
+    ):
+        raise ValueError(
+            "profile pin_lead_us must be a finite number in [0, %g] (got %r)"
+            % (PIN_LEAD_US_MAX, pin_lead_us)
         )
     numbers = [v for row in frame for v in row]
     for key in ("mass", "viscous", "coulomb"):
@@ -110,7 +196,11 @@ def parse_dynamics_profile(text: str) -> dict[str, Any]:
         "mass": [float(v) for v in data["mass"]],
         "viscous": [float(v) for v in data["viscous"]],
         "coulomb": [float(v) for v in data["coulomb"]],
+        "compliance": [float(v) for v in compliance],
         "ff_lead_us": float(ff_lead_us),
+        "pin_mass": [float(v) for v in pin_mass],
+        "pin_zeta": [float(v) for v in pin_zeta],
+        "pin_lead_us": float(pin_lead_us),
         "pairs": pairs,
     }
 
@@ -189,6 +279,13 @@ def _copy_dynamics(profile: dict[str, Any]) -> dict[str, Any]:
         "mass": list(profile["mass"]),
         "viscous": list(profile["viscous"]),
         "coulomb": list(profile["coulomb"]),
+        "compliance": [float(v) for v in profile.get("compliance", [])]
+        or [0.0] * len(profile["modes"]),
+        "pin_mass": [float(v) for v in profile.get("pin_mass", [])]
+        or [0.0] * len(profile["modes"]),
+        "pin_zeta": [float(v) for v in profile.get("pin_zeta", [])]
+        or [0.0] * len(profile["modes"]),
+        "pin_lead_us": float(profile.get("pin_lead_us", 0.0)),
         "pairs": [
             {
                 "slots": list(pair["slots"]),
@@ -230,6 +327,19 @@ def send_dynamics_model(
         [float(v) for v in profile["mass"]],
         [float(v) for v in profile["viscous"]],
         [float(v) for v in profile["coulomb"]],
+        [
+            float(v)
+            for v in profile.get("compliance", [0.0] * len(profile["modes"]))
+        ],
+        [
+            float(v)
+            for v in profile.get("pin_mass", [0.0] * len(profile["modes"]))
+        ],
+        [
+            float(v)
+            for v in profile.get("pin_zeta", [0.0] * len(profile["modes"]))
+        ],
+        float(profile.get("pin_lead_us", 0.0)),
         pair_slots,
         direction_split,
     )
@@ -344,17 +454,32 @@ def render_fit_dynamics_toml(
     def vec(values: list[float]) -> str:
         return "[%s]" % (", ".join(num(v) for v in values),)
 
+    compliance = applied.get("compliance", [0.0] * len(applied["modes"]))
+    n_modes = len(applied["modes"])
+    pin_mass = applied.get("pin_mass", [0.0] * n_modes)
+    pin_zeta = applied.get("pin_zeta", [0.0] * n_modes)
+    pin_lead_us = float(applied.get("pin_lead_us", 0.0))
+    has_pin = any(v != 0.0 for v in pin_mass)
     lines = [
-        "version = 6",
+        "version = 8" if has_pin else "version = 7",
         "axes = %s" % (json.dumps(applied["axes"]),),
         "modes = %s" % (json.dumps(applied["modes"]),),
         "frame = [%s]" % (", ".join(vec(row) for row in applied["frame"]),),
         "mass = %s" % (vec(applied["mass"]),),
         "viscous = %s" % (vec(applied["viscous"]),),
         "coulomb = %s" % (vec(applied["coulomb"]),),
+        "compliance = %s" % (vec(compliance),),
         "ff_lead_us = %s" % (num(lead_us),),
-        "applied_terms = %s" % (json.dumps([t.lower() for t in terms]),),
     ]
+    if has_pin:
+        lines += [
+            "pin_mass = %s" % (vec(pin_mass),),
+            "pin_zeta = %s" % (vec(pin_zeta),),
+            "pin_lead_us = %s" % (num(pin_lead_us),),
+        ]
+    lines.append(
+        "applied_terms = %s" % (json.dumps([t.lower() for t in terms]),)
+    )
     for key in ("mass", "viscous", "coulomb"):
         if applied[key] != fitted[key]:
             lines.append("fitted_%s = %s" % (key, vec(fitted[key])))

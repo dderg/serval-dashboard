@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import subprocess
 import time
-from typing import Any, overload
+from typing import Any, Iterator, overload
 
 from ... import structured_log
 from .. import servo_axis, servo_param, servo_strokes
@@ -20,6 +21,10 @@ from .common import (
 from .dynamics import parse_dynamics_profile
 from .params import NOTCH_MODE_ADDR, NOTCH_READBACK, SYNC_LOSS_COUNT_ADDR
 from .sweep import ExperimentRun, SweepEngine, SweepStep, _OverrideGcmd
+
+# A second's worth of same-tag runs; past that the timestamp is not the
+# problem and reusing someone else's directory is not the answer.
+RUN_DIR_COLLISION_LIMIT = 512
 
 
 class CalibrationHost:
@@ -49,6 +54,16 @@ class CalibrationHost:
         self.accel_chip_name = config.get("accel_chip", None)
         self.dwell_ms = config.getint("dwell_ms", 700, minval=0)
         self.travel_speed = config.getfloat("travel_speed", 100.0, above=0.0)
+        # Default buzz amplitudes (mm), overridable per command: the
+        # compliance identification sweep and the pin staircase dwell tone.
+        # Machines differ in how much excitation gives a clean notch without
+        # noise complaints - set what works for your frame.
+        self.compliance_amplitude_mm = config.getfloat(
+            "compliance_amplitude", 0.02, above=0.0
+        )
+        self.pin_sweep_amplitude_mm = config.getfloat(
+            "pin_sweep_amplitude", 0.01, above=0.0
+        )
         self.captures_root = config.get("captures_root", DEFAULT_CAPTURES_ROOT)
         self.dynamics_dir = os.path.expanduser(DEFAULT_DYNAMICS_DIR)
         self.servo_cal_binary = config.get(
@@ -79,6 +94,11 @@ class CalibrationHost:
             "SERVO_APPLY_GAINS",
             "SERVO_CALIBRATE_GAINS",
             "SERVO_TUNE_DYNAMICS",
+            "SERVO_SET_COMPLIANCE",
+            "SERVO_MEASURE_COMPLIANCE",
+            "SERVO_SWEEP_PIN",
+            "SERVO_COMPARE_PIN",
+            "SERVO_TUNE_PIN",
             "SERVO_SWEEP_INERTIA",
             "SERVO_SWEEP_ACCEL",
             "SERVO_AUTOTUNE",
@@ -115,11 +135,28 @@ class CalibrationHost:
         return self.printer.lookup_object("servo_capture")
 
     def _run_dir(self, tag: str) -> tuple[str, str]:
-        stamp = time.strftime("%Y%m%d_%H%M%S")
+        """A fresh directory per invocation, and the returned stamp IS that
+        directory's identity - callers name captures and profiles after it.
+        The timestamp only resolves to the second, so two runs of one tag
+        inside the same second collide; the loser gains a counter instead of
+        reusing the directory, because two commands are two runs and never
+        one merged pile of captures. Creating the directory is what detects
+        the collision, so a concurrent writer loses the same way."""
         root = os.path.expanduser(self.captures_root)
-        run_dir = os.path.join(root, "%s_%s" % (tag, stamp))
-        os.makedirs(run_dir, exist_ok=True)
-        return run_dir, stamp
+        second = time.strftime("%Y%m%d_%H%M%S")
+        for attempt in range(1, RUN_DIR_COLLISION_LIMIT + 1):
+            stamp = second if attempt == 1 else "%s_%d" % (second, attempt)
+            run_dir = os.path.join(root, "%s_%s" % (tag, stamp))
+            try:
+                os.makedirs(run_dir)
+            except FileExistsError:
+                continue
+            return run_dir, stamp
+        raise self.printer.command_error(
+            "no free run directory for tag %r at %s under %s after %d "
+            "attempts - refusing to reuse an existing run"
+            % (tag, second, root, RUN_DIR_COLLISION_LIMIT)
+        )
 
     def _resolve_motor(self, servo: str) -> Any:
         from .. import servo_axis
@@ -130,12 +167,19 @@ class CalibrationHost:
         return motor
 
     def _motor_manifest(self, motor: Any) -> dict[str, Any]:
-        return {
+        entry: dict[str, Any] = {
             "name": motor.get_motor_name(),
             "invert": motor.get_invert_direction(),
             "rotation_distance": motor.get_rotation_distance(),
             "counts_per_mm": motor.get_counts_per_mm(),
         }
+        # Rail-detection threshold tracks the drive's configured torque
+        # ceiling: max_torque is % of rated, recorded here as per-mille
+        # (x10). Omitted for older nodes whose config never exposed it.
+        max_torque = getattr(motor, "max_torque", None)
+        if max_torque is not None:
+            entry["max_torque_per_mille"] = int(round(max_torque * 10.0))
+        return entry
 
     def _ff_lead_us(self, gcmd: Any, motors: list[Any]) -> float:
         leads = set()
@@ -260,6 +304,47 @@ class CalibrationHost:
         self._active_run = run
         return run
 
+    @contextlib.contextmanager
+    def _run_scope(
+        self,
+        gcmd: Any,
+        experiment: str,
+        tag: str,
+        axis: str,
+        servos: list[str],
+        stroke_plan: dict[str, Any],
+        belts_rails: list[Any] | None = None,
+    ) -> Iterator[ExperimentRun]:
+        """The one way to run a calibration experiment. Owning the whole
+        lifecycle here means no command can skip a stage by omission: a body
+        that records zero capture steps is a broken command (raise), a run
+        whose analysis does not cover every recorded step is analyzed before
+        the scope closes, and the active run is always cleared.
+        SERVO_COMPARE_PIN shipped without recording or analyzing precisely
+        because each stage used to be a separate call every command had to
+        remember."""
+        run = self._begin_run(
+            gcmd, experiment, tag, axis, servos, stroke_plan, belts_rails
+        )
+        try:
+            yield run
+            if not run.manifest["steps"]:
+                if run.manifest.get("replayed_from"):
+                    # A full RESUME replay legitimately captures nothing: its
+                    # evidence is the source run named here, so there is
+                    # nothing to analyze either. A partial resume records
+                    # steps and takes the normal path below.
+                    return
+                raise gcmd.error(
+                    "%s finished without recording a single capture step - "
+                    "the command is broken, not the machine (run %s)"
+                    % (experiment, run.run_dir)
+                )
+            if run.analyzed_steps != len(run.manifest["steps"]):
+                self._analyze_and_report(gcmd, run)
+        finally:
+            self._active_run = None
+
     def _on_step_complete(self, step: SweepStep) -> None:
         if self._active_run is not None:
             self._active_run.record_step(step)
@@ -291,7 +376,14 @@ class CalibrationHost:
         if incremental:
             argv.append("--incremental")
         self._run(gcmd, argv, 120.0)
-        return self._read_results(gcmd, run.run_dir)
+        run.results = self._read_results(gcmd, run.run_dir)
+        # Incremental counts as full coverage: --incremental only caches
+        # already-analyzed steps, then recomputes the verdict over ALL steps
+        # and rewrites results.json wholesale (analyze.rs load_step_cache /
+        # write_outputs). _run_scope trusts this stamp to skip a redundant
+        # exit re-analyze.
+        run.analyzed_steps = len(run.manifest["steps"])
+        return run.results
 
     def _analyze_and_report(
         self, gcmd: Any, run: ExperimentRun
@@ -544,6 +636,26 @@ class CalibrationHost:
 
     def _prep(self, axis: str, dwell: int) -> None:
         servo_strokes.prep(self.printer, self.gcode, axis, dwell)
+
+    def _resonance_buzz(
+        self, gcmd: Any, engine: Any, handle: int, *args: int
+    ) -> None:
+        """engine.resonance_buzz with endpoint rejections turned into
+        recoverable gcmd errors instead of RuntimeError (which Klipper
+        escalates to a full shutdown). -828 means the torque gate is not
+        operation-enabled - typically the idle timeout's M84 parked the
+        servos between commands."""
+        try:
+            engine.resonance_buzz(handle, *args)
+        except RuntimeError as e:
+            hint = ""
+            if "-828" in str(e):
+                hint = (
+                    " (drives not operation-enabled - motors were likely "
+                    "disabled by the idle timeout; rerun the command, or "
+                    "home/move first to re-energize)"
+                )
+            raise gcmd.error("resonance buzz rejected: %s%s" % (e, hint))
 
     def _restore(self) -> None:
         self.gcode.run_script_from_command("RESET_VELOCITY_LIMIT")
@@ -805,10 +917,9 @@ class CalibrationHost:
             "iterations": iterations,
             "dwell_ms": dwell,
         }
-        run = self._begin_run(
+        with self._run_scope(
             gcmd, "tracking", name, axis, servos, stroke_plan, belts_rails
-        )
-        try:
+        ) as run:
             for prep_axis in plan.prep:
                 self._prep(prep_axis, dwell)
             self._start_capture(name, servos)
@@ -827,8 +938,6 @@ class CalibrationHost:
             self._restore()
             run.record_step(SweepStep(name, {}, []))
             results = self._analyze_and_report(gcmd, run)
-        finally:
-            self._active_run = None
         return run, results
 
     def _dynamics_out_path(

@@ -246,7 +246,21 @@ impl Scap {
         Scap::from_bytes(&bytes).map_err(|e| format!("{path}: {e}"))
     }
 
+    /// Zstandard frame magic (little-endian) as it appears at a file's start.
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Scap, String> {
+        // Compression is detected by content (the zstd magic), never by
+        // extension: kalico writes `.scap.zst` inline but legacy raw `.scap`
+        // and either extension mislabeled must both parse correctly.
+        if bytes.starts_with(&Self::ZSTD_MAGIC) {
+            let raw = zstd::decode_all(bytes).map_err(|e| format!("zstd decode: {e}"))?;
+            return Self::from_raw(&raw);
+        }
+        Self::from_raw(bytes)
+    }
+
+    fn from_raw(bytes: &[u8]) -> Result<Scap, String> {
         let nl = bytes
             .iter()
             .position(|&b| b == b'\n')

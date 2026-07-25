@@ -63,13 +63,23 @@ class ExperimentRun:
     stamp: str
     manifest: dict[str, Any]
     started_s: float = field(default_factory=time.time)
+    # Written by CalibrationHost._run_analyze: the parsed results.json and
+    # how many manifest steps that analysis covered. _run_scope compares the
+    # count against the manifest at exit to decide whether the run still
+    # needs analyzing - a command cannot leave a results-less run behind.
+    results: dict[str, Any] | None = None
+    analyzed_steps: int = -1
 
     @property
     def manifest_path(self) -> str:
         return os.path.join(self.run_dir, "manifest.json")
 
     def step_scap(self, name: str) -> str:
-        return os.path.join(self.run_dir, "step_%s.scap" % (name,))
+        # Captures are zstd-compressed inline by kalico's writer, which keys
+        # off the `.zst` suffix. The manifest's `capture` field (recorded via
+        # os.path.basename of this path) is the single source of the on-disk
+        # name; readers detect compression by content, not extension.
+        return os.path.join(self.run_dir, "step_%s.scap.zst" % (name,))
 
     def step_accel_csv(self, name: str) -> str:
         return os.path.join(self.run_dir, "step_%s_accel.csv" % (name,))

@@ -596,6 +596,7 @@ struct DemoAmbient {
 struct DemoManifest {
     version: i64,
     experiment: &'static str,
+    command: String,
     tag: String,
     created_utc: String,
     axis: &'static str,
@@ -624,6 +625,10 @@ fn manifest_json(attempt: &DemoAttempt, created: SystemTime) -> DemoManifest {
     DemoManifest {
         version: 1,
         experiment: "gain_sweep",
+        command: format!(
+            "SERVO_CALIBRATE_GAINS AXIS=X SPEED_GAINS=550,700 TAG=cal_{}",
+            attempt.suffix
+        ),
         tag: format!("cal_{}", attempt.suffix),
         created_utc: created_utc.clone(),
         axis: "X",

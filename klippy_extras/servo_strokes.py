@@ -301,6 +301,53 @@ def emit_strokes_with_stop_times(
     return stops
 
 
+def emit_square_flowing(
+    printer: Any,
+    gcode: Any,
+    x0: float,
+    y0: float,
+    size: float,
+    speed: float,
+    accel: float,
+    iterations: int,
+    dwell: int,
+) -> float:
+    """Square laps (corner at (x0, y0), CCW) as one continuous polyline.
+    The planner takes each 90 degree corner within the corner-deviation
+    budget from the user's config - rounded, at whatever corner speed
+    that budget allows - exactly what a print corner does. Deliberately
+    never touched here: kalico's SQUARE_CORNER_VELOCITY is only a
+    compatibility alias for that budget and there is no instantaneous
+    corner, so overriding it would silently change how print-like the
+    corners are. Corner times are NOT modelled: the analyzer reads them
+    off the capture's own commanded target reversals. Returns the
+    print-time fence read while still parked at (x0, y0) - the
+    motion-start anchor that maps accelerometer print-times onto capture
+    samples. A trailing dwell keeps the capture open past the final
+    stop's ring. The caller restores velocity limits afterwards."""
+    check_reachable(gcode, size, speed, accel)
+    toolhead = printer.lookup_object("toolhead")
+    feed = int(speed * 60)
+    gcode.run_script_from_command(
+        "SET_VELOCITY_LIMIT ACCEL=%.0f\nG90" % (accel,)
+    )
+    # Machine is parked at (x0, y0): the fence read is free.
+    t0 = toolhead.get_last_move_time()
+    corners = [
+        (x0 + size, y0),
+        (x0 + size, y0 + size),
+        (x0, y0 + size),
+        (x0, y0),
+    ]
+    lines = []
+    for _ in range(iterations):
+        for cx, cy in corners:
+            lines.append("G1 X%.3f Y%.3f F%d" % (cx, cy, feed))
+    lines += ["M400", "G4 P%d" % (dwell,), "M400"]
+    gcode.run_script_from_command("\n".join(lines))
+    return t0
+
+
 @dataclass
 class PatternMove:
     x: float
@@ -502,9 +549,32 @@ def scalar_fit_drive(gcmd: Any, kin: Any) -> str | None:
 def prep(printer: Any, gcode: Any, axis: str, dwell: int) -> None:
     curtime = printer.get_reactor().monotonic()
     toolhead = printer.lookup_object("toolhead")
-    homed = toolhead.get_kinematics().get_status(curtime)["homed_axes"]
+    kin = toolhead.get_kinematics()
+    homed = kin.get_status(curtime)["homed_axes"]
     lines = []
     if axis.lower() not in homed:
         lines.append("G28 %s" % (axis,))
+    else:
+        # Homed but possibly parked: servo lanes keep their homing across
+        # M84 / idle-timeout (absolute encoders), so G28 is rightly skipped
+        # - but torque is off and a subsequent buzz would be rejected by
+        # the endpoint (drive not operation-enabled). Re-energize the
+        # axis's motors the same way homing does; motor_enable_group also
+        # resyncs parked servo positions from the encoders.
+        deltas = [0.0, 0.0, 0.0]
+        deltas["xyz".index(axis.lower())] = 1.0
+        names: list[str] = []
+        for rail in kin.active_rails(*deltas):
+            steppers = rail.get_steppers()
+            if steppers:
+                names.extend(s.get_name() for s in steppers)
+            else:
+                names.append(rail.get_name())
+        stepper_enable = printer.lookup_object("stepper_enable")
+        if any(
+            not stepper_enable.lookup_enable(n).is_motor_enabled()
+            for n in names
+        ):
+            stepper_enable.motor_enable_group(names)
     lines += ["M400", "G4 P%d" % (dwell,), "M400"]
     gcode.run_script_from_command("\n".join(lines))

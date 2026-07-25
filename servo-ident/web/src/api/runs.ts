@@ -1,5 +1,4 @@
 import { client, unwrap } from "./client";
-
 export async function listRuns() {
   return unwrap(await client.GET("/api/runs"));
 }

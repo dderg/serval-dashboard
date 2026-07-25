@@ -239,6 +239,11 @@ def make_autotune(
             )
         elif base.startswith("autotune_verify_"):
             results = _synth_results(run_dir, no_pick_verdict, verify_ferr, 5.0)
+        elif base.startswith(("autotune_inertia_", "autotune_dynamics_")):
+            # The identify fits analyze their own runs at scope exit like
+            # every other calibration run; an identification never picks a
+            # step, so it carries the "not a sweep" verdict.
+            results = _synth_results(run_dir, no_pick_verdict, 40.0, 5.0)
         elif base.startswith("autotune_gain_"):
             flagged = gain_step_name if flagged_stage == "gain_sweep" else None
             results = _synth_results(

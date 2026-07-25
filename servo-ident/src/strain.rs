@@ -225,7 +225,7 @@ pub fn analyze_run(run_dir: &Path) -> Result<StrainMap, String> {
     let pairs = belt_pairs(belts).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
     let mut lines = Vec::with_capacity(manifest.steps.len());
     for step in &manifest.steps {
-        let path = run_dir.join(format!("step_{}.scap", step.name));
+        let path = run_dir.join(&step.capture);
         let scap = Scap::load(&path.display().to_string())?;
         let profiles = analyze_line(&scap, &pairs, &step.name)?;
         lines.push(StrainLine {

@@ -61,6 +61,9 @@ const PAGE_DEFS: Record<string, PageDef> = {
       "inertia_grid",
       "differential",
       "ringdown",
+      "compliance",
+      "pin_compare",
+      "pin_sweep",
     ],
     charts: ["psd", "time", "path", "frf", "ringdown"],
     intro:

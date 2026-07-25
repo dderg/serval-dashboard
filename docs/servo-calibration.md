@@ -3,7 +3,8 @@
 Command reference for tuning an A6-EC servo axis (EtherCAT). The
 `[servo_calibration]` extension registers the `SERVO_*` console commands. Each
 experiment command writes a run directory under `captures_root` (a
-`manifest.json`, one `step_<name>.scap` per step, optional accelerometer CSVs)
+`manifest.json`, one `step_<name>.scap.zst` per step — zstd-compressed inline
+by kalico's capture writer at write time — optional accelerometer CSVs)
 and then invokes the `servo-cal` Rust binary — `analyze` writes `results.json`
 with a typed verdict, `fit` writes a dynamics profile. Drive-parameter access
 comes from the kalico repo: `klippy/extras/servo_param.py` and
@@ -50,7 +51,9 @@ they are configured or passed.
 | `iterations` | `3` | strokes per grid point (`ITERATIONS=`) |
 | `dwell_ms` | `700` | settle between strokes (`DWELL_MS=`) |
 | `travel_speed` | `100` | CoreXY centering moves between grid points |
-| `accel_chip` | — | accelerometer section name (e.g. `adxl345`); when set, `SERVO_CALIBRATE_GAINS` also records vibration per step (`ACCEL_CHIP=`) |
+| `compliance_amplitude` | `0.02` | default buzz amplitude (mm) for the compliance identification sweep (`SERVO_MEASURE_COMPLIANCE AMPLITUDE=`, `SERVO_TUNE_PIN MEASURE_AMPLITUDE=`) |
+| `pin_sweep_amplitude` | `0.01` | default dwell-tone amplitude (mm) for the pin staircases (`SERVO_SWEEP_PIN`/`SERVO_TUNE_PIN` `AMPLITUDE=`) |
+| `accel_chip` | — | accelerometer section name (e.g. `adxl345`); when set, `SERVO_CALIBRATE_GAINS` records vibration per step, the pin staircases (`SERVO_SWEEP_PIN`/`SERVO_TUNE_PIN`) score the toolhead accel at the tone, and it is the default (and required) chip for `SERVO_COMPARE_PIN` (`ACCEL_CHIP=`) |
 | `captures_root` | `~/printer_data/logs/servo_captures` | parent directory for experiment run directories |
 | `journal_params` | — | comma list of drive SDO addresses (`addr[:type]`, e.g. `0x2001.0x31:u16`) read back from every captured drive at run start and recorded under `ambient.journal_params` in the manifest — the campaign's varied registers (notch mode, etc.) |
 | `servo_cal_binary` | `target/snapshot/servo-cal` | path to the `servo-cal` analysis binary |
@@ -486,6 +489,315 @@ resume. Params: `MAX_ACCEL` `MAX_SPEED` `STEP` (0.15) `TERMS`
 (MASS,VISCOUS,COULOMB,LEAD) `NAME` (tune) `PROFILE` `RESUME` `SERVOS`
 `BOUND` `SMALL_SIZE`.
 
+#### SERVO_SET_COMPLIANCE
+Writes the per-mode **belt-compliance** term `1/ω_b²` into the
+dynamics profile and streams it live (no restart). Compliance is
+**identification data**: it records the locked-rotor belt frequency
+`f_b` per Cartesian mode and is the **pin-rotor's `ω_b` source**. The
+endpoint no longer applies a command-path geometry correction from it
+— that "mode B" position/velocity/torque lead has been retired.
+Geometry inversion — commanding
+`x + (2ζ/ω)·ẋ + (1/ω²)·ẍ` so the toolhead follows the nominal path —
+now lives in the **planner's `mode_inverse` post-processor stage**
+(see [`mode_inverse` config](#planner-mode_inverse-config) below), fed
+by these identified numbers. Because the endpoint no longer leads the
+command path, the old **double-correction hazard** (endpoint lead
+stacking with a planner inversion) is gone by construction.
+
+`X_FREQ`/`Y_FREQ` are the **locked-rotor** belt frequencies in Hz —
+the frequency the carriage rings at when the rotor holds still. This
+sits *above* the coupled frequency a plain `SERVO_MEASURE_RINGDOWN`
+reports (there the rotor recoils on the position-loop spring in
+series with the belt, which reads low). `0` clears a mode; an omitted
+mode keeps its current value. On a coupled node the per-mode terms
+compose through the frame (`G = F⁺·diag(c)·F`), so per-axis
+frequencies map correctly onto CoreXY motors.
+
+`PIN=XY|X|Y|0` switches the **named** mode(s) to **pin-rotor** (mode A)
+and touches nothing else: `PIN=X` then `PIN=Y` compose without
+unpinning each other. To unpin one mode, clear all pins with `PIN=0`
+and re-pin what should remain (e.g. `PIN=0`, then `PIN=Y …`). In mode
+A the endpoint holds the rotor on the planner path and cancels the
+belt reaction with a predictive torque, so the toolhead rings at the
+locked-rotor `f_b` where a standard input shaper applies. Pin needs
+the mode's compliance as its frequency source, so set `X_FREQ`/`Y_FREQ`
+in the same call (or apply it to an existing profile). Each pinned mode
+also needs its FRF **peak** frequency — `X_PEAK`/`Y_PEAK` in Hz,
+reported per mode by `SERVO_MEASURE_COMPLIANCE`. With the mode's notch
+`f_b` and peak `f_peak` the per-mode load fraction is `1 − (f_b/f_peak)²`
+and the pinned inertia is `pin_mass = mass·(1 − (f_b/f_peak)²)`. This
+replaces the old `RATIO`/C00.06 source: C00.06 is a per-drive
+gain-scheduling number, not per-mode physics, whereas the IV FRF's
+peak/notch ratio recovers the open-loop plant and gives the load
+fraction per mode. `X_ZETA`/`Y_ZETA` (default `0.02`) set the per-mode
+belt damping ratio for the predictor decay — `ZETA` is the shared
+fallback for a pinned mode that omits its own — and `PIN_LEAD_US`
+(default `0`) the pin torque's phase lead in microseconds; because the
+pin term lives at `f_b`, the lead is tuned by minimizing the mode's
+line in the rotor following-error PSD (or the pin residual telemetry).
+
+The pin-rotor path (A) holds the rotor and makes the correction
+*measurable at the rotor encoder* — the belt reaction is cancelled at
+the source and what remains rings at `f_b`, which a shaper then
+handles. Toolhead-follows-the-planner behaviour below `f_b` is the job
+of the planner's `mode_inverse` stage, not the endpoint. The pin and
+`mode_inverse` are complementary: the pin damps residual excitation the
+command didn't cause (cogging, reversals, model error), while
+`mode_inverse` inverts the belt geometry for commanded motion.
+
+Baseline resolution matches `SERVO_TUNE_DYNAMICS` (`PROFILE=`, else
+the live-tuned model, else the configured node profile); the result
+is written as a new timestamped v7 TOML (v8 when a `PIN` mode is set;
+never overwriting) and left live until `RESTART`. Requires the matching
+kalico build on both sides (profile / wire schema v7, v8 for pin).
+Params: `X_FREQ` `Y_FREQ` (Hz, ≥ 20; 0 disables) `PIN` (0)
+`X_PEAK` `Y_PEAK` (Hz, FRF peak, required per pinned mode) `X_ZETA`
+`Y_ZETA` (per-mode damping) `ZETA` (0.02, shared fallback)
+`PIN_LEAD_US` (0) `NAME` (compliance) `PROFILE` `SERVOS`.
+
+#### Planner mode_inverse config
+Geometry inversion — following the nominal path by commanding
+`x + (2ζ/ω)·ẋ + (1/ω²)·ẍ` — is a **planner** post-processor stage
+([`trajectory::algos::ModeInverse`]), not an endpoint correction. Enable
+it per axis with a `[post_processor]` section of `type: mode_inverse`
+and reference it from the axis, preceded by a short smoothing kernel
+(the inverse amplifies high frequencies via the `ẍ` term, so bandlimit
+its input):
+
+```
+[post_processor slew]
+type: smooth_bell
+smooth_time: 0.0015
+
+[post_processor belt_x]
+type: mode_inverse
+frequency_hz: 131.0
+damping_ratio: 0.05
+
+[axis x]
+post_processors: slew, belt_x
+```
+
+`frequency_hz` is the measured locked-rotor belt notch `f_b`
+(`SERVO_MEASURE_COMPLIANCE`) and `damping_ratio` is the mode's belt
+damping ratio ζ (the fine-ladder winner from `SERVO_TUNE_PIN`).
+`SERVO_MEASURE_COMPLIANCE` and `SERVO_TUNE_PIN` both print a
+ready-to-paste snippet per mode. Runtime-tunable via
+`SET_POST_PROCESSOR`; kernel and inversion are both LTI so config order
+does not change the math. Adding zero endpoint lead alongside the
+planner stage means there is no double-correction hazard.
+
+#### SERVO_MEASURE_COMPLIANCE
+Measures the locked-rotor belt frequency `f_b` per Cartesian mode —
+the exact number `SERVO_SET_COMPLIANCE` wants — with the machine at
+standstill. For each selected mode it runs the engine's swept
+**position buzz** in the mode's frame pattern (in-phase for X,
+anti-phase for Y on CoreXY, invert signs unfolded automatically) and
+captures per-cycle command, encoder position, and measured torque
+(6077h). The analysis is an **instrumental-variable FRF** from
+measured torque to rotor position with the commanded buzz as the
+instrument (immune to the closed-loop bias a direct estimate picks
+up): its anti-resonance notch is exactly `sqrt(k_belt/m_load)/2π` —
+at that frequency the load is a perfectly tuned absorber and no
+applied torque can move the rotor. Plant zeros are invariant under
+feedback, so the position loop fighting the excitation doesn't shift
+the notch; the loop *is* the torque generator. `f_b` lands above the
+familiar coupled ringdown frequency and below the plant's two-mass
+peak, which is reported alongside as a sanity anchor.
+
+Re-measuring with the machine already tuned stays honest: the endpoint
+applies no command-path lead, and a live pin (A) cannot bias the notch
+— the FRF is measured-torque →
+position, and plant zeros don't care who generated the torque. Pinned
+modes do run their predictor through buzz cycles, so accelerometer
+resonance tests (`TEST_RESONANCES`) measure the *pinned* machine —
+tune the input shaper from those with the pin in its print-time state.
+Keep the two roles distinct: `SERVO_MEASURE_COMPLIANCE` is the
+*identification* tool (it recovers `f_b`/`f_peak` and changes nothing),
+while `TEST_RESONANCES` with the pin active is the *print-facing
+verification* that the shaped, pinned machine actually rings where the
+model predicts.
+
+The estimator is validated in CI against a simulated closed-loop
+two-mass plant (`servo-ident/tests/compliance_frf.rs`): it recovers
+the analytic `f_b` within 2 Hz and refuses to be dragged onto the
+coupled peak. Quality gates surface as step flags:
+`compliance_notch_shallow` (< 6 dB — raise `AMPLITUDE` or narrow the
+band), `compliance_flanks_incoherent`, and
+`compliance_peak_below_notch` (model violation — don't apply).
+
+Measurement only — it changes nothing on the drives. The verdict
+carries `f_b`, `f_peak` and the implied compliance per mode, and the
+command prints the ready-to-run
+`SERVO_SET_COMPLIANCE X_FREQ=… X_PEAK=… Y_FREQ=… Y_PEAK=…` line (the
+peaks make it pin-complete, with the persistence reminder). It also
+prints a ready-to-paste planner
+[`mode_inverse` snippet](#planner-mode_inverse-config) per mode
+(`frequency_hz=f_b`); `damping_ratio` is a placeholder here — the belt
+ζ comes from `SERVO_SWEEP_PIN`/`SERVO_TUNE_PIN`. When any
+step is flagged it prints a
+re-measure warning instead of a recommendation. Params: `MODE=XY|X|Y`
+`FREQ_START` (60) `FREQ_END` (320) `HZ_PER_SEC` (1) `DURATION`
+`AMPLITUDE` (0.02 mm; config `compliance_amplitude`) `RAMP` `DWELL_MS` `NAME` (compliance).
+A live pin is cleared for the sweep's duration and restored afterwards -
+identification must measure the raw plant (an active pin cancels torque
+exactly around f_b and biases the notch estimate).
+
+#### SERVO_SWEEP_PIN
+Staircase-tunes one pin-rotor parameter (`ZETA` or `LEAD`, i.e.
+`PIN_LEAD_US`) for a single already-pinned mode by dwelling the engine
+buzz as a **constant tone** — `freq_start == freq_end = FREQ`, typically
+the mode's notch `f_b` — in that mode's frame pattern, then re-streaming
+the dynamics model live at each step. The pin runs *through* the tone:
+streaming a new model mid-buzz rebuilds the endpoint's pin state, so
+every step's residual demodulator restarts cleanly and settles inside
+the dwell while the buzz forcing keeps integrating on the fresh damping.
+The un-swept pin parameter stays at its current baseline value.
+
+Scoring is **magnitude, not phase**. After the capture stops, the host
+reads the settled pin-residual magnitude `|pin_res|` at the tone that the
+analyzer already produces per step
+(`drives[*].metrics.pin_residual_mm`, the 0.25 s low-passed
+`pin_res_re/pin_res_im` phasor, so it is fully settled by the ≥ 1 s
+dwell) and reports a `value → residual (µm)` table with the minimum
+marked. The residual **phase** walks 0 → 180° across the notch naturally
+and is *not* a tuning target — the well-damped hold is the one that
+leaves the smallest settled residual magnitude at the tone, so the
+minimum of the table wins. The mode's residual rides the drive block of
+the same index, so the score is the max `pin_residual_mm` over the
+step's captured drives.
+
+Measurement only — nothing is left applied. The pre-sweep model is
+restored at the end (also on any failure mid-sweep, the same
+restore discipline `SERVO_CALIBRATE_GAINS` uses for drive params), and
+the command prints the ready-to-run
+`SERVO_SET_COMPLIANCE PIN=… …_PEAK=… …_ZETA=… PIN_LEAD_US=…` line with the
+winning value substituted (measure prints, [`SERVO_SET_COMPLIANCE`](#servo_set_compliance)
+applies; the peak is reconstructed from the baseline pin so the line is
+complete, and the un-swept parameter is carried through unchanged). If
+the capture carries no pin channels or every step reads ~0 it errors —
+the swept mode must be actively pinned (`pin_mass > 0`; pin it first with
+`SERVO_SET_COMPLIANCE PIN=`) and the kalico endpoint build must be
+current. Params: `MODE=X|Y` `FREQ` (Hz) `PARAM` (`ZETA`|`LEAD`, default
+`ZETA`) `VALUES` (comma list, one or more, each validated by the
+`SERVO_SET_COMPLIANCE` `ZETA`/`PIN_LEAD_US` rules) `DWELL` (s, default 3,
+min 1) `AMPLITUDE` (mm, 0.01; config `pin_sweep_amplitude`) `NAME` (pin_sweep) `ACCEL_CHIP` `PROFILE`.
+
+**Toolhead accelerometer scoring (optional).** With `ACCEL_CHIP=` (or the
+`[servo_calibration] accel_chip` config default; omit both to leave it off)
+each step also runs an accelerometer capture over the same scored dwell
+window and reports an extra `mm/s²` column: the single-bin accel amplitude
+at the tone frequency (a direct DFT bin over the settled tail, windowed the
+same way as the pin-residual scorer so the two columns are comparable), the
+three axes combined as vector magnitude. The pin-residual verdict is
+unchanged — it still picks the applied value — but the command additionally
+prints the accel-minimum step and, when it disagrees with the residual
+minimum, says so explicitly. The residual is what the drive *thinks* it left
+behind; the accelerometer measures the real toolhead, so this scores the
+physical spike directly. Suggested use: set `FREQ` to the old coupled peak
+(or the mode's `f_b`) and pick the `ZETA`/`LEAD` that minimizes the measured
+toolhead accel there. Steps whose capture yields no samples report `n/a`,
+never a fake zero (the same honesty rule as the residual column).
+
+A pin staircase is an ordinary run on the dashboard's tune tab. Each step's
+capture yields a following-error PSD, and — whenever the step recorded an
+accelerometer capture — a toolhead accel PSD in the section below it, both
+clipped to the same frequency ceiling so one spike lines up across the two
+charts. The step names carry the swept value (`zeta0p005`), so the chart
+legends and the step chips read as the ladder.
+
+#### SERVO_COMPARE_PIN
+Sweeps one pin-rotor parameter (`ZETA` or `LEAD`) across a list of values
+and compares the **toolhead accelerometer response curve** each value
+produces, so a bench operator can overlay them and see which pin setting
+flattens the resonance. Unlike [`SERVO_SWEEP_PIN`](#servo_sweep_pin) — which
+dwells a single constant tone and scores one settled residual per value —
+this runs a full **swept-sine buzz (chirp)** `FREQ_START → FREQ_END` in the
+selected mode's frame pattern once per value, re-streaming the dynamics
+model live before each sweep (only the swept `PARAM` changes; the other pin
+parameter keeps its baseline value) and capturing both the drives and the
+accelerometer across the whole sweep window.
+
+Nothing is reduced host-side. A linear chirp dwells equally at every
+frequency, so the accelerometer PSD of the capture *is* that value's
+frequency-response curve — the same per-step PSD the dashboard already
+draws for a pin staircase. The excitation is **constant accel-per-Hz**
+(klipper's `accel_per_hz` convention): the endpoint chirp holds the velocity
+amplitude constant, so displacement shrinks as `1/f` and the commanded accel
+is exactly `ACCEL_PER_HZ · f`. Per value the command reports the step name
+and the accelerometer sample count the sweep captured — a peak or a ratio
+would need exactly the reduction the PSD replaces.
+
+Each invocation is an **ordinary run** — the same
+`<captures_root>/<NAME>_<stamp>/manifest.json` every other calibration
+command writes, with `experiment: "pin_compare"`, the originating command
+line, and the usual ambient/motor/`git_rev` block, so a comparison is one
+more row in the dashboard's runs table and takes a note like any other run.
+Every swept value is an **ordinary step** inside it, named for the value
+(`zeta0p02`): a `.scap` drive capture plus an accelerometer CSV, the
+manifest rewritten as each sweep completes so a crash keeps whatever was
+measured. That layout is the whole feature — the tune tab charts a
+comparison with the sections it draws for any stepped run: a following-error
+PSD and a toolhead accel PSD, one trace per swept value, legends reading the
+values off the step names. Re-using a `NAME` produces a **second, separate
+run**; sweeps are never merged across invocations.
+
+Measurement only — the pre-sweep model is restored at the end (also on any
+failure mid-sweep). Every check that can reject the command (mode, param,
+frequency bounds, amplitude representability, accelerometer, baseline
+profile) runs **before** the first excitation, so measured sweeps are never
+discarded at write time. Params: `MODE=X|Y`
+(required, exactly one mode) `PARAM=ZETA|LEAD` (required) `VALUES` (comma
+list, nonempty, each validated by the `SERVO_SET_COMPLIANCE`
+`ZETA`/`PIN_LEAD_US` rules) `FREQ_START` `FREQ_END` (Hz, required,
+hard-limit validated) `HZ_PER_SEC` (default 1.0) `ACCEL_PER_HZ` (mm/s² per
+Hz, default 75 — sets the displacement at `FREQ_START` to
+`ACCEL_PER_HZ/(4π²·FREQ_START)`) `RAMP` `DWELL` (s between sweeps, default 3)
+`ACCEL_CHIP` (**required** — pass it or set `[servo_calibration] accel_chip`;
+the comparison is the accelerometer) `NAME` (default `compare`) `PROFILE`.
+
+#### SERVO_TUNE_PIN
+The full measured pin-rotor tuning campaign, chaining the identification
+and staircase primitives into one command so a bench operator gets a
+ready-to-keep profile in a single run. For each mode in `MODES` (XY|X|Y):
+
+1. **Identify** — unless `X_FREQ`/`X_PEAK` (resp. `Y_FREQ`/`Y_PEAK`) are
+   supplied, it runs the [`SERVO_MEASURE_COMPLIANCE`](#servo_measure_compliance)
+   machinery to get the locked-rotor notch `f_b` and the FRF peak
+   `f_peak` for that mode; pass both override params to skip the (slow)
+   measurement for a mode whose numbers you already trust.
+2. **Pin** — applies the same math as
+   [`SERVO_SET_COMPLIANCE`](#servo_set_compliance) `PIN=`
+   (`pin_mass = mass·(1 − (f_b/f_peak)²)`), seeding the mode's damping
+   at the first `ZETA_COARSE` value.
+3. **Coarse `ZETA` staircase** — dwells a constant tone at `f_b` and
+   steps `ZETA_COARSE` via the [`SERVO_SWEEP_PIN`](#servo_sweep_pin)
+   machinery, picking the settled pin-residual minimum.
+4. **Fine `ZETA` staircase** — 5 log-spaced values spanning
+   `winner/1.6 … winner·1.6` refine it; the fine winner is applied to
+   that mode's `pin_zeta`.
+
+After every mode a **single `LEAD` staircase** (`LEAD_VALUES`) runs on
+the **lowest-frequency tuned mode** and its winner is applied globally:
+`pin_lead_us` is a whole-model scalar, and the slowest mode advances the
+most degrees per microsecond, so it resolves the phase lead the finest.
+
+The tuned model is written as a fresh timestamped profile (the same
+writer [`SERVO_SET_COMPLIANCE`](#servo_set_compliance) uses) and left
+live until `RESTART`; any failure restores the pre-tune model and
+reports the partial results. The summary prints a per-mode table (`f_b`,
+`f_peak`, `zeta`, residual µm), the lead and its residual, and the
+ready-to-run `SERVO_SET_COMPLIANCE … X_ZETA=… Y_ZETA=… PIN_LEAD_US=…`
+line (per-mode `X_ZETA`/`Y_ZETA` spelling) for the pin, a ready-to-paste
+planner [`mode_inverse` snippet](#planner-mode_inverse-config) per mode
+(`frequency_hz=f_b`, `damping_ratio=` the fine-ladder belt ζ), plus the
+reminder to point
+`[ethercat_node] dynamics_profile` at the written TOML to keep it. Params:
+`MODES` (XY|X|Y) `DWELL` (s, 3) `AMPLITUDE` (mm, ladder tone, 0.01; config `pin_sweep_amplitude`) `MEASURE_AMPLITUDE` (mm, identification sweep, 0.02; config `compliance_amplitude`) `LEAD_VALUES`
+(`0,150,300,450,600`) `ZETA_COARSE` (`0.02,0.035,0.05,0.08,0.12,0.2,0.3`)
+`X_FREQ` `Y_FREQ` `X_PEAK` `Y_PEAK` (Hz, skip a mode's measurement)
+`NAME` (pin_tune) `PROFILE`.
+
 #### SERVO_CALIBRATE_INERTIA_RATIO
 Step 2 of tuning: identify the load inertia and print the recommended C00.06.
 `TORQUE_NM` and `INERTIA_KGM2` are **required** (config or param). On
@@ -619,6 +931,9 @@ Schemas: [servo-cal-contracts.md](servo-cal-contracts.md).
 | `SERVO_CALIBRATE_GAINS` | `servo-cal analyze` | run dir + `results.json` verdict (highest clean gain step); `APPLY=1` also writes + verifies |
 | `SERVO_SWEEP_INERTIA` | `servo-cal analyze` | run dir + `results.json` (no automated pick, so `APPLY=1` always errors) |
 | `SERVO_SWEEP_ACCEL` | `servo-cal analyze` | run dir + `results.json` verdict (max non-railing accel); `APPLY=1` verifies at the recommended accel (no SDO write) |
+| `SERVO_SWEEP_PIN` | `servo-cal analyze` | run dir + `results.json` (per-step settled pin-residual magnitude; prints the `value → µm` table + winning `SERVO_SET_COMPLIANCE` line; nothing applied) |
+| `SERVO_COMPARE_PIN` | `servo-cal analyze` (dashboard-side, on demand) | run dir + one ordinary step per swept value (`.scap` capture + accel CSV, named for the value); charted like a pin sweep — following-error PSD + toolhead accel PSD, one trace per value; one invocation is one run (re-using `NAME` never merges); nothing applied |
+| `SERVO_TUNE_PIN` | `servo-cal analyze` (per staircase) | run dir(s) + tuned `dynamics_<name>_<stamp>.toml` (per-mode coarse→fine `ZETA` + shared `LEAD` staircases; model stays live until RESTART; restores pre-tune model on failure) |
 | `SERVO_FIT_DYNAMICS`, `SERVO_CALIBRATE_INERTIA_RATIO` | `servo-cal fit` | run dir + `~/printer_data/config/servo_dynamics/dynamics_<name>_<stamp>.toml` + C00.06 |
 | `SERVO_TUNE_DYNAMICS` | `servo-cal fit --response ferr` (per capture) | run dir + tuned `dynamics_<name>_<stamp>.toml` when a pass beats the baseline (search is host-side; tuned model stays live until RESTART) |
 | `SERVO_MEASURE_INERTIA` | — | run dir + `.scap` capture only (the building block behind the fit commands) |
@@ -635,3 +950,68 @@ dashboard; `--drive` restricts to one drive in a multi-drive capture, `--csv`
 exports samples. The four gain/inertia/refine/accel sweep-report scripts and
 the fit-dynamics wrapper script were deleted — their metrics and verdict logic
 moved into `servo-cal`.
+
+## Capture retention / disk budget
+
+Run directories accumulate under `<captures_root>`
+(`~/printer_data/logs/servo_captures` on the bench). Captures are now
+zstd-compressed **at write time** — kalico's capture writer streams each
+`step_<name>.scap.zst` through a zstd encoder as it is recorded, so no bulk
+back-compression pass runs over fresh runs (the old compress-later batch job
+saturated the memory bus and tripped RT frame faults). `scripts/servo-capture-prune`
+keeps the tree within a byte budget and back-compresses only any **legacy raw
+`*.scap`** left from before inline compression; `install.sh` installs it as
+`servo-capture-prune.service` (oneshot, `Nice=19` + `IOSchedulingClass=idle`)
+driven by `servo-capture-prune.timer` (`OnCalendar=daily`, `OnBootSec=15min`,
+`Persistent=true`).
+
+Policy, applied in order every run:
+
+1. **Back-compress legacy raw payloads.** New captures are already
+   `*.scap.zst`, so this step only touches legacy raw `*.scap` (already-`.zst`
+   files are skipped). For any run dir whose newest file is older than
+   `--cold-age-hours` (default **48h**), each remaining raw `*.scap` is
+   compressed in place with `zstd -6 --rm` (bus-throttled; see the unit) to
+   `*.scap.zst`. Small analysis artifacts (`manifest.json`, `results.json`,
+   `plot_series.json`, …) are left readable so the dashboard's run list and
+   plots keep working for compressed runs.
+2. **Budget prune.** While the total exceeds `--budget-gib` (default **8 GiB**),
+   the oldest whole run dir (ordered by newest-file mtime) is deleted,
+   oldest-first.
+3. **Min-keep floor.** Nothing newer than `--min-keep-hours` (default **24h**)
+   is ever deleted. If the budget cannot be met without deleting a dir inside
+   that window, the prune pass refuses — it deletes **nothing** and exits
+   nonzero with a loud message (so the timer run is marked failed and the
+   captures are left intact for you to clear space manually).
+
+`--dry-run` prints the full plan (compressions + deletions) and modifies
+nothing.
+
+### Changing the budget
+
+Edit the `ExecStart` line in the installed unit
+(`~/servo-cal/servo-capture-prune.service`) to append the flag, e.g.
+`--budget-gib 20`, then `sudo systemctl daemon-reload`. To make it permanent,
+edit `service/servo-capture-prune.service` in this repo and re-run
+`./install.sh`. Run it by hand any time with:
+
+```sh
+~/servo-cal/servo-capture-prune --root ~/printer_data/logs/servo_captures --dry-run
+```
+
+### Re-analyzing a compressed capture
+
+No decompression step is needed. `servo-cal` (and the dashboard it serves)
+detect zstd by the frame magic and decode `.scap.zst` transparently, so
+`analyze`, `fit`, and the strain re-fit read compressed captures directly:
+
+```sh
+servo-cal analyze run_dir            # reads step_*.scap.zst in place
+```
+
+If you want a raw `.scap` for the standalone `scripts/servo_capture.py`
+inspector (which still expects raw bytes), decompress a copy by hand:
+
+```sh
+zstd -d run_dir/step_foo.scap.zst    # -> run_dir/step_foo.scap
+```

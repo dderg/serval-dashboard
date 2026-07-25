@@ -104,6 +104,22 @@ if [ "$INSTALL_SERVICE" -eq 1 ]; then
     sudo systemctl enable "$SERVICE_HOME/servo-cal.service"
     sudo systemctl restart servo-cal
     systemctl status servo-cal --no-pager -n 5
+
+    # servo capture retention: prune script + daily/boot timer
+    CAPTURES_DIR="$HOME/printer_data/logs/servo_captures"
+    captures_dir_sed=$(escape_sed "$CAPTURES_DIR")
+    cp "$ROOT/scripts/servo-capture-prune" "$SERVICE_HOME/servo-capture-prune"
+    chmod +x "$SERVICE_HOME/servo-capture-prune"
+    sed -e "s|@SERVO_CAL_USER@|$user_sed|g" \
+        -e "s|@SERVO_CAL_HOME@|$service_home_sed|g" \
+        -e "s|@SERVO_CAPTURES_DIR@|$captures_dir_sed|g" \
+        "$ROOT/service/servo-capture-prune.service" \
+        > "$SERVICE_HOME/servo-capture-prune.service"
+    cp "$ROOT/service/servo-capture-prune.timer" \
+        "$SERVICE_HOME/servo-capture-prune.timer"
+    sudo systemctl enable "$SERVICE_HOME/servo-capture-prune.service"
+    sudo systemctl enable --now "$SERVICE_HOME/servo-capture-prune.timer"
+    systemctl status servo-capture-prune.timer --no-pager -n 5
 fi
 
 cat <<EOF

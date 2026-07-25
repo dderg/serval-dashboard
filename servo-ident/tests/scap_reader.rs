@@ -37,6 +37,32 @@ fn reads_per_drive_channels_and_drops_partial_record() {
 }
 
 #[test]
+fn zstd_compressed_parses_identically_to_raw() {
+    // A capture compressed with zstd (as kalico writes `.scap.zst` inline)
+    // must decode to exactly the same records as the raw bytes, detected by
+    // the zstd magic and not by any file extension.
+    let raw = synthetic(2);
+    let compressed = zstd::encode_all(&raw[..], 3).unwrap();
+    assert_eq!(&compressed[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+    let from_raw = Scap::from_bytes(&raw).unwrap();
+    let from_zstd = Scap::from_bytes(&compressed).unwrap();
+    assert_eq!(from_zstd.n_records, from_raw.n_records);
+    assert_eq!(from_zstd.drive_names(), from_raw.drive_names());
+    assert_eq!(
+        from_zstd.read_i64(0, "following_error").unwrap(),
+        from_raw.read_i64(0, "following_error").unwrap()
+    );
+    assert_eq!(
+        from_zstd.read_i64(1, "following_error").unwrap(),
+        from_raw.read_i64(1, "following_error").unwrap()
+    );
+    assert_eq!(
+        from_zstd.read_i64(0, "cycle_index").unwrap(),
+        from_raw.read_i64(0, "cycle_index").unwrap()
+    );
+}
+
+#[test]
 fn rejects_unsupported_version() {
     assert!(Scap::from_bytes(&synthetic(3)).is_err());
 }

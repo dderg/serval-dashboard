@@ -12,7 +12,7 @@ One experiment (one command invocation) = one directory:
 ```
 <captures_root>/<tag>_<YYYYmmdd_HHMMSS>/
   manifest.json                 # klippy, written before the first stroke
-  step_<step>.scap              # one per step
+  step_<step>.scap.zst          # one per step (zstd-compressed at write time)
   step_<step>_accel.csv         # optional, next to its step
   results.json                  # servo-cal analyze
   plot_series.json              # servo-cal analyze
@@ -41,7 +41,7 @@ One experiment (one command invocation) = one directory:
              "swept": {"position": 880, "speed": 550, "integral": 2273},
              "applied": [{"servo": "motor_a", "addr": "0x2001.0x01",
                           "type": "u16", "value": 880}],
-             "capture": "step_p880_s550_i2273.scap",
+             "capture": "step_p880_s550_i2273.scap.zst",
              "accel": "step_p880_s550_i2273_accel.csv"}],
   "ambient": {
     "journal_params": {"motor_a": {"0x2001.0x31": 2}},

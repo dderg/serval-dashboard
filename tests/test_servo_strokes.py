@@ -355,3 +355,93 @@ def test_pattern_reach_summary_reports_triangular_segments():
     assert "1 of 2 pattern segments run triangular" in summary
     fast = servo_strokes.pattern_reach_summary([moves[1]], 300.0)
     assert fast == "all 1 pattern segments reach 300mm/s"
+
+
+class _FakePrepRail:
+    def __init__(self, name):
+        self._name = name
+
+    def get_name(self):
+        return self._name
+
+    def get_steppers(self):
+        return []
+
+    def get_range(self):
+        return (0.0, 200.0)
+
+
+class _FakeEnableLine:
+    def __init__(self, enabled):
+        self._enabled = enabled
+
+    def is_motor_enabled(self):
+        return self._enabled
+
+
+class _FakeStepperEnable:
+    def __init__(self, lines):
+        self._lines = lines
+        self.enable_groups = []
+
+    def lookup_enable(self, name):
+        return self._lines[name]
+
+    def motor_enable_group(self, names):
+        self.enable_groups.append(list(names))
+
+
+def _prep_setup(homed, enabled_by_name):
+    from fakes import FakePrinter, FakeToolhead
+
+    kin = FakeKin(
+        [_FakePrepRail("axis x"), _FakePrepRail("axis y")],
+        coupled_xy=True,
+        limits=(
+            [(0.0, 200.0), (0.0, 200.0), (1.0, -1.0)]
+            if homed
+            else [(1.0, -1.0)] * 3
+        ),
+        get_status_ranges=[(0.0, 200.0)] * 3,
+    )
+    se = _FakeStepperEnable(
+        {n: _FakeEnableLine(v) for n, v in enabled_by_name.items()}
+    )
+    printer = FakePrinter(
+        objects={
+            "toolhead": FakeToolhead(kin=kin),
+            "stepper_enable": se,
+        }
+    )
+    return printer, se
+
+
+def test_prep_reenables_parked_servo_lane_when_homed():
+    # Servo lanes keep homing across M84/idle-timeout, so prep skips G28 -
+    # it must still re-energize torque or the following buzz is rejected
+    # by the endpoint (drive not operation-enabled).
+    printer, se = _prep_setup(
+        homed=True, enabled_by_name={"axis x": False, "axis y": True}
+    )
+    gcode = FakeGcode()
+    servo_strokes.prep(printer, gcode, "X", 0)
+    assert se.enable_groups == [["axis x", "axis y"]]
+    (script,) = gcode.scripts
+    assert "G28" not in script
+
+
+def test_prep_skips_enable_group_when_all_motors_energized():
+    printer, se = _prep_setup(
+        homed=True, enabled_by_name={"axis x": True, "axis y": True}
+    )
+    servo_strokes.prep(printer, FakeGcode(), "X", 0)
+    assert se.enable_groups == []
+
+
+def test_prep_homes_unhomed_axis_without_enable_group():
+    printer, se = _prep_setup(homed=False, enabled_by_name={})
+    gcode = FakeGcode()
+    servo_strokes.prep(printer, gcode, "X", 0)
+    assert se.enable_groups == []
+    (script,) = gcode.scripts
+    assert script.splitlines()[0] == "G28 X"

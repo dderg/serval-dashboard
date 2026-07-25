@@ -84,12 +84,16 @@ class FakeEngine(_FakeEngine):
         super().__init__(sdo_read=(2, 7))
         self.dynamics_calls = []
         self.ff_lead_calls = []
+        self.buzzes = []
 
     def set_dynamics_model(self, *args):
         self.dynamics_calls.append(args)
 
     def set_ff_lead(self, handle, slot, lead_ns):
         self.ff_lead_calls.append((handle, slot, lead_ns))
+
+    def resonance_buzz(self, *args):
+        self.buzzes.append(args)
 
 
 def _motor(name, node_name, chain_index, invert=False):
@@ -264,6 +268,7 @@ def make_calibration(
 
     sc.fake_ferr_queue = []
     sc.fake_flags_by_step = {}
+    sc.fake_compliance_by_step = {}
     sc.fake_rms_fn = quadratic_rms()
     sc.fake_coef_hints = {
         "mass": (0.0, 0.0),
@@ -285,6 +290,7 @@ def make_calibration(
                 {
                     "name": s["name"],
                     "flags": sc.fake_flags_by_step.get(s["name"], []),
+                    "compliance": sc.fake_compliance_by_step.get(s["name"]),
                 }
                 for s in manifest["steps"]
             ]
@@ -300,9 +306,9 @@ def make_calibration(
                 payload = sc.fake_ferr_queue.pop(0)
             else:
                 engine = sc.printer.lookup_object("motion_engine")
-                _h, _frame, mass, viscous, coulomb, _ps, _ds = (
-                    engine.dynamics_calls[-1]
-                )
+                _call = engine.dynamics_calls[-1]
+                _h, _frame, mass, viscous, coulomb, _comp = _call[:6]
+                _ds = _call[-1]
                 lead_s = (
                     engine.ff_lead_calls[-1][2] * 1e-9
                     if engine.ff_lead_calls
@@ -503,7 +509,7 @@ def test_tune_dynamics_already_optimal_converges_and_writes_baseline():
     assert prof["viscous"] == pytest.approx(BASELINE_VISCOUS, rel=0.06)
     assert prof["coulomb"] == pytest.approx(BASELINE_COULOMB, rel=0.06)
     # winner is streamed and left live
-    _h, _f, mass, viscous, coulomb, _ps, _ds = engine.dynamics_calls[-1]
+    _h, _f, mass, viscous, coulomb, _comp = engine.dynamics_calls[-1][:6]
     assert mass == pytest.approx(prof["mass"])
     assert viscous == pytest.approx(prof["viscous"])
     assert coulomb == pytest.approx(prof["coulomb"])
@@ -568,7 +574,7 @@ def test_tune_dynamics_torque_rail_aborts_and_restores_baseline():
     sc.fake_flags_by_step["tune_r0"] = ["torque_saturated"]
     with pytest.raises(RuntimeError, match="torque rail"):
         sc.cmd_SERVO_TUNE_DYNAMICS(FakeGcmd())
-    _h, _f, mass, _v, _c, _ps, _ds = engine.dynamics_calls[-1]
+    _h, _f, mass, _v, _c, _comp = engine.dynamics_calls[-1][:6]
     assert mass == pytest.approx(BASELINE_MASS)
 
 
@@ -958,6 +964,291 @@ def test_servo_refine_dynamics_command_is_removed():
     assert not hasattr(sc, "cmd_SERVO_REFINE_DYNAMICS")
 
 
+# ---- SERVO_SET_COMPLIANCE ------------------------------------------------
+
+
+@requires_tomllib
+def test_set_compliance_writes_v7_profile_and_streams_it():
+    sc, _gcode, _path = make_calibration()
+    gcmd = FakeGcmd({"X_FREQ": 190.0, "Y_FREQ": 120.0})
+    sc.cmd_SERVO_SET_COMPLIANCE(gcmd)
+    engine = sc.printer.lookup_object("motion_engine")
+    assert len(engine.dynamics_calls) == 1
+    _h, _f, _m, _v, _c, compliance = engine.dynamics_calls[-1][:6]
+    import math as _math
+
+    cx = 1.0 / (2.0 * _math.pi * 190.0) ** 2
+    cy = 1.0 / (2.0 * _math.pi * 120.0) ** 2
+    assert compliance == pytest.approx([cx, cy])
+    node = sc.printer.lookup_object("ethercat_node xy_drives")
+    out_path = node.get_live_dynamics_profile()
+    assert out_path and os.path.exists(out_path)
+    with open(out_path) as f:
+        written = servo_calibration.parse_dynamics_profile(f.read())
+    assert written["compliance"] == pytest.approx([cx, cy])
+    assert written["ff_lead_us"] == 250.0  # baseline lead passes through
+    assert written["mass"] == BASELINE_MASS
+
+
+@requires_tomllib
+def test_set_compliance_partial_update_keeps_other_mode():
+    sc, _gcode, _path = make_calibration()
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"X_FREQ": 190.0, "Y_FREQ": 120.0}))
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"Y_FREQ": 0.0}))
+    engine = sc.printer.lookup_object("motion_engine")
+    _h, _f, _m, _v, _c, compliance = engine.dynamics_calls[-1][:6]
+    import math as _math
+
+    cx = 1.0 / (2.0 * _math.pi * 190.0) ** 2
+    assert compliance == pytest.approx([cx, 0.0])
+
+
+@requires_tomllib
+def test_set_compliance_rejects_soft_and_missing_frequencies():
+    sc, _gcode, _path = make_calibration()
+    with pytest.raises(RuntimeError, match=">= 20 Hz"):
+        sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"X_FREQ": 10.0}))
+    with pytest.raises(RuntimeError, match="X_FREQ"):
+        sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == []
+
+
+@requires_tomllib
+def test_set_compliance_pin_writes_v8_and_streams_pin_mass():
+    sc, _gcode, _path = make_calibration()
+    gcmd = FakeGcmd(
+        {
+            "Y_FREQ": 131.5,
+            "PIN": "Y",
+            "Y_PEAK": 215.8,
+            "ZETA": 0.02,
+            "PIN_LEAD_US": 1100.0,
+        }
+    )
+    sc.cmd_SERVO_SET_COMPLIANCE(gcmd)
+    engine = sc.printer.lookup_object("motion_engine")
+    call = engine.dynamics_calls[-1]
+    # 11-wide: handle, frame, mass, viscous, coulomb, compliance,
+    # pin_mass, pin_zeta, pin_lead_us, pair_slots, direction_split
+    assert len(call) == 11
+    pin_mass, pin_zeta, pin_lead_us = call[6], call[7], call[8]
+    fraction = 1.0 - (131.5 / 215.8) ** 2
+    expected = BASELINE_MASS[1] * fraction
+    assert pin_mass == pytest.approx([0.0, expected])
+    assert pin_zeta == pytest.approx([0.0, 0.02])
+    assert pin_lead_us == pytest.approx(1100.0)
+    assert any("y: pinned" in r for r in gcmd.responses)
+    node = sc.printer.lookup_object("ethercat_node xy_drives")
+    out_path = node.get_live_dynamics_profile()
+    with open(out_path) as f:
+        text = f.read()
+    assert "version = 8" in text
+    written = servo_calibration.parse_dynamics_profile(text)
+    assert written["pin_mass"] == pytest.approx([0.0, expected])
+    assert written["pin_zeta"] == pytest.approx([0.0, 0.02])
+    assert written["pin_lead_us"] == pytest.approx(1100.0)
+
+
+@requires_tomllib
+def test_set_compliance_pin_without_peak_errors():
+    sc, _gcode, _path = make_calibration()
+    with pytest.raises(RuntimeError, match="SERVO_MEASURE_COMPLIANCE"):
+        sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"Y_FREQ": 120.0, "PIN": "Y"}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == []
+
+
+@requires_tomllib
+def test_set_compliance_pin_without_compliance_errors():
+    sc, _gcode, _path = make_calibration()
+    with pytest.raises(RuntimeError, match="compliance"):
+        sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "Y", "Y_PEAK": 215.8}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == []
+
+
+@requires_tomllib
+def test_set_compliance_pin_peak_below_notch_errors():
+    sc, _gcode, _path = make_calibration()
+    with pytest.raises(RuntimeError, match="must sit above the notch"):
+        sc.cmd_SERVO_SET_COMPLIANCE(
+            FakeGcmd({"Y_FREQ": 131.5, "PIN": "Y", "Y_PEAK": 120.0})
+        )
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == []
+
+
+@requires_tomllib
+def test_set_compliance_pin_zero_clears_but_keeps_compliance():
+    sc, _gcode, _path = make_calibration()
+    sc.cmd_SERVO_SET_COMPLIANCE(
+        FakeGcmd(
+            {
+                "X_FREQ": 190.0,
+                "Y_FREQ": 120.0,
+                "PIN": "XY",
+                "X_PEAK": 260.0,
+                "Y_PEAK": 175.0,
+            }
+        )
+    )
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "0"}))
+    engine = sc.printer.lookup_object("motion_engine")
+    call = engine.dynamics_calls[-1]
+    compliance, pin_mass, pin_zeta = call[5], call[6], call[7]
+    import math as _math
+
+    cx = 1.0 / (2.0 * _math.pi * 190.0) ** 2
+    cy = 1.0 / (2.0 * _math.pi * 120.0) ** 2
+    assert compliance == pytest.approx([cx, cy])
+    assert pin_mass == pytest.approx([0.0, 0.0])
+    assert pin_zeta == pytest.approx([0.0, 0.0])
+    node = sc.printer.lookup_object("ethercat_node xy_drives")
+    with open(node.get_live_dynamics_profile()) as f:
+        text = f.read()
+    assert "version = 7" in text  # no pins -> back to v7
+    written = servo_calibration.parse_dynamics_profile(text)
+    assert written["compliance"] == pytest.approx([cx, cy])
+    assert written["pin_mass"] == pytest.approx([0.0, 0.0])
+
+
+@requires_tomllib
+def test_set_compliance_sequential_pins_compose():
+    sc, _gcode, _path = make_calibration()
+    sc.cmd_SERVO_SET_COMPLIANCE(
+        FakeGcmd(
+            {
+                "X_FREQ": 190.0,
+                "Y_FREQ": 120.0,
+                "PIN": "X",
+                "X_PEAK": 260.0,
+            }
+        )
+    )
+    # PIN=Y mutates only Y; X's pin from the previous call must persist.
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "Y", "Y_PEAK": 200.0}))
+    engine = sc.printer.lookup_object("motion_engine")
+    pin_mass = engine.dynamics_calls[-1][6]
+    pin_x = BASELINE_MASS[0] * (1.0 - (190.0 / 260.0) ** 2)
+    pin_y = BASELINE_MASS[1] * (1.0 - (120.0 / 200.0) ** 2)
+    assert pin_mass == pytest.approx([pin_x, pin_y])
+
+
+@requires_tomllib
+def test_set_compliance_unpin_one_mode_via_clear_and_repin():
+    sc, _gcode, _path = make_calibration()
+    sc.cmd_SERVO_SET_COMPLIANCE(
+        FakeGcmd(
+            {
+                "X_FREQ": 190.0,
+                "Y_FREQ": 120.0,
+                "PIN": "XY",
+                "X_PEAK": 260.0,
+                "Y_PEAK": 175.0,
+            }
+        )
+    )
+    # The documented unpin path: PIN=0 clears all, then re-pin Y only.
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "0"}))
+    sc.cmd_SERVO_SET_COMPLIANCE(FakeGcmd({"PIN": "Y", "Y_PEAK": 200.0}))
+    engine = sc.printer.lookup_object("motion_engine")
+    pin_mass = engine.dynamics_calls[-1][6]
+    pin_y = BASELINE_MASS[1] * (1.0 - (120.0 / 200.0) ** 2)
+    assert pin_mass == pytest.approx([0.0, pin_y])
+
+
+# ---- SERVO_MEASURE_COMPLIANCE --------------------------------------------
+
+
+def _fake_notch(mode, f_notch, f_peak):
+    import math as _math
+
+    return {
+        "mode": mode,
+        "segments": 12,
+        "f_notch_hz": f_notch,
+        "notch_depth_db": 22.0,
+        "flank_coherence": 0.97,
+        "compliance_s2": 1.0 / (2.0 * _math.pi * f_notch) ** 2,
+        "f_peak_hz": f_peak,
+    }
+
+
+@requires_tomllib
+def test_measure_compliance_buzzes_each_mode_and_prints_the_apply_line():
+    sc, _gcode, _path = make_calibration()
+    sc.fake_compliance_by_step = {
+        "x": _fake_notch("x", 214.0, 260.0),
+        "y": _fake_notch("y", 141.0, 175.0),
+    }
+    gcmd = FakeGcmd({})
+    sc.cmd_SERVO_MEASURE_COMPLIANCE(gcmd)
+    engine = sc.printer.lookup_object("motion_engine")
+    # One sweep per mode; both slots participate on CoreXY.
+    assert len(engine.buzzes) == 2
+    (_h1, mask_x, sign_x, fs1, fe1, amp, _dur, _ramp) = engine.buzzes[0]
+    (_h2, mask_y, sign_y, *_rest) = engine.buzzes[1]
+    assert mask_x == 0b11 and mask_y == 0b11
+    # x mode: both frame entries positive -> in-phase; y mode: motor_b
+    # column is negative -> anti-phase on slot 1.
+    assert sign_x == 0
+    assert sign_y == 0b10
+    assert fs1 == 60_000 and fe1 == 320_000
+    assert amp == 20_000  # 0.02 mm in nm
+    # Measurement only: nothing streamed, the apply line is printed.
+    assert engine.dynamics_calls == []
+    apply_lines = [
+        r
+        for r in gcmd.responses
+        if (
+            "SERVO_SET_COMPLIANCE X_FREQ=214.0 X_PEAK=260.0 "
+            "Y_FREQ=141.0 Y_PEAK=175.0"
+        )
+        in r
+    ]
+    assert apply_lines, gcmd.responses
+    report = "\n".join(gcmd.responses)
+    assert "type: mode_inverse" in report
+    assert "frequency_hz: 214.0" in report
+    assert "frequency_hz: 141.0" in report
+    # measure-only: belt zeta is a marked placeholder, not a number
+    assert "damping_ratio: <belt zeta" in report
+    assert "dynamics_profile" in apply_lines[-1]  # persistence hint
+    manifest = _manifest_for(sc)
+    assert manifest["experiment"] == "compliance"
+    assert manifest["stroke_plan"]["modes"] == ["x", "y"]
+    assert [s["name"] for s in manifest["steps"]] == ["x", "y"]
+
+
+@requires_tomllib
+def test_measure_compliance_flagged_steps_warn_instead_of_recommending():
+    sc, _gcode, _path = make_calibration()
+    sc.fake_compliance_by_step = {
+        "x": _fake_notch("x", 214.0, 260.0),
+        "y": _fake_notch("y", 141.0, 175.0),
+    }
+    sc.fake_flags_by_step = {"y": ["compliance_notch_shallow"]}
+    gcmd = FakeGcmd({})
+    sc.cmd_SERVO_MEASURE_COMPLIANCE(gcmd)
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == []
+    warn = [r for r in gcmd.responses if "flagged steps" in r]
+    assert warn and "compliance_notch_shallow" in warn[-1]
+    assert "re-measure before applying" in warn[-1]
+
+
+@requires_tomllib
+def test_measure_compliance_single_mode():
+    sc, _gcode, _path = make_calibration()
+    sc.fake_compliance_by_step = {"y": _fake_notch("y", 141.0, 175.0)}
+    sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({"MODE": "Y"}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert len(engine.buzzes) == 1
+    manifest = _manifest_for(sc)
+    assert [s["name"] for s in manifest["steps"]] == ["y"]
+
+
 def _run_dir_for(sc):
     return os.path.dirname(
         sc.printer.lookup_object("servo_capture").starts[0][0]
@@ -974,7 +1265,7 @@ def test_tune_dynamics_resume_replays_all_rounds_without_capturing():
     with open(tune1["profile"], "rb") as f:
         prof1 = tomllib.load(f)
 
-    sc2, _gcode2, _path2 = make_calibration()
+    sc2, gcode2, _path2 = make_calibration()
     # deliberately DIFFERENT fake bench: a full replay must never capture,
     # so the resumed tune has to land on the exact same profile anyway
     sc2.fake_rms_fn = quadratic_rms(mass_opt=[0.014, 0.022])
@@ -989,6 +1280,23 @@ def test_tune_dynamics_resume_replays_all_rounds_without_capturing():
     with open(profiles[0], "rb") as f:
         prof2 = tomllib.load(f)
     assert prof2["mass"] == pytest.approx(prof1["mass"])
+    # A capture-free run is the one legitimate zero-step run: it says where
+    # its evidence came from instead, and there is nothing to analyze.
+    run_dirs = [
+        os.path.join(sc2.captures_root, d)
+        for d in os.listdir(sc2.captures_root)
+        if os.path.isdir(os.path.join(sc2.captures_root, d))
+    ]
+    assert len(run_dirs) == 1
+    with open(os.path.join(run_dirs[0], "manifest.json")) as f:
+        resumed = json.load(f)
+    assert resumed["steps"] == []
+    assert resumed["replayed_from"] == old_dir
+    assert not [
+        s
+        for s in gcode2.scripts
+        if isinstance(s, tuple) and s[0] == "RUN" and s[1][1] == "analyze"
+    ]
 
 
 @requires_tomllib
@@ -1037,3 +1345,61 @@ def test_tune_dynamics_resume_rejects_non_tune_run_dir():
     bogus = tempfile.mkdtemp()
     with pytest.raises(RuntimeError, match="manifest.json"):
         sc.cmd_SERVO_TUNE_DYNAMICS(FakeGcmd(TERMS="MASS", RESUME=bogus))
+
+
+@requires_tomllib
+def test_measure_compliance_clears_pin_for_the_sweep_and_restores():
+    # Identification must see the raw plant: a live pin cancels torque
+    # exactly around f_b and drags the notch estimate off-frequency
+    # (bench: 128.8 -> "123.7"). The sweep streams a pin-cleared model
+    # first and restores the pinned one afterwards.
+    sc, _gcode, path = make_calibration()
+    with open(path, "w") as f:
+        f.write(
+            BASELINE_TOML.replace("version = 6", "version = 8")
+            + "compliance = [1.0e-5, 1.5e-5]\n"
+            + "pin_mass = [0.010, 0.012]\n"
+            + "pin_zeta = [0.05, 0.06]\n"
+            + "pin_lead_us = 600.0\n"
+        )
+    sc.fake_compliance_by_step = {"y": _fake_notch("y", 141.0, 175.0)}
+    sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({"MODE": "Y"}))
+    engine = sc.printer.lookup_object("motion_engine")
+    # Exactly two streams: pin-cleared for the sweep, pinned restored after.
+    assert len(engine.dynamics_calls) == 2
+    cleared, restored = engine.dynamics_calls
+    assert cleared[6] == [0.0, 0.0], "pin_mass must be cleared for the sweep"
+    assert cleared[7] == [0.0, 0.0]
+    assert restored[6] == [0.010, 0.012], "pinned model must be restored"
+    assert restored[7] == [0.05, 0.06]
+
+
+@requires_tomllib
+def test_measure_compliance_without_a_profile_sweeps_with_nothing_to_clear():
+    # No dynamics_profile configured means nothing is pinned, so there is
+    # no baseline to clear and no model to restore - the sweep still runs.
+    sc, _gcode, _path = make_calibration(configure_profile=False)
+    sc.fake_compliance_by_step = {"y": _fake_notch("y", 141.0, 175.0)}
+    sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({"MODE": "Y"}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == []
+
+
+@requires_tomllib
+def test_measure_compliance_refuses_to_sweep_behind_an_unreadable_profile():
+    # A configured-but-broken profile is NOT "nothing is pinned": sweeping
+    # anyway would run against whatever model is still live - a stale pin
+    # included - and hand back a contaminated f_b. Today the guarantee is
+    # direct (the pin-clear load refuses to treat a broken file as absent);
+    # before that it was incidental, resting on _begin_run happening to
+    # re-load the same profile two frames later. Pin the contract, not the
+    # accident: a bad baseline stops the command before it excites anything.
+    sc, gcode, path = make_calibration()
+    with open(path, "w") as f:
+        f.write("version = 8\nmass = [\n")
+    sc.fake_compliance_by_step = {"y": _fake_notch("y", 141.0, 175.0)}
+    with pytest.raises(RuntimeError, match="failed to load dynamics profile"):
+        sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({"MODE": "Y"}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == [], "must not stream behind a bad profile"
+    assert gcode.scripts == [], "must not buzz before validating the baseline"

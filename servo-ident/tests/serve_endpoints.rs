@@ -230,6 +230,66 @@ fn missing_run_is_404_with_reason_body() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// A pin comparison is an ordinary stepped run: the same
+/// `<captures_root>/<name>` layout every other experiment uses, one step per
+/// swept value carrying a drive capture and an accelerometer CSV. It has no
+/// manifest block and no route of its own.
+fn write_pin_compare_run(run_dir: &Path, tag: &str) {
+    std::fs::create_dir_all(run_dir).unwrap();
+    let manifest = serde_json::json!({
+        "version": 1,
+        "experiment": "pin_compare",
+        "command": format!("SERVO_COMPARE_PIN MODE=X PARAM=ZETA NAME={tag}"),
+        "tag": tag,
+        "axis": "X",
+        "steps": [
+            {
+                "name": "zeta0p005",
+                "capture": "step_zeta0p005.scap",
+                "swept": {"value": 0.005},
+                "accel": "accel_zeta0p005.csv",
+            },
+            {
+                "name": "zeta0p02",
+                "capture": "step_zeta0p02.scap",
+                "swept": {"value": 0.02},
+                "accel": "accel_zeta0p02.csv",
+            },
+        ],
+    });
+    std::fs::write(
+        run_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_pin_comparison_lists_and_serves_its_steps_like_any_other_run() {
+    let root = temp_dir("pin_compare");
+    write_pin_compare_run(&root.join("cmp_20260725_101500"), "cmp");
+    let port = spawn_server(root.clone());
+
+    let listed: Value = serde_json::from_str(&request(port, "GET", "/api/runs").body).unwrap();
+    let row = &listed[0];
+    assert_eq!(row["name"], Value::from("cmp_20260725_101500"));
+    assert_eq!(row["experiment"], Value::from("pin_compare"));
+    assert_eq!(row["tag"], Value::from("cmp"));
+    assert_eq!(row["axis"], Value::from("X"));
+    assert_eq!(row["has_results"], Value::Bool(false));
+
+    let resp = request(port, "GET", "/api/runs/cmp_20260725_101500/manifest");
+    assert_eq!(resp.status, 200);
+    let manifest: Value = serde_json::from_str(&resp.body).unwrap();
+    let steps = manifest["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0]["name"], Value::from("zeta0p005"));
+    assert_eq!(steps[0]["swept"]["value"], Value::from(0.005));
+    assert_eq!(steps[0]["accel"], Value::from("accel_zeta0p005.csv"));
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn directory_traversal_run_name_is_rejected() {
     let (root, _run_dirs) = demo_root("traversal");

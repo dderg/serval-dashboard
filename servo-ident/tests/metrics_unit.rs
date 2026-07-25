@@ -1,6 +1,8 @@
 use servo_ident::metrics::{
-    compute_metrics, motion_segments, target_motion_segments, torque_summary, DriveSeries,
+    compute_metrics, drive_series, motion_segments, target_motion_segments, torque_summary,
+    DriveSeries,
 };
+use servo_ident::scap::Scap;
 
 fn series_from(ferr: Vec<i64>, target: Vec<i64>, torque: Vec<i64>, flags: Vec<i64>) -> DriveSeries {
     let n = ferr.len();
@@ -14,6 +16,8 @@ fn series_from(ferr: Vec<i64>, target: Vec<i64>, torque: Vec<i64>, flags: Vec<i6
         flags,
         velocity_offset: None,
         torque_offset: None,
+        pin_res_re: None,
+        pin_res_im: None,
     }
 }
 
@@ -186,4 +190,115 @@ fn target_ripple_inside_the_settle_band_is_not_a_move() {
     let metrics = compute_metrics(&d, 50, 1400, fs, 0).unwrap();
     assert_eq!(metrics.moves.len(), 1);
     assert_eq!(metrics.moves[0].direction, 1);
+}
+
+const PIN_HEADER: &str = "{\"version\":2,\"cycle_ns\":250000,\"record_size\":33,\
+\"drives\":[{\"name\":\"d0\",\"counts_per_mm\":1000.0}],\
+\"channels\":[\
+{\"name\":\"cycle_index\",\"dtype\":\"u64\",\"offset\":0},\
+{\"name\":\"flags\",\"dtype\":\"u8\",\"offset\":8},\
+{\"name\":\"following_error\",\"dtype\":\"i32\",\"offset\":9},\
+{\"name\":\"target_counts\",\"dtype\":\"i32\",\"offset\":13},\
+{\"name\":\"position_actual\",\"dtype\":\"i32\",\"offset\":17},\
+{\"name\":\"torque_actual\",\"dtype\":\"i32\",\"offset\":21},\
+{\"name\":\"pin_res_re\",\"dtype\":\"f32\",\"offset\":25},\
+{\"name\":\"pin_res_im\",\"dtype\":\"f32\",\"offset\":29}]}";
+
+const NOPIN_HEADER: &str = "{\"version\":2,\"cycle_ns\":250000,\"record_size\":25,\
+\"drives\":[{\"name\":\"d0\",\"counts_per_mm\":1000.0}],\
+\"channels\":[\
+{\"name\":\"cycle_index\",\"dtype\":\"u64\",\"offset\":0},\
+{\"name\":\"flags\",\"dtype\":\"u8\",\"offset\":8},\
+{\"name\":\"following_error\",\"dtype\":\"i32\",\"offset\":9},\
+{\"name\":\"target_counts\",\"dtype\":\"i32\",\"offset\":13},\
+{\"name\":\"position_actual\",\"dtype\":\"i32\",\"offset\":17},\
+{\"name\":\"torque_actual\",\"dtype\":\"i32\",\"offset\":21}]}";
+
+fn pin_capture(re: &[f32], im: &[f32]) -> Vec<u8> {
+    assert_eq!(re.len(), im.len());
+    let mut b = PIN_HEADER.as_bytes().to_vec();
+    b.push(b'\n');
+    for k in 0..re.len() {
+        b.extend_from_slice(&(k as u64).to_le_bytes());
+        b.push(0u8);
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.extend_from_slice(&re[k].to_le_bytes());
+        b.extend_from_slice(&im[k].to_le_bytes());
+    }
+    b
+}
+
+fn nopin_capture(samples: usize) -> Vec<u8> {
+    let mut b = NOPIN_HEADER.as_bytes().to_vec();
+    b.push(b'\n');
+    for k in 0..samples {
+        b.extend_from_slice(&(k as u64).to_le_bytes());
+        b.push(0u8);
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.extend_from_slice(&0i32.to_le_bytes());
+        b.extend_from_slice(&0i32.to_le_bytes());
+    }
+    b
+}
+
+#[test]
+fn pin_residual_magnitude_and_phase_from_settled_tail() {
+    let cap = Scap::from_bytes(&pin_capture(&[0.1, 0.2, 3.0], &[0.1, 0.2, 4.0])).unwrap();
+    let s = drive_series(&cap, 0).unwrap();
+    let m = compute_metrics(&s, 50, 1400, cap.fs(), 0).unwrap();
+    let mag = m.pin_residual_mm.expect("magnitude present");
+    assert!((mag - 5.0).abs() < 1e-5, "mag={mag}");
+    let phase = m.pin_phase_deg.expect("phase present");
+    assert!((phase - 53.130_102).abs() < 1e-3, "phase={phase}");
+}
+
+#[test]
+fn pin_residual_none_when_channels_absent() {
+    let cap = Scap::from_bytes(&nopin_capture(3)).unwrap();
+    let s = drive_series(&cap, 0).unwrap();
+    assert!(s.pin_res_re.is_none() && s.pin_res_im.is_none());
+    let m = compute_metrics(&s, 50, 1400, cap.fs(), 0).unwrap();
+    assert!(m.pin_residual_mm.is_none());
+    assert!(m.pin_phase_deg.is_none());
+}
+
+#[test]
+fn pin_residual_none_when_all_samples_zero() {
+    let cap = Scap::from_bytes(&pin_capture(&[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0])).unwrap();
+    let s = drive_series(&cap, 0).unwrap();
+    assert!(s.pin_res_re.is_some() && s.pin_res_im.is_some());
+    let m = compute_metrics(&s, 50, 1400, cap.fs(), 0).unwrap();
+    assert!(m.pin_residual_mm.is_none());
+    assert!(m.pin_phase_deg.is_none());
+}
+
+#[test]
+fn pin_phase_suppressed_below_noise_floor() {
+    let cap = Scap::from_bytes(&pin_capture(&[0.0, 0.0, 5e-7], &[0.0, 0.0, 0.0])).unwrap();
+    let s = drive_series(&cap, 0).unwrap();
+    let m = compute_metrics(&s, 50, 1400, cap.fs(), 0).unwrap();
+    let mag = m.pin_residual_mm.expect("tiny magnitude still reported");
+    assert!((mag - 5e-7).abs() < 1e-12, "mag={mag}");
+    assert!(m.pin_phase_deg.is_none());
+}
+
+#[test]
+fn pin_residual_ignores_reset_trailing_zeros() {
+    // A model restore or pin reset racing the capture stop zeroes the
+    // demodulator; the settled-tail median must ignore those samples
+    // instead of reporting a fake 0.00 (which won bench staircases).
+    let re: Vec<f32> = (0..20).map(|k| if k < 16 { 3.0 } else { 0.0 }).collect();
+    let im: Vec<f32> = (0..20).map(|k| if k < 16 { 4.0 } else { 0.0 }).collect();
+    let cap = Scap::from_bytes(&pin_capture(&re, &im)).unwrap();
+    let s = drive_series(&cap, 0).unwrap();
+    let m = compute_metrics(&s, 50, 1400, cap.fs(), 0).unwrap();
+    let mag = m.pin_residual_mm.expect("magnitude present");
+    assert!(
+        (mag - 5.0).abs() < 1e-5,
+        "settled tail must ignore reset zeros: {mag}"
+    );
 }

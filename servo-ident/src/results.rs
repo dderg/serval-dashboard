@@ -57,10 +57,18 @@ pub struct ManifestSpatial {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ManifestMotor {
+    #[serde(default)]
+    pub max_torque_per_mille: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Manifest {
     #[serde(default)]
     pub version: i64,
     pub experiment: String,
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default)]
     pub tag: String,
     #[serde(default)]
@@ -79,6 +87,8 @@ pub struct Manifest {
     pub ff_lead_cycles: u64,
     #[serde(default)]
     pub spatial: Option<ManifestSpatial>,
+    #[serde(default)]
+    pub motors: Vec<ManifestMotor>,
     pub steps: Vec<Step>,
 }
 
@@ -130,6 +140,22 @@ pub struct DifferentialResult {
     pub modes: Vec<DifferentialMode>,
 }
 
+/// The locked-rotor belt anti-resonance per Cartesian mode: `f_notch_hz`
+/// is the frequency where no applied torque can move the rotor (the load
+/// is a tuned absorber), `compliance_s2 = 1/(2*pi*f_notch)^2` is the
+/// v7 dynamics-profile term it implies, and `f_peak_hz` is the coupled
+/// resonance just above it (sanity: peak > notch always).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ComplianceResult {
+    pub mode: String,
+    pub segments: usize,
+    pub f_notch_hz: f64,
+    pub notch_depth_db: f64,
+    pub flank_coherence: f64,
+    pub compliance_s2: f64,
+    pub f_peak_hz: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RingdownMode {
     pub freq_hz: f64,
@@ -169,6 +195,8 @@ pub struct StepResult {
     pub differential: Option<DifferentialResult>,
     #[serde(default)]
     pub ringdown: Option<RingdownResult>,
+    #[serde(default)]
+    pub compliance: Option<ComplianceResult>,
     pub flags: Vec<String>,
 }
 
@@ -238,6 +266,18 @@ pub struct PlotDifferential {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PlotCompliance {
+    pub freq_hz: Vec<f64>,
+    pub mag_db: Vec<f64>,
+    pub phase_deg: Vec<f64>,
+    pub coherence: Vec<f64>,
+    pub coherence_min: f64,
+    pub band: (f64, f64),
+    pub notch_hz: f64,
+    pub peak_hz: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct PlotRingdownTail {
     pub start_s: f64,
     pub value: Vec<f64>,
@@ -280,6 +320,8 @@ pub struct PlotStep {
     pub differential: Option<PlotDifferential>,
     #[serde(default)]
     pub ringdown: Option<PlotRingdown>,
+    #[serde(default)]
+    pub compliance: Option<PlotCompliance>,
     #[serde(default)]
     pub path: Option<PlotPath>,
     pub psd: PlotPsd,

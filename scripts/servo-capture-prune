@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""Disk-budget retention for servo captures.
+
+Policy (in order):
+
+1. Compress: for run dirs whose newest file mtime is older than COLD_AGE,
+   ``zstd -6 --rm`` each ``*.scap`` payload (already-``.zst`` skipped). Small
+   analysis artifacts (manifest.json, results.json, ...) stay readable so the
+   dashboard keeps working for compressed runs.
+2. Budget: while the captures root exceeds BUDGET_BYTES, delete the oldest
+   whole run dir (ordered by newest-file mtime), oldest first.
+   Nothing newer than MIN_KEEP_AGE is ever deleted; if the budget cannot be met
+   without touching those, the pass refuses (deletes nothing) and exits nonzero
+   with a loud message.
+
+The pure-python core (everything above ``main``) is importable and unit
+testable; the CLI is a thin wrapper.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+DEFAULT_BUDGET_GIB = 8.0
+DEFAULT_COLD_AGE_HOURS = 48.0
+DEFAULT_MIN_KEEP_HOURS = 24.0
+
+
+class PruneError(RuntimeError):
+    """Raised when the budget cannot be met without violating MIN_KEEP_AGE."""
+
+
+@dataclass
+class RunDir:
+    path: Path
+    newest_mtime: float
+    size_bytes: int
+
+
+@dataclass
+class CompressAction:
+    run: Path
+    scap: Path
+    before_bytes: int
+    after_bytes: int
+
+    @property
+    def saved_bytes(self) -> int:
+        return self.before_bytes - self.after_bytes
+
+
+@dataclass
+class PrunePlan:
+    compress: list[CompressAction] = field(default_factory=list)
+    delete: list[RunDir] = field(default_factory=list)
+    total_before: int = 0
+    total_after: int = 0
+    budget_bytes: int = 0
+    refused: bool = False
+    refusal_reason: str = ""
+
+
+def _iter_files(path: Path):
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            yield Path(root) / name
+
+
+def dir_size(path: Path) -> int:
+    total = 0
+    for f in _iter_files(path):
+        try:
+            total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def newest_mtime(path: Path) -> float:
+    newest = 0.0
+    for f in _iter_files(path):
+        try:
+            newest = max(newest, f.stat().st_mtime)
+        except OSError:
+            pass
+    if newest == 0.0:
+        try:
+            newest = path.stat().st_mtime
+        except OSError:
+            pass
+    return newest
+
+
+def scan_runs(root: Path) -> list[RunDir]:
+    """Enumerate the run dirs under ``root``."""
+    return [
+        RunDir(
+            path=child,
+            newest_mtime=newest_mtime(child),
+            size_bytes=dir_size(child),
+        )
+        for child in sorted(root.iterdir())
+        if child.is_dir()
+    ]
+
+
+def select_cold_runs(
+    runs: list[RunDir], cold_age_seconds: float, now: float
+) -> list[RunDir]:
+    cutoff = now - cold_age_seconds
+    return [r for r in runs if r.newest_mtime < cutoff]
+
+
+def scap_payloads(run_dir: Path) -> list[Path]:
+    """Raw capture payloads eligible for compression (skip already .zst)."""
+    out: list[Path] = []
+    for f in _iter_files(run_dir):
+        if f.name.endswith(".scap") and f.is_file():
+            out.append(f)
+    return sorted(out)
+
+
+def deletion_order(runs: list[RunDir]) -> list[RunDir]:
+    """Oldest-first by newest-file mtime."""
+    return sorted(runs, key=lambda r: r.newest_mtime)
+
+
+def plan_budget(
+    runs: list[RunDir],
+    budget_bytes: int,
+    min_keep_seconds: float,
+    now: float,
+    total_after_compress: int,
+) -> PrunePlan:
+    """Plan deletions to reach budget. Transactional: if the budget cannot be
+    met using only dirs older than MIN_KEEP_AGE, refuse (delete nothing)."""
+    plan = PrunePlan(
+        total_before=total_after_compress,
+        total_after=total_after_compress,
+        budget_bytes=budget_bytes,
+    )
+    if total_after_compress <= budget_bytes:
+        return plan
+
+    keep_cutoff = now - min_keep_seconds
+    remaining = total_after_compress
+    to_delete: list[RunDir] = []
+    for run in deletion_order(runs):
+        if remaining <= budget_bytes:
+            break
+        if run.newest_mtime >= keep_cutoff:
+            # This dir is protected; skip it and keep looking for older ones.
+            continue
+        to_delete.append(run)
+        remaining -= run.size_bytes
+
+    if remaining > budget_bytes:
+        plan.refused = True
+        plan.refusal_reason = (
+            "cannot reach budget of {budget} bytes without deleting run dirs "
+            "newer than MIN_KEEP_AGE; would still be at {remaining} bytes "
+            "after deleting every eligible dir".format(
+                budget=budget_bytes, remaining=remaining
+            )
+        )
+        plan.delete = []
+        plan.total_after = total_after_compress
+        return plan
+
+    plan.delete = to_delete
+    plan.total_after = remaining
+    return plan
+
+
+def _zstd_compress(scap: Path, dry_run: bool) -> int:
+    """Compress ``scap`` in place with ``zstd -6 --rm``. Returns new size.
+
+    Level 6, not 19: the RT endpoint faults on frame lateness from
+    memory-bus/SD contention that nice/ionice cannot bound (measured
+    2026-07-24: a zstd -19 pass tripped 8-42 us frame faults on an
+    otherwise idle machine). -6 costs ~10-15% compressed size for an
+    order of magnitude less CPU time; the unit additionally caps
+    bandwidth via CPUQuota.
+
+    In dry-run mode nothing is written and the reported size is estimated as
+    the current size (no compression performed)."""
+    dest = scap.with_name(scap.name + ".zst")
+    if dry_run:
+        return scap.stat().st_size
+    subprocess.run(
+        ["zstd", "-6", "--rm", "-q", "-f", str(scap)],
+        check=True,
+    )
+    return dest.stat().st_size
+
+
+def build_plan(
+    root: Path,
+    budget_bytes: int,
+    cold_age_seconds: float,
+    min_keep_seconds: float,
+    now: float,
+    dry_run: bool,
+    compress_fn=_zstd_compress,
+) -> PrunePlan:
+    """Compute compression + deletion plan. When ``dry_run`` is False the
+    compression step is executed (it must run before the budget is measured);
+    deletions are returned in the plan for the caller to apply."""
+    runs = scan_runs(root)
+    cold = select_cold_runs(runs, cold_age_seconds, now)
+
+    compress_actions: list[CompressAction] = []
+    saved_total = 0
+    for run in cold:
+        for scap in scap_payloads(run.path):
+            # Runs can vanish or shrink under us (operator deletion, a
+            # concurrent prune): skip missing files instead of dying -
+            # the next timer run re-plans from the surviving state.
+            try:
+                before = scap.stat().st_size
+                after = compress_fn(scap, dry_run)
+            except FileNotFoundError:
+                continue
+            action = CompressAction(
+                run=run.path, scap=scap, before_bytes=before, after_bytes=after
+            )
+            compress_actions.append(action)
+            saved_total += action.saved_bytes
+
+    total_before = sum(r.size_bytes for r in runs)
+    if dry_run:
+        total_after_compress = total_before - saved_total
+        # Reflect projected sizes in run entries for accurate budget planning.
+        run_saved: dict[Path, int] = {}
+        for a in compress_actions:
+            run_saved[a.run] = run_saved.get(a.run, 0) + a.saved_bytes
+        for r in runs:
+            r.size_bytes -= run_saved.get(r.path, 0)
+    else:
+        # Re-scan sizes after real compression.
+        for r in runs:
+            r.size_bytes = dir_size(r.path)
+            r.newest_mtime = newest_mtime(r.path)
+        total_after_compress = sum(r.size_bytes for r in runs)
+
+    plan = plan_budget(
+        runs, budget_bytes, min_keep_seconds, now, total_after_compress
+    )
+    plan.compress = compress_actions
+    plan.total_before = total_before
+    if not plan.refused:
+        pass
+    return plan
+
+
+def apply_plan(plan: PrunePlan) -> None:
+    for run in plan.delete:
+        shutil.rmtree(run.path)
+
+
+def _fmt_bytes(n: int) -> str:
+    step = 1024.0
+    val = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(val) < step or unit == "TiB":
+            return f"{val:.1f} {unit}"
+        val /= step
+    return f"{n} B"
+
+
+def render_plan(plan: PrunePlan, dry_run: bool) -> str:
+    lines: list[str] = []
+    tag = "[dry-run] " if dry_run else ""
+    lines.append(f"{tag}servo-capture-prune plan")
+    lines.append(f"  budget:        {_fmt_bytes(plan.budget_bytes)}")
+    lines.append(f"  total before:  {_fmt_bytes(plan.total_before)}")
+    if plan.compress:
+        saved = sum(a.saved_bytes for a in plan.compress)
+        lines.append(
+            f"  compress:      {len(plan.compress)} payload(s), "
+            f"saved {_fmt_bytes(saved)}"
+        )
+        per_run: dict[Path, int] = {}
+        for a in plan.compress:
+            per_run[a.run] = per_run.get(a.run, 0) + a.saved_bytes
+        for run_path, saved_bytes in per_run.items():
+            lines.append(
+                f"    {run_path.name}: saved {_fmt_bytes(saved_bytes)}"
+            )
+    else:
+        lines.append("  compress:      none (no cold *.scap payloads)")
+    if plan.refused:
+        lines.append(f"  budget:        REFUSED - {plan.refusal_reason}")
+    elif plan.delete:
+        lines.append(f"  delete:        {len(plan.delete)} run dir(s)")
+        for run in plan.delete:
+            lines.append(
+                f"    {run.path.name} ({_fmt_bytes(run.size_bytes)})"
+            )
+        lines.append(f"  total after:   {_fmt_bytes(plan.total_after)}")
+    else:
+        lines.append("  delete:        none (within budget)")
+    return "\n".join(lines)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="servo-capture-prune",
+        description="Keep the servo captures root within a byte budget.",
+    )
+    p.add_argument(
+        "--root", required=True, help="captures root directory (required)"
+    )
+    p.add_argument(
+        "--budget-gib",
+        type=float,
+        default=DEFAULT_BUDGET_GIB,
+        help=f"byte budget in GiB (default {DEFAULT_BUDGET_GIB})",
+    )
+    p.add_argument(
+        "--cold-age-hours",
+        type=float,
+        default=DEFAULT_COLD_AGE_HOURS,
+        help=f"compress payloads older than this (default "
+        f"{DEFAULT_COLD_AGE_HOURS}h)",
+    )
+    p.add_argument(
+        "--min-keep-hours",
+        type=float,
+        default=DEFAULT_MIN_KEEP_HOURS,
+        help=f"never delete dirs newer than this (default "
+        f"{DEFAULT_MIN_KEEP_HOURS}h)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the full plan and modify nothing",
+    )
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    root = Path(args.root).expanduser()
+    if not root.is_dir():
+        print(
+            f"servo-capture-prune: root is not a directory: {root}",
+            file=sys.stderr,
+        )
+        return 2
+    if shutil.which("zstd") is None and not args.dry_run:
+        print(
+            "servo-capture-prune: zstd binary not found on PATH",
+            file=sys.stderr,
+        )
+        return 2
+
+    now = time.time()
+    plan = build_plan(
+        root=root,
+        budget_bytes=int(args.budget_gib * (1024**3)),
+        cold_age_seconds=args.cold_age_hours * 3600.0,
+        min_keep_seconds=args.min_keep_hours * 3600.0,
+        now=now,
+        dry_run=args.dry_run,
+    )
+
+    print(render_plan(plan, args.dry_run))
+
+    if plan.refused:
+        print(
+            "servo-capture-prune: REFUSING to prune - "
+            + plan.refusal_reason,
+            file=sys.stderr,
+        )
+        return 1
+
+    if not args.dry_run:
+        apply_plan(plan)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

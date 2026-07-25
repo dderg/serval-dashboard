@@ -638,6 +638,28 @@ export interface components {
             /** Format: double */
             on_ferr_rms_mm: number;
         };
+        /**
+         * @description The locked-rotor belt anti-resonance per Cartesian mode: `f_notch_hz`
+         *     is the frequency where no applied torque can move the rotor (the load
+         *     is a tuned absorber), `compliance_s2 = 1/(2*pi*f_notch)^2` is the
+         *     v7 dynamics-profile term it implies, and `f_peak_hz` is the coupled
+         *     resonance just above it (sanity: peak > notch always).
+         */
+        ComplianceResult: {
+            /** Format: double */
+            compliance_s2: number;
+            /** Format: double */
+            f_notch_hz: number;
+            /** Format: double */
+            f_peak_hz?: number | null;
+            /** Format: double */
+            flank_coherence: number;
+            mode: string;
+            /** Format: double */
+            notch_depth_db: number;
+            /** Format: uint */
+            segments: number;
+        };
         DeleteResponse: {
             deleted: string;
         };
@@ -750,6 +772,10 @@ export interface components {
             /** Format: int64 */
             ff_velocity_offset_max?: number | null;
             moves: components["schemas"]["Move"][];
+            /** Format: double */
+            pin_phase_deg?: number | null;
+            /** Format: double */
+            pin_residual_mm?: number | null;
             /** Format: uint */
             samples: number;
             torque: components["schemas"]["TorqueSummary"];
@@ -793,6 +819,22 @@ export interface components {
         PlotCombined: {
             cross_ferr_mm: number[];
             on_ferr_mm: number[];
+        };
+        PlotCompliance: {
+            band: [
+                number,
+                number
+            ];
+            coherence: number[];
+            /** Format: double */
+            coherence_min: number;
+            freq_hz: number[];
+            mag_db: number[];
+            /** Format: double */
+            notch_hz: number;
+            /** Format: double */
+            peak_hz?: number | null;
+            phase_deg: number[];
         };
         PlotDifferential: {
             band: [
@@ -861,6 +903,8 @@ export interface components {
         PlotStep: {
             accel?: components["schemas"]["PlotAccel"] | null;
             combined?: components["schemas"]["PlotCombined"] | null;
+            /** @default null */
+            compliance: components["schemas"]["PlotCompliance"] | null;
             differential?: components["schemas"]["PlotDifferential"] | null;
             drives: {
                 [key: string]: components["schemas"]["PlotDrive"];
@@ -974,6 +1018,8 @@ export interface components {
         StepResult: {
             accel?: components["schemas"]["AccelResult"] | null;
             combined?: components["schemas"]["Combined"] | null;
+            /** @default null */
+            compliance: components["schemas"]["ComplianceResult"] | null;
             differential?: components["schemas"]["DifferentialResult"] | null;
             drives: {
                 [key: string]: components["schemas"]["DriveResult"];

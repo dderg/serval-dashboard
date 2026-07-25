@@ -10,6 +10,9 @@ use crate::scap::{Scap, FLAG_MOTION_ACTIVE};
 
 pub const SETTLE_HOLD_MS: f64 = 50.0;
 pub const DEFAULT_SETTLE_BAND_COUNTS: i64 = 50;
+// Fallback rail-detection threshold, per-mille of rated torque. Used only
+// for manifests predating the per-motor max_torque_per_mille field; runs
+// that carry it derive the limit from the drive's configured max_torque.
 pub const DEFAULT_TORQUE_LIMIT_PER_MILLE: i64 = 1400;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -51,6 +54,10 @@ pub struct Metrics {
     pub ff_velocity_offset_max: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ff_torque_offset_max: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_residual_mm: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_phase_deg: Option<f64>,
 }
 
 pub struct DriveSeries {
@@ -62,6 +69,8 @@ pub struct DriveSeries {
     pub flags: Vec<i64>,
     pub velocity_offset: Option<Vec<i64>>,
     pub torque_offset: Option<Vec<i64>>,
+    pub pin_res_re: Option<Vec<f64>>,
+    pub pin_res_im: Option<Vec<f64>>,
 }
 
 pub fn drive_series(cap: &Scap, idx: usize) -> Result<DriveSeries, String> {
@@ -81,6 +90,16 @@ pub fn drive_series(cap: &Scap, idx: usize) -> Result<DriveSeries, String> {
         },
         torque_offset: if cap.has_channel("torque_offset") {
             Some(cap.read_i64(idx, "torque_offset")?)
+        } else {
+            None
+        },
+        pin_res_re: if cap.has_channel("pin_res_re") {
+            Some(cap.read_f64(idx, "pin_res_re")?)
+        } else {
+            None
+        },
+        pin_res_im: if cap.has_channel("pin_res_im") {
+            Some(cap.read_f64(idx, "pin_res_im")?)
         } else {
             None
         },
@@ -287,6 +306,8 @@ pub fn compute_metrics(
         ferr_crosscheck_max,
         ff_velocity_offset_max: None,
         ff_torque_offset_max: None,
+        pin_residual_mm: None,
+        pin_phase_deg: None,
     };
     if let Some(vel_off) = &d.velocity_offset {
         let moving: Vec<bool> = d
@@ -304,6 +325,34 @@ pub fn compute_metrics(
         metrics.ff_velocity_offset_max = Some(max_moving(vel_off));
         metrics.ff_torque_offset_max =
             Some(d.torque_offset.as_ref().map(|t| max_moving(t)).unwrap_or(0));
+    }
+    if let (Some(re), Some(im)) = (&d.pin_res_re, &d.pin_res_im) {
+        let any_nonzero = re.iter().chain(im.iter()).any(|&v| v != 0.0);
+        if any_nonzero {
+            // Settled-tail median, not the last sample: a model restore or
+            // pin reset racing the capture stop zeroes the demodulator, and
+            // a last-sample readout then reports a fake 0.00 (the bench
+            // tuner picked edge values on exactly that artifact). Median
+            // |phasor| over the last 40% of samples, with exact trailing
+            // zeros (the reset residue) dropped first.
+            let mut tail_end = re.len();
+            while tail_end > 0 && re[tail_end - 1] == 0.0 && im[tail_end - 1] == 0.0 {
+                tail_end -= 1;
+            }
+            let tail_start = tail_end - (tail_end * 2) / 5;
+            let mut mags: Vec<f64> = (tail_start..tail_end).map(|k| re[k].hypot(im[k])).collect();
+            if !mags.is_empty() {
+                mags.sort_by(|a, b| a.total_cmp(b));
+                let mag = mags[mags.len() / 2];
+                metrics.pin_residual_mm = Some(mag);
+                if mag > 1e-6 {
+                    // Phase from the mid-tail sample nearest the median
+                    // magnitude window: use the settled last nonzero sample.
+                    let k = tail_end - 1;
+                    metrics.pin_phase_deg = Some(im[k].atan2(re[k]).to_degrees());
+                }
+            }
+        }
     }
     Ok(metrics)
 }

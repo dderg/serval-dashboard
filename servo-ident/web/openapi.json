@@ -119,6 +119,51 @@
         ],
         "type": "object"
       },
+      "ComplianceResult": {
+        "description": "The locked-rotor belt anti-resonance per Cartesian mode: `f_notch_hz`\nis the frequency where no applied torque can move the rotor (the load\nis a tuned absorber), `compliance_s2 = 1/(2*pi*f_notch)^2` is the\nv7 dynamics-profile term it implies, and `f_peak_hz` is the coupled\nresonance just above it (sanity: peak > notch always).",
+        "properties": {
+          "compliance_s2": {
+            "format": "double",
+            "type": "number"
+          },
+          "f_notch_hz": {
+            "format": "double",
+            "type": "number"
+          },
+          "f_peak_hz": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "flank_coherence": {
+            "format": "double",
+            "type": "number"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "notch_depth_db": {
+            "format": "double",
+            "type": "number"
+          },
+          "segments": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mode",
+          "segments",
+          "f_notch_hz",
+          "notch_depth_db",
+          "flank_coherence",
+          "compliance_s2"
+        ],
+        "type": "object"
+      },
       "DeleteResponse": {
         "properties": {
           "deleted": {
@@ -537,6 +582,20 @@
             },
             "type": "array"
           },
+          "pin_phase_deg": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pin_residual_mm": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "samples": {
             "format": "uint",
             "minimum": 0,
@@ -704,6 +763,78 @@
         "required": [
           "on_ferr_mm",
           "cross_ferr_mm"
+        ],
+        "type": "object"
+      },
+      "PlotCompliance": {
+        "properties": {
+          "band": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "format": "double",
+                "type": "number"
+              }
+            ],
+            "type": "array"
+          },
+          "coherence": {
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "coherence_min": {
+            "format": "double",
+            "type": "number"
+          },
+          "freq_hz": {
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "mag_db": {
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "notch_hz": {
+            "format": "double",
+            "type": "number"
+          },
+          "peak_hz": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "phase_deg": {
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "freq_hz",
+          "mag_db",
+          "phase_deg",
+          "coherence",
+          "coherence_min",
+          "band",
+          "notch_hz"
         ],
         "type": "object"
       },
@@ -1064,6 +1195,17 @@
                 "type": "null"
               }
             ]
+          },
+          "compliance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlotCompliance"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "differential": {
             "anyOf": [
@@ -1476,6 +1618,17 @@
                 "type": "null"
               }
             ]
+          },
+          "compliance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ComplianceResult"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "differential": {
             "anyOf": [

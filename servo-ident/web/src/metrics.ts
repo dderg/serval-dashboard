@@ -594,6 +594,7 @@ function renderAccelPsdChart(names: string[], plots: PlotSeries[], steps: string
     psdBox("accelerometer", traces, RESONANCE_BAND_HZ, "accel amplitude (mm/s²)", {
       linear: true,
       zeroFloor: true,
+      xMax: psdMaxFreqHz(),
     })
   );
 }
@@ -610,6 +611,7 @@ interface PsdBoxOpts {
   fixedY?: FixedY | null;
   threshold?: number | null;
   markers?: FreqMarker[] | null;
+  xMax?: number | null;
 }
 
 function psdBox(
@@ -639,6 +641,7 @@ function psdBox(
       fixedY: opts.fixedY,
       threshold: opts.threshold,
       markers: opts.markers,
+      xMax: opts.xMax,
       formatValue: opts.linear ? fmtLinear : (v: number) => v.toExponential(2),
     });
   }
@@ -666,7 +669,7 @@ function renderPsdChart(names: string[], plots: PlotSeries[], steps: string[]) {
     container.innerHTML = '<p class="note">select runs above</p>';
     return;
   }
-  const psdOpts = { linear: true, zeroFloor: true };
+  const psdOpts = { linear: true, zeroFloor: true, xMax: psdMaxFreqHz() };
   const hasCartesian = plots.some((p) =>
     p.steps.some((s) => steps.includes(s.name) && s.psd && s.psd.cartesian)
   );
@@ -733,7 +736,7 @@ function renderMotorChips(motorNames: string[]) {
 }
 
 function renderStepChips(stepNames: string[]) {
-  for (const id of ["psd-step-chips", "time-step-chips"]) {
+  for (const id of ["psd-step-chips", "accel-psd-step-chips", "time-step-chips"]) {
     const container = el(id);
     if (!container) continue;
     const filter = state.stepFilter ? [...state.stepFilter] : null;
@@ -800,7 +803,8 @@ function PsdSection() {
 function AccelPsdSection() {
   const tools =
     `<span class="note">per-axis accelerometer spectra; solid: x+y+z total</span>` +
-    `<div class="chips" id="accel-axis-chips"></div>`;
+    `<div class="chips" id="accel-axis-chips"></div>` +
+    `<div class="chips" id="accel-psd-step-chips"></div>`;
   return html`<section class="accel-psd-section" id="accel-psd-section" hidden>
     <${SectionHead} title="accel PSD" tools=${tools} />
     <div class="charts" id="accel-psd-charts"></div>

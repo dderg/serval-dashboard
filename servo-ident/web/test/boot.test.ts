@@ -47,6 +47,9 @@ afterAll(async () => {
   const app = document.getElementById("app");
   if (app) render(null, app);
   cleanup();
+  // The observer is a module global; leaving it subscribed means the next
+  // file's startRunsPolling early-returns onto ours and never polls.
+  (await import("../src/runs")).stopRunsPolling();
 });
 
 test("boot renders the shell without errors", () => {
@@ -159,6 +162,18 @@ test("startRunsPolling is idempotent — a second call adds no observer", () => 
   expect(runsQuery().getObserversCount()).toBe(before);
   const pollers = runsQuery().observers.filter((o) => o.options.refetchInterval === 5000);
   expect(pollers.length).toBe(1);
+});
+
+test("stopRunsPolling releases the singleton so a later start really polls", () => {
+  // The guard in startRunsPolling keys off the module-global observer, so
+  // without a disposer anything that detaches it from the cache leaves the
+  // next caller silently unpolled — its runs query never resolves and its
+  // page never reconciles. That is a whole page rendering blank, not a
+  // tidiness concern.
+  runs.stopRunsPolling();
+  expect(runsQuery().observers.filter((o) => o.options.refetchInterval === 5000).length).toBe(0);
+  runs.startRunsPolling();
+  expect(runsQuery().observers.filter((o) => o.options.refetchInterval === 5000).length).toBe(1);
 });
 
 test("deleting a run drops every ['runs', name] cache, not just detail and plot", async () => {

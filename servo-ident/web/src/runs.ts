@@ -213,11 +213,10 @@ function ContextMenu() {
   return html`<div class="context-menu" style=${style} ref=${ref}>
     ${run.has_results ? item(pinned ? "unpin" : "pin", () => togglePin(run)) : null}
     ${item("→ console", () => loadRerunForm(run.name), { disabled: !detail?.manifest })}
-    ${!run.has_results ? item("analyze", () => analyze.mutate(run.name)) : null}
+    ${run.has_results ? null : item("analyze", () => analyze.mutate(run.name))}
     ${item("delete", () => del.mutate(run.name), { danger: true })}
   </div>`;
 }
-
 
 function RunRow({ run, def }: { run: RunSummary; def: PageDef }) {
   const analyze = useAnalyzeRun();
@@ -284,7 +283,6 @@ function RunsTable() {
   const runs = def.journal ? runsData() : pageRuns(def);
   return runs.map((run) => html`<${RunRow} key=${run.name} run=${run} def=${def} />`);
 }
-
 
 function RunsBody() {
   useQuery({ ...runsQuery(), notifyOnChangeProps: ["data"] });
@@ -420,4 +418,4 @@ function autoSelectInitialRuns() {
 }
 
 export { selectedRunNames, runColor, TunePage, JournalPage };
-export { startRunsPolling } from "./queries/runs";
+export { startRunsPolling, stopRunsPolling } from "./queries/runs";

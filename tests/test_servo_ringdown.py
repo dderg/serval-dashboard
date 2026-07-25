@@ -307,3 +307,56 @@ def test_analyze_invoked_on_the_run_dir():
     ]
     assert analyze and analyze[-1][2] == run_dir
     assert sc._active_run is None, "run must be closed even on success"
+
+
+def test_square_pattern_is_continuous_with_motion_anchor():
+    sc, gcode = make_calibration()
+    sc.cmd_SERVO_MEASURE_RINGDOWN(
+        FakeGcmd(PATTERN="SQUARE", SPEEDS="100", ITERATIONS=2)
+    )
+    manifest = _manifest_for(sc)
+    assert manifest["experiment"] == "ringdown"
+    assert manifest["axis"] == "XY"
+    plan = manifest["stroke_plan"]
+    assert plan["pattern"] == "square"
+    assert plan["stops_per_iteration"] == 4
+    assert plan["size_mm"] == 80.0, "default min(80, span)"
+    assert plan["corner_x"] == 70.0 and plan["corner_y"] == 70.0, (
+        "80 mm box centered on the (20,200) bounds center 110"
+    )
+    assert "corner_velocity" not in plan
+    # The corner budget is never touched: kalico's SQUARE_CORNER_VELOCITY
+    # is only an alias for corner deviation, so overriding it would
+    # silently change how print-like (rounded) the corners are.
+    assert not any(
+        "SQUARE_CORNER_VELOCITY" in s
+        for s in gcode.scripts
+        if isinstance(s, str)
+    )
+    (step,) = manifest["steps"]
+    # No modelled stop times: the analyzer detects corners from the
+    # capture's commanded reversals; only the motion-start fence is
+    # recorded to anchor the accelerometer's print-time axis.
+    assert step.get("stops") is None
+    assert step["swept"]["motion_start_pt"] == 0.0, "fake fence time"
+    # Legs alternate X and Y between the two corner coordinates.
+    assert _step_extents(gcode, "X") == {70.0, 150.0}
+    assert _step_extents(gcode, "Y") == {70.0, 150.0}
+
+
+def test_square_leg_too_short_fails_loud():
+    sc, _ = make_calibration()
+    with pytest.raises(RuntimeError, match="raise SIZE"):
+        sc.cmd_SERVO_MEASURE_RINGDOWN(
+            FakeGcmd(PATTERN="SQUARE", SPEEDS="400", SIZE=20)
+        )
+
+
+def test_square_bypasses_post_processors_and_jerk():
+    sc, _ = make_calibration()
+    sc.cmd_SERVO_MEASURE_RINGDOWN(FakeGcmd(PATTERN="SQUARE", SPEEDS="100"))
+    engine = sc.printer.lookup_object("motion_engine")
+    calls = [c for c in engine.calls if c[0] in ("bypass", "jerk")]
+    assert ("bypass", True) in calls and ("bypass", False) in calls
+    assert any(c[0] == "jerk" and c[1] == float("inf") for c in calls)
+    assert calls[-1][0] in ("bypass", "jerk"), "restored on the way out"

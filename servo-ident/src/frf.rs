@@ -286,3 +286,179 @@ pub fn find_modes(frf: &Frf, lo: f64, hi: f64) -> Result<Vec<DifferentialMode>, 
     modes.sort_by(|a, b| a.freq_hz.partial_cmp(&b.freq_hz).unwrap());
     Ok(modes)
 }
+
+/// A mode-projected series: capture channels weighted by one frame row.
+/// The weights are the RAW-drive-frame columns (the `spatial_frame`
+/// convention — each motor's invert sign is already folded into its
+/// column), so positions and torque are taken unsigned here: counts are
+/// scaled by 1/counts_per_mm only, never by the invert flag. Only the
+/// relative sign between input and output matters for the FRF, and both
+/// sides get the identical weighting.
+#[derive(Debug)]
+pub struct ModeSeries {
+    pub cmd_mm: Vec<f64>,
+    pub act_mm: Vec<f64>,
+    pub torque: Vec<f64>,
+}
+
+pub fn mode_series(cap: &Scap, axes: &[String], weights: &[f64]) -> Result<ModeSeries, String> {
+    if axes.len() != weights.len() {
+        return Err(format!(
+            "spatial frame lists {} axes but the row has {} weights",
+            axes.len(),
+            weights.len()
+        ));
+    }
+    let n = cap.n_records;
+    let mut cmd_mm = vec![0.0; n];
+    let mut act_mm = vec![0.0; n];
+    let mut torque = vec![0.0; n];
+    let mut used = 0usize;
+    for (idx, d) in cap.header.drives.iter().enumerate() {
+        let Some(pos) = axes.iter().position(|a| a == &d.name) else {
+            continue;
+        };
+        let w = weights[pos];
+        if w == 0.0 {
+            continue;
+        }
+        if d.counts_per_mm <= 0.0 {
+            return Err(format!(
+                "drive {:?} has non-positive counts_per_mm {}",
+                d.name, d.counts_per_mm
+            ));
+        }
+        let scale = w / d.counts_per_mm;
+        for (out, v) in cmd_mm.iter_mut().zip(cap.read_f64(idx, "target_counts")?) {
+            *out += v * scale;
+        }
+        for (out, v) in act_mm.iter_mut().zip(cap.read_f64(idx, "position_actual")?) {
+            *out += v * scale;
+        }
+        for (out, v) in torque.iter_mut().zip(cap.read_f64(idx, "torque_actual")?) {
+            *out += v * w;
+        }
+        used += 1;
+    }
+    if used == 0 {
+        return Err(format!(
+            "capture drives [{}] share no weighted axis with the spatial frame",
+            cap.drive_names().join(", ")
+        ));
+    }
+    Ok(ModeSeries {
+        cmd_mm,
+        act_mm,
+        torque,
+    })
+}
+
+/// Instrumental-variable FRF: with both `num = S_ry/S_rr` and
+/// `den = S_ru/S_rr` estimated against the same noise-free reference r,
+/// the ratio is `S_ry/S_ru = G(u→y)` free of the closed-loop bias a
+/// direct `S_uy/S_uu` estimate picks up when u is generated inside the
+/// loop. Coherence is the elementwise minimum of the two legs — a bin is
+/// only trustworthy when the reference explains both signals.
+pub fn complex_ratio(num: &Frf, den: &Frf) -> Result<Frf, String> {
+    if num.freqs.len() != den.freqs.len() {
+        return Err(format!(
+            "FRF grids differ ({} vs {} bins) - both legs must share the Welch segmentation",
+            num.freqs.len(),
+            den.freqs.len()
+        ));
+    }
+    let bins = num.freqs.len();
+    let mut re = vec![0.0; bins];
+    let mut im = vec![0.0; bins];
+    let mut coherence = vec![0.0; bins];
+    for b in 0..bins {
+        let d2 = den.re[b] * den.re[b] + den.im[b] * den.im[b];
+        if d2 > 0.0 {
+            re[b] = (num.re[b] * den.re[b] + num.im[b] * den.im[b]) / d2;
+            im[b] = (num.im[b] * den.re[b] - num.re[b] * den.im[b]) / d2;
+        }
+        coherence[b] = num.coherence[b].min(den.coherence[b]);
+    }
+    Ok(Frf {
+        freqs: num.freqs.clone(),
+        re,
+        im,
+        coherence,
+        segments: num.segments.min(den.segments),
+    })
+}
+
+/// The locked-rotor anti-resonance: at `f_b = sqrt(k_belt/m_load)/2pi`
+/// the load is a perfectly tuned absorber — no applied torque can move
+/// the rotor — so the torque→rotor-position FRF has a zero there. Plant
+/// zeros are invariant under feedback, so the notch survives any loop
+/// gain. Coherence AT the notch is naturally poor (the output is nearly
+/// zero), so the gate is on the flanks a quarter octave to each side.
+#[derive(Debug, Clone)]
+pub struct Notch {
+    pub freq_hz: f64,
+    pub depth_db: f64,
+    pub flank_coherence: f64,
+}
+
+pub fn find_notch(g: &Frf, lo: f64, hi: f64) -> Result<Notch, String> {
+    let band: Vec<usize> = (0..g.freqs.len())
+        .filter(|&i| g.freqs[i] >= lo && g.freqs[i] <= hi)
+        .collect();
+    if band.len() < 8 {
+        return Err(format!(
+            "FRF band {lo:.0}..{hi:.0} Hz holds only {} bins; sweep longer or widen the band",
+            band.len()
+        ));
+    }
+    let mag = g.magnitude();
+    let db = |v: f64| 20.0 * libm::log10(v.max(1e-12));
+    let mut mags_db: Vec<f64> = band.iter().map(|&i| db(mag[i])).collect();
+    let i_min = band[1..band.len() - 1]
+        .iter()
+        .enumerate()
+        .min_by(|(_, &a), (_, &b)| {
+            mag[a]
+                .partial_cmp(&mag[b])
+                .unwrap_or(core::cmp::Ordering::Equal)
+        })
+        .map(|(k, _)| band[k + 1])
+        .ok_or_else(|| "notch search band is empty".to_string())?;
+    // Depth relative to the band median: a real anti-resonance carves a
+    // deep local hole; a flat coherent response has nothing to report.
+    mags_db.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let median_db = mags_db[mags_db.len() / 2];
+    let depth_db = median_db - db(mag[i_min]);
+    // Flank coherence: quarter-octave to each side of the candidate.
+    let f0 = g.freqs[i_min];
+    let flank = |target: f64| -> f64 {
+        let i = (0..g.freqs.len())
+            .min_by(|&a, &b| {
+                (g.freqs[a] - target)
+                    .abs()
+                    .partial_cmp(&(g.freqs[b] - target).abs())
+                    .unwrap_or(core::cmp::Ordering::Equal)
+            })
+            .unwrap_or(i_min);
+        g.coherence[i]
+    };
+    let flank_coherence = flank(f0 / 1.19).min(flank(f0 * 1.19));
+    // Parabolic refinement on log-magnitude through the minimum bin.
+    let freq_hz = if i_min > 0 && i_min + 1 < g.freqs.len() {
+        let (m0, m1, m2) = (db(mag[i_min - 1]), db(mag[i_min]), db(mag[i_min + 1]));
+        let denom = m0 - 2.0 * m1 + m2;
+        if denom > 0.0 {
+            let delta = 0.5 * (m0 - m2) / denom;
+            g.freqs[i_min] + delta.clamp(-0.5, 0.5) * (g.freqs[1] - g.freqs[0])
+        } else {
+            g.freqs[i_min]
+        }
+    } else {
+        g.freqs[i_min]
+    };
+    Ok(Notch {
+        freq_hz,
+        depth_db,
+        flank_coherence,
+    })
+}

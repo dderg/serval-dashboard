@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 import pytest
 from fakes import FakeConfig, FakeKin, FakeNode, FakeReactor, FakeToolhead
@@ -131,11 +132,24 @@ def make_sc(handle=1, engine_values=None, verdict=None):
     return sc, gcode
 
 
-def _manifest(sc):
-    run_dir = os.path.dirname(
+def _capture_run_dir(sc):
+    return os.path.dirname(
         sc.printer.lookup_object("servo_capture").starts[0][0]
     )
-    with open(os.path.join(run_dir, "manifest.json")) as f:
+
+
+def _analyze_argv(sc):
+    """argv of the last servo-cal invocation - the run scope's analyze for
+    every command whose own body never asks for one."""
+    runs = [
+        s for s in sc.gcode.scripts if isinstance(s, tuple) and s[0] == "RUN"
+    ]
+    assert runs, "the run scope invoked servo-cal not at all"
+    return runs[-1][1]
+
+
+def _manifest(sc):
+    with open(os.path.join(_capture_run_dir(sc), "manifest.json")) as f:
         return json.load(f)
 
 
@@ -167,7 +181,7 @@ def test_manifest_records_experiment_motors_belts_and_step():
         },
     ]
     assert [s["name"] for s in m["steps"]] == ["track"]
-    assert m["steps"][0]["capture"] == "step_track.scap"
+    assert m["steps"][0]["capture"] == "step_track.scap.zst"
     assert m["steps"][0]["applied"] == []
     assert m["stroke_plan"]["speed"] == 100.0
 
@@ -226,6 +240,40 @@ def test_machinery_writes_are_suppressed_from_the_journal():
     servo_param.record_param_write("motor_a", "0x2001.0x31", 1)
     writes = servo_param.drain_param_writes()
     assert [(w["addr"], w["value"]) for w in writes] == [("0x2001.0x31", 1)]
+
+
+def test_same_second_runs_of_one_tag_get_their_own_directories(monkeypatch):
+    """The run directory stamps to the second, so two quick commands with
+    one tag used to share a directory and the second manifest clobbered the
+    first. Two commands are two runs."""
+    sc, _ = make_sc()
+    monkeypatch.setattr(time, "strftime", lambda _fmt: "20260725_101500")
+    first_dir, first_stamp = sc._run_dir("cal")
+    second_dir, second_stamp = sc._run_dir("cal")
+    assert os.path.basename(first_dir) == "cal_20260725_101500"
+    assert os.path.basename(second_dir) == "cal_20260725_101500_2"
+    # The stamp is the directory's identity, not the bare second: callers
+    # name captures and written profiles after it.
+    assert first_stamp == "20260725_101500"
+    assert second_stamp == "20260725_101500_2"
+    for run_dir, tag in ((first_dir, "a"), (second_dir, "b")):
+        with open(os.path.join(run_dir, "manifest.json"), "w") as f:
+            json.dump({"tag": tag}, f)
+    for run_dir, tag in ((first_dir, "a"), (second_dir, "b")):
+        with open(os.path.join(run_dir, "manifest.json")) as f:
+            assert json.load(f)["tag"] == tag
+
+
+def test_run_dir_refuses_to_reuse_a_directory_when_it_runs_out_of_names(
+    monkeypatch,
+):
+    sc, _ = make_sc()
+    monkeypatch.setattr(time, "strftime", lambda _fmt: "20260725_101500")
+    monkeypatch.setattr(servo_calibration.host, "RUN_DIR_COLLISION_LIMIT", 2)
+    sc._run_dir("cal")
+    sc._run_dir("cal")
+    with pytest.raises(RuntimeError, match="refusing to reuse"):
+        sc._run_dir("cal")
 
 
 def test_verdict_one_liner_names_step_and_run_dir():
@@ -595,16 +643,16 @@ def test_strain_map_raster_records_one_capture_per_line():
     caps = sc.printer.lookup_object("servo_capture").starts
     names = [os.path.basename(path) for path, _servos in caps]
     assert names == [
-        "step_xline_y030.scap",
-        "step_xline_y150.scap",
-        "step_xline_y270.scap",
-        "step_yline_x030.scap",
-        "step_yline_x150.scap",
-        "step_yline_x270.scap",
+        "step_xline_y030.scap.zst",
+        "step_xline_y150.scap.zst",
+        "step_xline_y270.scap.zst",
+        "step_yline_x030.scap.zst",
+        "step_yline_x150.scap.zst",
+        "step_yline_x270.scap.zst",
     ]
     m = _manifest(sc)
     assert m["experiment"] == "strain_map"
-    assert [s["name"] for s in m["steps"]] == [n[5:-5] for n in names]
+    assert [s["name"] for s in m["steps"]] == [n[5:-9] for n in names]
     assert m["steps"][0]["swept"] == {"y": 30.0}
     assert m["stroke_plan"]["line_spacing"] == 120.0
     g1 = [
@@ -636,6 +684,21 @@ def test_strain_map_sync_zero_skips_the_zero_point():
     gcmd = FakeGcmd(LINE_SPACING="120", SYNC="0")
     sc.cmd_SERVO_MEASURE_STRAIN_MAP(gcmd)
     assert _manifest(sc)["stroke_plan"]["zero_sync"] is False
+
+
+def test_strain_map_analyzes_the_raster_at_scope_exit():
+    """The raster body never asks for analysis - the run scope does, so a
+    map cannot land on disk without its results.json."""
+    servo_param.drain_param_writes()
+    sc, _gcode = make_sc()
+    sc.printer.add_object("servo_sync", FakeServoSync())
+    sc.bounds = {"X": (30.0, 270.0), "Y": (30.0, 270.0)}
+    sc.cmd_SERVO_MEASURE_STRAIN_MAP(FakeGcmd(LINE_SPACING="120"))
+    assert _analyze_argv(sc) == [
+        sys.executable,
+        "analyze",
+        _capture_run_dir(sc),
+    ]
 
 
 def test_strain_map_rejects_cartesian_kinematics():
@@ -695,7 +758,9 @@ def test_strain_response_steps_each_pair_along_one_line_and_fits():
     caps = sc.printer.lookup_object("servo_capture").starts
     names = [os.path.basename(path) for path, _servos in caps]
     assert names == [
-        "step_belt%s_step%d.scap" % (belt, i) for belt in "ab" for i in range(5)
+        "step_belt%s_step%d.scap.zst" % (belt, i)
+        for belt in "ab"
+        for i in range(5)
     ]
     m = _manifest(sc)
     assert m["experiment"] == "strain_response"
@@ -703,6 +768,9 @@ def test_strain_response_steps_each_pair_along_one_line_and_fits():
     assert m["stroke_plan"]["y"] == 150.0
     assert m["steps"][1]["swept"] == {"belt": 0.0, "offset_um": 50.0}
     assert comp.fits == [os.path.dirname(caps[0][0])]
+    # The scope analyzes inside the with, i.e. before the outer finally
+    # clears the offset session and before the stiffness fit reads the run.
+    assert _analyze_argv(sc)[1:] == ["analyze", _capture_run_dir(sc)]
 
 
 def test_strain_response_without_strain_comp_errors_loudly():
@@ -860,10 +928,10 @@ def test_tune_loops_xy_lines_until_converged():
     caps = sc.printer.lookup_object("servo_capture").starts
     names = [os.path.basename(path) for path, _servos in caps]
     assert names == [
-        "step_iter0_x.scap",
-        "step_iter0_y.scap",
-        "step_iter1_x.scap",
-        "step_iter1_y.scap",
+        "step_iter0_x.scap.zst",
+        "step_iter0_y.scap.zst",
+        "step_iter1_x.scap.zst",
+        "step_iter1_y.scap.zst",
     ]
     assert tuner.scored[0][1] == [
         ("iter0_x", "y", 150.0),
@@ -881,6 +949,7 @@ def test_tune_loops_xy_lines_until_converged():
     assert m["steps"][0]["swept"]["kaa"] == 300.0
     assert m["steps"][0]["swept"]["y"] == 150.0
     assert m["steps"][0]["swept"]["x"] == 150.0
+    assert _analyze_argv(sc)[1:] == ["analyze", _capture_run_dir(sc)]
 
 
 def test_tune_fails_loudly_when_it_does_not_converge():
@@ -888,6 +957,9 @@ def test_tune_fails_loudly_when_it_does_not_converge():
     with pytest.raises(RuntimeError, match="did not converge"):
         sc.cmd_SERVO_STRAIN_COMP_TUNE(FakeGcmd(RUN="ignored"))
     assert comp.tuner.stored == 0
+    # The scope exits cleanly before the non-convergence error is raised,
+    # so the iterations that did run are analyzed, not thrown away.
+    assert _analyze_argv(sc)[1:] == ["analyze", _capture_run_dir(sc)]
 
 
 def test_tune_without_strain_comp_errors_loudly():

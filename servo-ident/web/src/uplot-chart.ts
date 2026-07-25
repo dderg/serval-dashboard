@@ -74,6 +74,11 @@ interface PsdPlotOpts {
   height: number;
   traces: PsdTrace[];
   band?: [number, number] | null;
+  /// Pin the frequency axis instead of letting it stop at the traces' own
+  /// Nyquist. The accelerometer and the following error sample at different
+  /// rates, so only a shared span makes one peak line up across the two
+  /// charts.
+  xMax?: number | null;
   yTitle: string;
   linear?: boolean;
   zeroFloor?: boolean;
@@ -435,7 +440,7 @@ function freqMarkersPlugin(markers: FreqMarker[]): uPlot.Plugin {
 /// furniture — band shading with per-trace peak dots, a threshold line,
 /// staggered vertical mode markers, and the nearest-point hover readout.
 function psdPlot(target: HTMLElement, opts: PsdPlotOpts): uPlot {
-  const { width, height, traces, band, yTitle, linear, zeroFloor, fixedY, threshold, markers, formatValue } = opts;
+  const { width, height, traces, band, yTitle, linear, zeroFloor, fixedY, threshold, markers, formatValue, xMax } = opts;
   const plotY = linear ? (v: number) => v : (v: number) => Math.max(v, PSD_LOG_FLOOR);
 
   const plugins: uPlot.Plugin[] = [];
@@ -472,7 +477,7 @@ function psdPlot(target: HTMLElement, opts: PsdPlotOpts): uPlot {
       pxAlign: false,
       cursor: { show: true, x: false, y: false, points: { show: false } },
       legend: { show: false },
-      scales: { x: { time: false }, y: yScale },
+      scales: { x: { time: false, range: xMax == null ? undefined : [0, xMax] }, y: yScale },
       axes: [
         themedAxis({ values: (u2, vals) => vals.map((f) => f.toFixed(0) + "Hz"), size: 24 }),
         themedAxis({

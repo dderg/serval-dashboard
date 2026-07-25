@@ -1,0 +1,15 @@
+[Unit]
+Description=serval servo capture retention (compress cold + budget prune)
+After=network.target
+
+[Service]
+Type=oneshot
+User=@SERVO_CAL_USER@
+Nice=19
+IOSchedulingClass=idle
+# Bound MEMORY-BUS and SD pressure, not just scheduling: the RT endpoint
+# faults on frame lateness from bus contention that nice/ionice cannot
+# control (zstd -19 at nice 19 tripped 8-42 us frame faults, 2026-07-24).
+CPUQuota=25%
+MemoryHigh=256M
+ExecStart=@SERVO_CAL_HOME@/servo-capture-prune --root @SERVO_CAPTURES_DIR@

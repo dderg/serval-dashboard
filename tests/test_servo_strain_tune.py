@@ -944,3 +944,45 @@ def test_tune_rejects_collinear_own_and_cross_corrections(tmp_path):
     )
     with pytest.raises(RuntimeError, match="cannot be separated"):
         tuner.score_lines(FakeGcmd(), str(tune_dir), tune_steps(0))
+
+
+def test_load_scap_decodes_zstd_identically_to_raw(tmp_path):
+    # A capture compressed with zstd (as kalico writes *.scap.zst inline) must
+    # decode to exactly the same header and columns as the raw bytes; the
+    # reader detects compression by the zstd magic, not by the file extension.
+    xs = [i * 0.5 for i in range(64)]
+    ys = [1.0] * 64
+    raw_path = tmp_path / "step_x.scap"
+    write_scap(raw_path, xs, ys, elastic_a, elastic_a)
+    raw_bytes = raw_path.read_bytes()
+    zst_path = tmp_path / "step_x.scap.zst"
+    import subprocess
+
+    subprocess.run(
+        ["zstd", "-3", "-q", "-o", str(zst_path), str(raw_path)], check=True
+    )
+    assert zst_path.read_bytes()[:4] == b"\x28\xb5\x2f\xfd"
+
+    raw_header, raw_col = servo_strain_tune._load_scap(str(raw_path))
+    zst_header, zst_col = servo_strain_tune._load_scap(str(zst_path))
+    assert zst_header == raw_header
+    for name in ("target_counts", "torque_actual"):
+        for di in range(len(raw_header["drives"])):
+            assert list(zst_col(name, di)) == list(raw_col(name, di))
+
+
+def test_capture_path_prefers_manifest_then_falls_back(tmp_path):
+    run = tmp_path
+    (run / "step_a.scap.zst").write_bytes(b"z")
+    (run / "step_b.scap").write_bytes(b"r")
+    assert servo_strain_tune._capture_path(
+        str(run), {"name": "a", "capture": "step_a.scap.zst"}
+    ) == str(run / "step_a.scap.zst")
+    # legacy run without a capture field: raw sibling wins if present
+    assert servo_strain_tune._capture_path(str(run), {"name": "b"}) == str(
+        run / "step_b.scap"
+    )
+    # neither on disk nor recorded: default to the compressed name
+    assert servo_strain_tune._capture_path(str(run), {"name": "c"}) == str(
+        run / "step_c.scap.zst"
+    )

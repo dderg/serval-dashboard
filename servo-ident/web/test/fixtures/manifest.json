@@ -1,6 +1,7 @@
 {
   "version": 1,
   "experiment": "gain_sweep",
+  "command": "SERVO_CALIBRATE_GAINS AXIS=X SPEED_GAINS=550,700 TAG=cal_attempt3",
   "tag": "cal_attempt3",
   "created_utc": "2026-07-18T19:29:15Z",
   "axis": "X",
