@@ -3225,6 +3225,10 @@ class DynamicsFitCommands(MeasureCommands):
                 accel_name,
                 run,
             )
+            # Every other calibration command analyzes its own run before it
+            # returns; a comparison that did not left the dashboard holding a
+            # results-less run and an analyze button to press by hand.
+            self._analyze_and_report(gcmd, run)
         finally:
             self._active_run = None
         steps = run.manifest["steps"]

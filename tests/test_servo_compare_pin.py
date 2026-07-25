@@ -327,3 +327,20 @@ def test_compare_requires_freq_bounds_and_param():
     with pytest.raises(Exception, match="FREQ_END"):
         sc.cmd_SERVO_COMPARE_PIN(_gcmd(FREQ_END=None))
     assert sc.printer.lookup_object("motion_engine").buzzes == []
+
+
+@requires_tomllib
+def test_compare_analyzes_its_own_run_like_every_other_command():
+    # Without this the dashboard gets a results-less run and the operator
+    # has to press analyze by hand — every other calibration command
+    # analyzes before it returns.
+    sc, gcode, _node, _path, _chip = _setup()
+    sc.cmd_SERVO_COMPARE_PIN(_gcmd())
+    run_dir = _run_dirs(sc)[0]
+    analyzed = [
+        argv
+        for kind, argv, _t in gcode.scripts
+        if kind == "RUN" and len(argv) >= 3 and argv[1] == "analyze"
+    ]
+    assert [argv[2] for argv in analyzed] == [run_dir]
+    assert os.path.exists(os.path.join(run_dir, "results.json"))
