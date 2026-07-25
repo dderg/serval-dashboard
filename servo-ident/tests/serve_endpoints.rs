@@ -244,16 +244,16 @@ fn write_pin_compare_run(run_dir: &Path, tag: &str) {
         "axis": "X",
         "steps": [
             {
-                "name": "v0_zeta0p005",
-                "capture": "step_v0_zeta0p005.scap",
+                "name": "zeta0p005",
+                "capture": "step_zeta0p005.scap",
                 "swept": {"value": 0.005},
-                "accel": "accel_v0_zeta0p005.csv",
+                "accel": "accel_zeta0p005.csv",
             },
             {
-                "name": "v1_zeta0p02",
-                "capture": "step_v1_zeta0p02.scap",
+                "name": "zeta0p02",
+                "capture": "step_zeta0p02.scap",
                 "swept": {"value": 0.02},
-                "accel": "accel_v1_zeta0p02.csv",
+                "accel": "accel_zeta0p02.csv",
             },
         ],
     });
@@ -283,9 +283,9 @@ fn a_pin_comparison_lists_and_serves_its_steps_like_any_other_run() {
     let manifest: Value = serde_json::from_str(&resp.body).unwrap();
     let steps = manifest["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 2);
-    assert_eq!(steps[0]["name"], Value::from("v0_zeta0p005"));
+    assert_eq!(steps[0]["name"], Value::from("zeta0p005"));
     assert_eq!(steps[0]["swept"]["value"], Value::from(0.005));
-    assert_eq!(steps[0]["accel"], Value::from("accel_v0_zeta0p005.csv"));
+    assert_eq!(steps[0]["accel"], Value::from("accel_zeta0p005.csv"));
 
     std::fs::remove_dir_all(&root).ok();
 }

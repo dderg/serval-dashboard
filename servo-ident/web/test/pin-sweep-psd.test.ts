@@ -33,7 +33,7 @@ const PIN_RUN = "pin_20260725_120000";
 const PIN_COMMAND = "SERVO_SWEEP_PIN MODE=X PARAM=ZETA FREQ=137 VALUES=0.005,0.02 NAME=pin";
 // The staircase names each step after the value it swept — those names are
 // what the chart legends print, so they are the thing under test.
-const STEP_NAMES = ["v0_zeta0p005", "v1_zeta0p02"];
+const STEP_NAMES = ["zeta0p005", "zeta0p02"];
 const STEP_ZETA = [0.005, 0.02];
 
 const pinSummary: RunSummary = {

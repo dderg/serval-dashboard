@@ -35,7 +35,7 @@ const COMPARE_COMMAND = "SERVO_COMPARE_PIN MODE=Y PARAM=LEAD VALUES=0,600 NAME=c
 // A comparison names each step after the value it swept, exactly as the pin
 // staircase does — those names are what the chart legends print, so they are
 // the thing under test.
-const STEP_NAMES = ["v0_lead0", "v1_lead600"];
+const STEP_NAMES = ["lead0", "lead600"];
 const STEP_LEAD = [0, 600];
 
 const compareSummary: RunSummary = {

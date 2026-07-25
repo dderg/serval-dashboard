@@ -703,7 +703,7 @@ A pin staircase is an ordinary run on the dashboard's tune tab. Each step's
 capture yields a following-error PSD, and — whenever the step recorded an
 accelerometer capture — a toolhead accel PSD in the section below it, both
 clipped to the same frequency ceiling so one spike lines up across the two
-charts. The step names carry the swept value (`v0_zeta0p005`), so the chart
+charts. The step names carry the swept value (`zeta0p005`), so the chart
 legends and the step chips read as the ladder.
 
 #### SERVO_COMPARE_PIN
@@ -734,7 +734,7 @@ command writes, with `experiment: "pin_compare"`, the originating command
 line, and the usual ambient/motor/`git_rev` block, so a comparison is one
 more row in the dashboard's runs table and takes a note like any other run.
 Every swept value is an **ordinary step** inside it, named for the value
-(`v0_zeta0p02`): a `.scap` drive capture plus an accelerometer CSV, the
+(`zeta0p02`): a `.scap` drive capture plus an accelerometer CSV, the
 manifest rewritten as each sweep completes so a crash keeps whatever was
 measured. That layout is the whole feature — the tune tab charts a
 comparison with the sections it draws for any stepped run: a following-error

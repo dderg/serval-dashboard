@@ -110,7 +110,7 @@ fn a_comparison_analyzes_end_to_end_from_standstill_captures() {
     let dir = std::env::temp_dir().join(format!("servo_cal_cmp_{}_{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
-    let steps = ["v0_zeta0p005", "v1_zeta0p02"];
+    let steps = ["zeta0p005", "zeta0p02"];
     for name in steps {
         std::fs::write(dir.join(format!("step_{name}.scap")), buzz_bytes(4096)).unwrap();
     }
