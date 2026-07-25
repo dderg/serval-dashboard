@@ -170,18 +170,18 @@ test("a comparison is one more row, structurally identical to a gain sweep", () 
   const columns = (row: HTMLTableRowElement) =>
     [...row.querySelectorAll("td")].map((td) => td.className.replace(" empty", ""));
   expect(columns(compare)).toEqual(columns(ordinary));
-  expect(columns(compare)).toEqual(["", "", "", "run-command", "diff", "run-note", "actions"]);
+  expect(columns(compare)).toEqual(["", "", "", "diff", "run-note", "actions"]);
   // the tag column reads like every other run — no "pin_compare/<name>" prefix
   expect(compare.children[2].textContent?.trim()).toBe("cmp Y");
 });
 
-test("the command that made the run is shown, truncated with the full text as a tooltip", () => {
-  const cell = rowFor(COMPARE_RUN).querySelector<HTMLElement>("td.run-command");
-  expect(cell).not.toBeNull();
-  expect(cell!.textContent?.trim()).toBe(COMPARE_COMMAND);
-  expect(cell!.getAttribute("title")).toBe(COMPARE_COMMAND);
-  // the CSS ellipsis is what truncates; the cell must not wrap it away
-  expect(rowFor(RUN_NAME).querySelector("td.run-command")).not.toBeNull();
+test("a comparison offers the same → console prefill as any other run", () => {
+  // The run's command line lives in its manifest and reaches the console
+  // through this button; the runs table deliberately does not spend a
+  // column repeating it.
+  const button = rowFor(COMPARE_RUN).querySelector<HTMLButtonElement>("td.actions button");
+  expect(button?.textContent).toContain("console");
+  expect(button?.disabled).toBe(false);
 });
 
 test("a comparison takes a note like any other run", async () => {

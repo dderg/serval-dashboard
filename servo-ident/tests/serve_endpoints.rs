@@ -267,41 +267,6 @@ fn write_pin_compare_run(run_dir: &Path, tag: &str) {
 }
 
 #[test]
-fn run_summaries_carry_the_command_that_made_the_run() {
-    let (root, _run_dirs) = demo_root("command");
-    let port = spawn_server(root.clone());
-
-    let resp = request(port, "GET", "/api/runs");
-    assert_eq!(resp.status, 200);
-    let runs: Value = serde_json::from_str(&resp.body).unwrap();
-    for run in runs.as_array().unwrap() {
-        let command = run["command"].as_str().expect("command is a string");
-        assert!(
-            command.starts_with("SERVO_CALIBRATE_GAINS "),
-            "{command:?} is not the manifest's command line"
-        );
-    }
-
-    std::fs::remove_dir_all(&root).ok();
-}
-
-/// A manifest without a `command` (anything written before the field
-/// existed) still lists — the column is simply blank.
-#[test]
-fn a_run_without_a_recorded_command_lists_with_a_null_command() {
-    let root = temp_dir("no_command");
-    write_bare_manifest(&root.join("bare_run"), "bare");
-    let port = spawn_server(root.clone());
-
-    let resp = request(port, "GET", "/api/runs");
-    assert_eq!(resp.status, 200);
-    let runs: Value = serde_json::from_str(&resp.body).unwrap();
-    assert_eq!(runs[0]["command"], Value::Null);
-
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[test]
 fn a_pin_comparison_lists_as_an_ordinary_run_and_serves_its_curves() {
     let root = temp_dir("pin_compare");
     write_pin_compare_run(&root.join("cmp_20260725_101500"), "cmp");
@@ -314,10 +279,6 @@ fn a_pin_comparison_lists_as_an_ordinary_run_and_serves_its_curves() {
     assert_eq!(row["tag"], Value::from("cmp"));
     assert_eq!(row["axis"], Value::from("X"));
     assert_eq!(row["has_results"], Value::Bool(false));
-    assert_eq!(
-        row["command"],
-        Value::from("SERVO_COMPARE_PIN MODE=X PARAM=ZETA NAME=cmp")
-    );
 
     let resp = request(port, "GET", "/api/runs/cmp_20260725_101500/pin_compare");
     assert_eq!(resp.status, 200);

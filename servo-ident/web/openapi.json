@@ -1616,13 +1616,6 @@
               "null"
             ]
           },
-          "command": {
-            "description": "The G-code line that produced the run, as the manifest recorded it.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "experiment": {
             "type": "string"
           },

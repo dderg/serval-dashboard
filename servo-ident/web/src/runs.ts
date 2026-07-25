@@ -258,9 +258,6 @@ function RunRow({ run, def }: { run: RunSummary; def: PageDef }) {
         ? `${run.experiment}/${run.tag}${run.axis ? " " + run.axis : ""}`
         : `${run.tag}${run.axis ? " " + run.axis : ""}`}
     </td>
-    <td class=${run.command ? "run-command" : "run-command empty"} title=${run.command || null}>
-      ${run.command || "—"}
-    </td>
     <td class=${diff ? "diff" : "diff empty"} title=${diff || null}>${diff || "—"}</td>
     <${NoteCell} run=${run} />
     <td class="actions">
@@ -324,7 +321,7 @@ function TunePage() {
             <table>
               <thead>
                 <tr>
-                  <th></th><th>time</th><th>tag</th><th>command</th>
+                  <th></th><th>time</th><th>tag</th>
                   <th>ambient diff vs previous</th><th>note</th><th></th>
                 </tr>
               </thead>
@@ -364,7 +361,7 @@ function JournalPage() {
             <table>
               <thead>
                 <tr>
-                  <th></th><th>time</th><th>experiment/tag</th><th>command</th>
+                  <th></th><th>time</th><th>experiment/tag</th>
                   <th>ambient diff vs previous</th><th>note</th><th></th>
                 </tr>
               </thead>

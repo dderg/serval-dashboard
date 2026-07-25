@@ -105,7 +105,6 @@ function runsUnchanged(prev: RunSummary[], next: RunSummary[]): boolean {
         run.experiment === current.experiment &&
         run.tag === current.tag &&
         run.axis === current.axis &&
-        run.command === current.command &&
         run.has_results === current.has_results &&
         verdictsMatch &&
         run.note === current.note

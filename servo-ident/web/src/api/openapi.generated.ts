@@ -1078,8 +1078,6 @@ export interface components {
         };
         RunSummary: {
             axis?: string | null;
-            /** @description The G-code line that produced the run, as the manifest recorded it. */
-            command?: string | null;
             experiment: string;
             has_results: boolean;
             mtime_utc: string;

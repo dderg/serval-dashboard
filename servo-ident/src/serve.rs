@@ -41,8 +41,6 @@ pub struct RunSummary {
     pub experiment: String,
     pub tag: String,
     pub axis: Option<String>,
-    /// The G-code line that produced the run, as the manifest recorded it.
-    pub command: Option<String>,
     pub has_results: bool,
     pub verdict: Option<VerdictSummary>,
     pub note: Option<String>,
@@ -194,7 +192,6 @@ pub fn list_runs(captures_root: &Path) -> Result<Vec<RunSummary>, String> {
                 experiment: manifest.experiment,
                 tag: manifest.tag,
                 axis: manifest.axis,
-                command: manifest.command,
                 has_results,
                 verdict,
                 note,
