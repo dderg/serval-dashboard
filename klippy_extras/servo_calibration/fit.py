@@ -2305,7 +2305,11 @@ class DynamicsFitCommands(MeasureCommands):
         "AMPLITUDE (mm; config pin_sweep_amplitude, 0.01) NAME (pin_sweep) "
         "ACCEL_CHIP (accelerometer scoring the toolhead directly; config "
         "accel_chip, else off - measures the real spike at the tone as an "
-        "extra column and its own flagged minimum, residual still applied) "
+        "extra column and its own flagged minimum) ZETA_TOL (0.15 - for "
+        "PARAM=ZETA the applied value is the LOWEST zeta scoring within "
+        "this fraction of the best residual, not the plain minimum: zeta "
+        "is inverse predictor gain, and under-driving the pin leaves both "
+        "the coupled and locked-rotor spikes standing) "
         "PROFILE"
     )
 
@@ -2457,6 +2461,34 @@ class DynamicsFitCommands(MeasureCommands):
             total_sq += amp * amp
         return math.sqrt(total_sq)
 
+    @staticmethod
+    def _pick_pin_value(
+        scored: list[tuple[float, float | None]], param: str, zeta_tol: float
+    ) -> tuple[float, float]:
+        """Choose the applied value from a scored staircase.
+
+        LEAD takes the plain residual minimum. ZETA does not: zeta is the
+        predictor's inverse gain (Q = 1/2zeta at f_b), so a residual
+        minimum is the point where the ROTOR tracks the dwell tone best,
+        which is not the same as the point where the coupled toolhead mode
+        is most completely cancelled. Under-driving the pin leaves both the
+        coupled and the locked-rotor resonance standing - two input-shaper
+        spikes where an unpinned machine had one - so among values that
+        score within ``zeta_tol`` of the best residual, the LOWEST zeta (the
+        most cancellation) is the honest pick. Exact ties would otherwise
+        resolve by list order."""
+        usable = [(v, r) for v, r in scored if r is not None]
+        if not usable:
+            raise ValueError("no scored steps")
+        best_value, best_res = min(usable, key=lambda t: t[1])
+        if param != "ZETA":
+            return best_value, best_res
+        ceiling = best_res * (1.0 + zeta_tol)
+        for value, res in sorted(usable):
+            if res <= ceiling:
+                return value, res
+        return best_value, best_res
+
     def _run_pin_staircase(
         self,
         gcmd: Any,
@@ -2478,6 +2510,7 @@ class DynamicsFitCommands(MeasureCommands):
         amplitude: float,
         name: str,
         accel_chip: Any = None,
+        zeta_tol: float = 0.15,
     ) -> tuple[
         list[tuple[float, float | None, float | None]], float, float, str
     ]:
@@ -2628,9 +2661,13 @@ class DynamicsFitCommands(MeasureCommands):
                 self._active_run = None
         scored = self._pin_sweep_scores(gcmd, results, values)
         rows = [(v, r, a) for (v, r), a in zip(scored, accels)]
-        best_value, best_res = min(
-            ((v, r) for v, r in scored if r is not None), key=lambda t: t[1]
-        )
+        best_value, best_res = self._pick_pin_value(scored, param, zeta_tol)
+        if param == "ZETA" and best_value == min(values):
+            gcmd.respond_info(
+                "pin sweep (mode %s): ZETA settled on the ladder floor %g - "
+                "the useful value may be lower still; re-run with a lower "
+                "ZETA_COARSE floor to find out" % (mode, best_value)
+            )
         accel_scored = [(v, a) for v, _r, a in rows if a is not None]
         if accel_scored:
             best_accel_value, best_accel = min(accel_scored, key=lambda t: t[1])
@@ -2744,6 +2781,7 @@ class DynamicsFitCommands(MeasureCommands):
             amplitude,
             name,
             accel_chip,
+            gcmd.get_float("ZETA_TOL", 0.15, minval=0.0),
         )
         accel_on = any(a is not None for _v, _r, a in rows)
 
@@ -2802,7 +2840,7 @@ class DynamicsFitCommands(MeasureCommands):
             run_dir=run_dir,
         )
         gcmd.respond_info(
-            "pin sweep %s (mode %s) residual: %s | minimum at %s=%g "
+            "pin sweep %s (mode %s) residual: %s | picked %s=%g "
             "(%.2f um) | to apply: %s"
             % (
                 param,
@@ -3263,7 +3301,8 @@ class DynamicsFitCommands(MeasureCommands):
         "dwell tone; config pin_sweep_amplitude, 0.01) MEASURE_AMPLITUDE "
         "(mm, identification sweep; config compliance_amplitude, 0.02) "
         "LEAD_VALUES (0,150,300,450,600) "
-        "ZETA_COARSE (0.02,0.035,0.05,0.08,0.12,0.2,0.3) "
+        "ZETA_COARSE (0.005,0.01,0.02,0.035,0.05,0.08,0.12,0.2) ZETA_TOL "
+        "(0.15) "
         "X_FREQ Y_FREQ X_PEAK Y_PEAK (Hz, skip a mode's measurement) "
         "ACCEL_CHIP (toolhead accel scoring on every ladder stage; config "
         "accel_chip, else off) NAME (pin_tune) PROFILE"
@@ -3302,8 +3341,9 @@ class DynamicsFitCommands(MeasureCommands):
         zeta_coarse = self._coerce_pin_values(
             gcmd,
             "ZETA",
-            gcmd.get("ZETA_COARSE", "0.02,0.035,0.05,0.08,0.12,0.2,0.3"),
+            gcmd.get("ZETA_COARSE", "0.005,0.01,0.02,0.035,0.05,0.08,0.12,0.2"),
         )
+        zeta_tol = gcmd.get_float("ZETA_TOL", 0.15, minval=0.0)
         name = gcmd.get("NAME", "pin_tune")
         servos = list(spatial["axes"])
         node = self._dynamics_node(gcmd, servos)
@@ -3431,6 +3471,7 @@ class DynamicsFitCommands(MeasureCommands):
                     amplitude,
                     name,
                     accel_chip,
+                    zeta_tol,
                 )
                 working["pin_zeta"][mode_i] = coarse_win
                 fine_lo = coarse_win / 1.6
@@ -3458,6 +3499,7 @@ class DynamicsFitCommands(MeasureCommands):
                     amplitude,
                     name,
                     accel_chip,
+                    zeta_tol,
                 )
                 working["pin_zeta"][mode_i] = fine_win
                 summary[mode] = {

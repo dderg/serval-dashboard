@@ -111,12 +111,16 @@ def test_tune_pin_full_flow_applies_per_mode_zeta_and_shared_lead():
 
     engine = sc.printer.lookup_object("motion_engine")
     final = engine.dynamics_calls[-1]
-    # Per-mode fine winners: coarse picks the nearest grid point, the fine
-    # staircase (winner/1.6 .. winner*1.6, 5 log-spaced) refines toward the
-    # target. x: coarse 0.05 -> fine 0.0632; y: coarse 0.12 -> fine 0.1518.
-    fine_x = 0.05 / 1.6 * (2.56 ** (3.0 / 4.0))
+    # Per-mode winners. The synthetic residual bowl minimises at
+    # ZETA_TARGET, but ZETA is picked by the knee rule, not argmin: the
+    # lowest zeta scoring within ZETA_TOL of the best wins, because zeta is
+    # inverse predictor gain and under-driving the pin leaves two spikes.
+    # x: bowl is shallow across the grid, so the fine stage's 0.05 rung
+    # scores within 15% of the 0.0632 minimum and the knee takes it.
+    # y: bowl is steep enough that nothing below the 0.1518 minimum
+    # qualifies, so the knee agrees with argmin.
     fine_y = 0.12 / 1.6 * (2.56 ** (3.0 / 4.0))
-    assert final[7][0] == pytest.approx(fine_x, rel=1e-6)
+    assert final[7][0] == pytest.approx(0.05, rel=1e-6)
     assert final[7][1] == pytest.approx(fine_y, rel=1e-6)
     # lead is a whole-model scalar applied once, on the lowest-f mode (y)
     assert final[8] == 300.0
@@ -136,7 +140,7 @@ def test_tune_pin_full_flow_applies_per_mode_zeta_and_shared_lead():
     assert "type: mode_inverse" in report
     assert "frequency_hz: 216.8" in report
     assert "frequency_hz: 131.5" in report
-    assert "damping_ratio: %.4g" % (fine_x,) in report
+    assert "damping_ratio: %.4g" % (0.05,) in report
     assert "damping_ratio: %.4g" % (fine_y,) in report
     assert sc._active_run is None
 
@@ -149,8 +153,7 @@ def test_tune_pin_single_mode_runs_lead_on_that_mode():
     report = " ".join(gcmd.responses)
     engine = sc.printer.lookup_object("motion_engine")
     final = engine.dynamics_calls[-1]
-    fine_x = 0.05 / 1.6 * (2.56 ** (3.0 / 4.0))
-    assert final[7][0] == pytest.approx(fine_x, rel=1e-6)
+    assert final[7][0] == pytest.approx(0.05, rel=1e-6)
     # y stays unpinned (baseline pin_zeta 0.0)
     assert final[7][1] == 0.0
     assert final[8] == 300.0
@@ -299,7 +302,7 @@ def test_tune_pin_scores_accel_on_every_ladder_stage():
     # MODES=X keeps every staircase (coarse 7, fine 5, lead 5) at the same
     # tone f_b, so the chip's fixed-frequency tone lines up. The accel
     # minimum line surfaces once per stage and the pin verdict is unchanged.
-    n_steps = 7 + 5 + 5
+    n_steps = 8 + 5 + 5
     amps = [1.0 + 0.1 * i for i in range(n_steps)]
     sc, _gcode, node, path = _setup(accel_amps=amps, accel_freq=131.5)
     gcmd = FakeGcmd(

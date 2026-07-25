@@ -132,8 +132,10 @@ def _setup(
 
 
 @requires_tomllib
-def test_pin_sweep_picks_the_minimum_residual():
-    # residuals (um): 5, 2, 1, 3 -> minimum at the third value (ZETA=0.06).
+def test_pin_sweep_picks_the_minimum_residual_when_it_is_a_clear_win():
+    # residuals (um): 5, 2, 1, 3. Nothing lower scores within ZETA_TOL of
+    # the 1 um minimum, so the plain minimum is also the lowest admissible
+    # zeta and the knee rule agrees with argmin.
     sc, _gcode, node, path = _setup(residuals=[5.0e-3, 2.0e-3, 1.0e-3, 3.0e-3])
     gcmd = FakeGcmd(
         MODE="X",
@@ -144,7 +146,7 @@ def test_pin_sweep_picks_the_minimum_residual():
     )
     sc.cmd_SERVO_SWEEP_PIN(gcmd)
     report = " ".join(gcmd.responses)
-    assert "minimum at ZETA=0.06" in report
+    assert "picked ZETA=0.06" in report
     assert "X_ZETA=0.06" in report
     # the ready-to-run line carries the reconstructed FRF peak and preserves
     # the un-swept pin lead (baseline pin_lead_us=100)
@@ -160,6 +162,62 @@ def test_pin_sweep_picks_the_minimum_residual():
 
 
 @requires_tomllib
+def test_pin_sweep_prefers_the_lowest_zeta_on_a_flat_residual_shoulder():
+    # residuals (um): 1.05, 1.02, 1.00, 3.0. Argmin is ZETA=0.02, but the
+    # three low values are within noise of each other - and zeta is inverse
+    # predictor gain, so the lowest one cancels the coupled mode hardest.
+    # Taking the argmin here is what left the machine with two input-shaper
+    # spikes instead of one.
+    sc, _gcode, _node, _path = _setup(
+        residuals=[1.05e-3, 1.02e-3, 1.0e-3, 3.0e-3]
+    )
+    gcmd = FakeGcmd(
+        MODE="X",
+        FREQ="130",
+        PARAM="ZETA",
+        VALUES="0.005,0.01,0.02,0.04",
+        DWELL="1",
+    )
+    sc.cmd_SERVO_SWEEP_PIN(gcmd)
+    report = " ".join(gcmd.responses)
+    assert "picked ZETA=0.005" in report
+    assert "X_ZETA=0.005" in report
+    # settling on the lowest rung means the useful value may be lower still
+    assert "ladder floor" in report
+
+
+@requires_tomllib
+def test_pin_sweep_zeta_tol_zero_restores_plain_argmin():
+    sc, _gcode, _node, _path = _setup(
+        residuals=[1.05e-3, 1.02e-3, 1.0e-3, 3.0e-3]
+    )
+    gcmd = FakeGcmd(
+        MODE="X",
+        FREQ="130",
+        PARAM="ZETA",
+        VALUES="0.005,0.01,0.02,0.04",
+        DWELL="1",
+        ZETA_TOL="0",
+    )
+    sc.cmd_SERVO_SWEEP_PIN(gcmd)
+    assert "picked ZETA=0.02" in " ".join(gcmd.responses)
+
+
+@requires_tomllib
+def test_pin_sweep_lead_ignores_the_zeta_knee_rule():
+    # LEAD is not an inverse gain - there is no "prefer lower" argument, so
+    # a flat shoulder must still resolve to the actual minimum.
+    sc, _gcode, _node, _path = _setup(residuals=[1.05e-3, 1.02e-3, 1.0e-3])
+    gcmd = FakeGcmd(
+        MODE="X", FREQ="130", PARAM="LEAD", VALUES="0,150,300", DWELL="1"
+    )
+    sc.cmd_SERVO_SWEEP_PIN(gcmd)
+    report = " ".join(gcmd.responses)
+    assert "picked LEAD=300" in report
+    assert "ladder floor" not in report
+
+
+@requires_tomllib
 def test_pin_sweep_sweeps_lead_and_keeps_zeta():
     sc, _gcode, _node, _path = _setup(residuals=[3.0e-3, 1.0e-3, 4.0e-3])
     gcmd = FakeGcmd(
@@ -167,7 +225,7 @@ def test_pin_sweep_sweeps_lead_and_keeps_zeta():
     )
     sc.cmd_SERVO_SWEEP_PIN(gcmd)
     report = " ".join(gcmd.responses)
-    assert "minimum at LEAD=150" in report
+    assert "picked LEAD=150" in report
     # LEAD is a whole-model scalar (arg index 8); zeta stays at baseline 0.05
     engine = sc.printer.lookup_object("motion_engine")
     assert [call[8] for call in engine.dynamics_calls][:3] == [
