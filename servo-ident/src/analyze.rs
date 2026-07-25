@@ -1150,8 +1150,8 @@ pub fn compute_verdict(
                 let mode = plan_str("mode")?;
                 let param = plan_str("param")?;
                 // (swept value, step index, worst in-band ferr amplitude in
-                // um, the frequency it sits at)
-                let mut scored: Vec<(f64, usize, f64, f64)> = Vec::new();
+                // um, the frequency it sits at, the psd bin width)
+                let mut scored: Vec<(f64, usize, f64, f64, f64)> = Vec::new();
                 let mut lines = Vec::new();
                 for (i, sr) in steps.iter().enumerate() {
                     let ps = plots
@@ -1201,10 +1201,10 @@ pub fn compute_verdict(
                         .ok_or_else(|| format!("step {:?} missing from manifest", sr.name))?
                         .swept_value("value")
                         .ok_or_else(|| format!("step {:?} has no swept value", sr.name))?;
-                    scored.push((value, i, amp_um, f_at));
+                    scored.push((value, i, amp_um, f_at, df));
                     lines.push(format!("{}: {:.2} um @ {:.0} Hz", sr.name, amp_um, f_at));
                 }
-                let &(_, best_i, best_amp, _) = scored
+                let &(_, best_i, best_amp, _, _) = scored
                     .iter()
                     .min_by(|a, b| a.2.total_cmp(&b.2))
                     .expect("steps is non-empty");
@@ -1213,22 +1213,21 @@ pub fn compute_verdict(
                 // predictor's inverse gain, and under-driving the pin leaves
                 // the coupled resonance standing next to the locked-rotor
                 // one - two shaper spikes where an unpinned machine had one.
-                // LEAD is not a gain, so it takes the outright minimum.
-                let (win_i, win_amp, win_f) = if param == "ZETA" {
+                // LEAD and FREQ are not gains, so they take the outright
+                // minimum.
+                let &(win_value, win_i, win_amp, win_f, win_df) = if param == "ZETA" {
                     let ceiling = best_amp * 1.15;
-                    let mut by_value = scored.clone();
+                    let mut by_value: Vec<&(f64, usize, f64, f64, f64)> = scored.iter().collect();
                     by_value.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    let &(_, i, a, f) = by_value
-                        .iter()
-                        .find(|&&(_, _, a, _)| a <= ceiling)
-                        .expect("the best step is always under its own ceiling");
-                    (i, a, f)
+                    by_value
+                        .into_iter()
+                        .find(|&&(_, _, a, _, _)| a <= ceiling)
+                        .expect("the best step is always under its own ceiling")
                 } else {
-                    let &(_, i, a, f) = scored
+                    scored
                         .iter()
                         .min_by(|a, b| a.2.total_cmp(&b.2))
-                        .expect("steps is non-empty");
-                    (i, a, f)
+                        .expect("steps is non-empty")
                 };
                 let tie_note = if win_i != best_i {
                     format!(
@@ -1238,15 +1237,50 @@ pub fn compute_verdict(
                 } else {
                     String::new()
                 };
+                let mut notes = String::new();
+                if param == "FREQ" {
+                    // Signatures from the bench frequency ladder (2026-07-25,
+                    // model f_b 136.7 -> 130 Hz, true resonance ~129): every
+                    // too-high step parks its worst tone at one fixed
+                    // frequency (~137, NOT tracking its own f_b), and the
+                    // moment the frequency is right the tone migrates to
+                    // unrelated background (160). The score was also monotone
+                    // down that whole ladder - an outright min at the ladder
+                    // floor means "extend", not "done".
+                    let &(_, _, worst_amp, worst_f, _) = scored
+                        .iter()
+                        .max_by(|a, b| a.2.total_cmp(&b.2))
+                        .expect("steps is non-empty");
+                    if worst_amp < win_amp * 1.25 {
+                        notes.push_str(
+                            "; scores nearly tie across the ladder - these \
+                             frequencies are in-band equivalent",
+                        );
+                    } else if (win_f - worst_f).abs() <= 2.0 * win_df {
+                        notes.push_str(
+                            "; the winner's worst tone has not migrated away \
+                             from the failing steps' - the frequency is \
+                             likely still off",
+                        );
+                    }
+                    let floor = scored.iter().map(|s| s.0).fold(f64::INFINITY, f64::min);
+                    if win_value == floor {
+                        notes.push_str(
+                            "; the winner is the ladder floor - the useful \
+                             frequency may be lower still",
+                        );
+                    }
+                }
                 Ok((
                     steps[win_i].name.clone(),
                     format!(
-                        "flattest in-band ferr {:.2} um @ {:.0} Hz at {}{}; {}",
+                        "flattest in-band ferr {:.2} um @ {:.0} Hz at {}{}; {}{}",
                         win_amp,
                         win_f,
                         steps[win_i].name,
                         tie_note,
-                        lines.join(", ")
+                        lines.join(", "),
+                        notes
                     ),
                 ))
             };

@@ -2377,12 +2377,21 @@ class DynamicsFitCommands(MeasureCommands):
                 raise gcmd.error("VALUES entry %r is not a number" % (p,))
             # Same rules as SERVO_SET_COMPLIANCE: ZETA finite and > 0 (no
             # upper cap - overdamped predictors are legal); PIN_LEAD_US in
-            # [0, PIN_LEAD_US_MAX] (minval=0.0, maxval=PIN_LEAD_US_MAX).
+            # [0, PIN_LEAD_US_MAX] (minval=0.0, maxval=PIN_LEAD_US_MAX);
+            # FREQ (model f_b, compare-only) finite and > 0 here - the
+            # only other hard limit, f_b < the mode's coupled peak, needs
+            # the baseline profile and is checked by the command upfront.
             if param == "ZETA":
                 if not (math.isfinite(v) and v > 0.0):
                     raise gcmd.error(
                         "VALUES ZETA entry %g must be a finite number > 0 "
                         "(same rule as SERVO_SET_COMPLIANCE ZETA)" % (v,)
+                    )
+            elif param == "FREQ":
+                if not (math.isfinite(v) and v > 0.0):
+                    raise gcmd.error(
+                        "VALUES FREQ entry %g must be a finite frequency "
+                        "> 0 Hz (the model f_b)" % (v,)
                     )
             elif not 0.0 <= v <= PIN_LEAD_US_MAX:
                 raise gcmd.error(
@@ -2401,14 +2410,42 @@ class DynamicsFitCommands(MeasureCommands):
         value: float,
     ) -> dict[str, Any]:
         """Copy the baseline and set the one swept pin parameter on the
-        pinned mode; the other pin parameter is preserved by the copy."""
+        pinned mode; the other pin parameters are preserved by the copy."""
         updated = _copy_dynamics(baseline)
         updated["ff_lead_us"] = baseline.get("ff_lead_us", 0.0)
         if param == "ZETA":
             updated["pin_zeta"][mode_i] = value
+        elif param == "FREQ":
+            # f_b is not a model field: it rides compliance
+            # (c = 1/(2*pi*f_b)^2) and, jointly with the coupled peak,
+            # pin_mass (= mass*(1-(f_b/f_peak)^2)). Sweeping the model
+            # frequency recomputes both while f_peak - the measured plant
+            # fact - stays where the measurement put it.
+            f_peak = self._pin_mode_f_peak(baseline, mode_i)
+            mass = baseline["mass"][mode_i]
+            updated["compliance"][mode_i] = 1.0 / (2.0 * math.pi * value) ** 2
+            updated["pin_mass"][mode_i] = mass * (1.0 - (value / f_peak) ** 2)
         else:  # LEAD -> pin_lead_us is a whole-model scalar
             updated["pin_lead_us"] = value
         return updated
+
+    @staticmethod
+    def _pin_mode_f_peak(baseline: dict[str, Any], mode_i: int) -> float:
+        """The mode's coupled-peak frequency implied by the baseline's
+        compliance and pin_mass (f_peak = f_b / sqrt(1 - pin_mass/mass)),
+        the same relation SERVO_TUNE_PIN uses. Requires an actively pinned
+        mode with a positive compliance."""
+        comp = baseline["compliance"][mode_i]
+        pin_mass = baseline["pin_mass"][mode_i]
+        mass = baseline["mass"][mode_i]
+        if comp <= 0.0 or pin_mass <= 0.0:
+            raise ValueError(
+                "mode %d is not actively pinned in the baseline "
+                "(compliance %g, pin_mass %g)" % (mode_i, comp, pin_mass)
+            )
+        f_b = 1.0 / (2.0 * math.pi * math.sqrt(comp))
+        fraction = pin_mass / mass
+        return f_b / math.sqrt(max(1.0 - fraction, 1e-9))
 
     @staticmethod
     def _pin_step_name(param: str, value: float) -> str:
@@ -3001,7 +3038,12 @@ class DynamicsFitCommands(MeasureCommands):
         "own run, exactly like every other calibration command: re-using "
         "NAME makes a second, separate run - sweeps are never merged across "
         "invocations. Measurement only: the pre-sweep model is restored at "
-        "the end (also on failure). Params MODE=X|Y PARAM=ZETA|LEAD "
+        "the end (also on failure). PARAM=FREQ sweeps the model f_b itself "
+        "(compliance and pin_mass recomputed per value, coupled peak "
+        "fixed): the plant's true resonance sits below the small-amplitude "
+        "notch measurement, and the chirp signature - worst in-band tone "
+        "parked at the model f_b vs migrated to background - says whether "
+        "the frequency is still off. Params MODE=X|Y PARAM=ZETA|LEAD|FREQ "
         "VALUES (comma list) FREQ_START FREQ_END (Hz, required) HZ_PER_SEC "
         "(1.0) ACCEL_PER_HZ (mm/s^2 per Hz, 75) RAMP DWELL (s "
         "between sweeps, 3) ACCEL_CHIP (required; config accel_chip) "
@@ -3179,9 +3221,9 @@ class DynamicsFitCommands(MeasureCommands):
             )
         mode = modes[0]
         param = gcmd.get("PARAM", "").upper()
-        if param not in ("ZETA", "LEAD"):
+        if param not in ("ZETA", "LEAD", "FREQ"):
             raise gcmd.error(
-                "PARAM= is required and must be ZETA or LEAD (got %r)"
+                "PARAM= is required and must be ZETA, LEAD or FREQ (got %r)"
                 % (param,)
             )
         values = self._parse_pin_sweep_values(gcmd, param)
@@ -3244,6 +3286,27 @@ class DynamicsFitCommands(MeasureCommands):
                 % (mode, profile_path, baseline["modes"])
             )
         mode_i = baseline["modes"].index(mode)
+        if param == "FREQ":
+            # The only hard limit on a swept model f_b is the mode's
+            # coupled peak: at f_b = f_peak the implied pin_mass hits zero
+            # (pin_mass = mass*(1-(f_b/f_peak)^2)) and the pin stops
+            # existing. Needs the baseline, so it lands here - still
+            # before the first excitation.
+            try:
+                f_peak = self._pin_mode_f_peak(baseline, mode_i)
+            except ValueError as e:
+                raise gcmd.error(
+                    "PARAM=FREQ needs mode %s actively pinned in %s (%s) - "
+                    "pin it first with SERVO_SET_COMPLIANCE PIN="
+                    % (mode, profile_path, e)
+                )
+            for v in values:
+                if v >= f_peak:
+                    raise gcmd.error(
+                        "VALUES FREQ entry %g Hz is at or above the mode's "
+                        "coupled peak %.1f Hz - the implied pin_mass would "
+                        "be <= 0" % (v, f_peak)
+                    )
         slot_for: dict[str, int] = {}
         invert_for: dict[str, bool] = {}
         for servo in servos:

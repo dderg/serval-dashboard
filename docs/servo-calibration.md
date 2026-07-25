@@ -743,8 +743,25 @@ but not scored either — the better the pin, the more of the band's energy
 piles into the one sharp locked-rotor peak, so in-band accel peak height is
 anti-correlated with quality on a chirp. For `PARAM=ZETA` the verdict takes
 the lowest value within 15 % of the best (under-driving splits the spectrum
-into two shaper spikes, worse than no pin); `LEAD` takes the outright
-minimum.
+into two shaper spikes, worse than no pin); `LEAD` and `FREQ` take the
+outright minimum.
+
+**`PARAM=FREQ` sweeps the model `f_b` itself.** The frequency is not a model
+field: per value the compliance is recomputed as `1/(2π·f_b)²` and the
+`pin_mass` as `mass·(1−(f_b/f_peak)²)`, with the coupled peak `f_peak` held
+at the baseline's implied value (the measured plant fact). The motivation is
+that the small-amplitude notch measurement reads high — the bench ladder
+walked the model from the measured 136.7 Hz down to 130 while the in-band
+ferr score fell monotonically — so the model frequency deserves its own
+A/B. Two hard limits only: `f_b > 0`, and `f_b < f_peak` (at the peak the
+implied `pin_mass` hits zero and the pin stops existing; checked against the
+baseline before the first excitation). The verdict adds `FREQ`-specific
+notes read off the bench signature: when the scores nearly tie the
+frequencies are declared in-band equivalent; when the winner's worst tone
+has **not migrated away** from where the failing steps park theirs, the
+frequency is flagged as likely still off; and a winner at the ladder floor
+says the useful frequency may be lower still (the score is monotone until
+saturation, so an edge win means "extend", not "done").
 
 Each invocation is an **ordinary run** — the same
 `<captures_root>/<NAME>_<stamp>/manifest.json` every other calibration
@@ -765,9 +782,10 @@ failure mid-sweep). Every check that can reject the command (mode, param,
 frequency bounds, amplitude representability, accelerometer, baseline
 profile) runs **before** the first excitation, so measured sweeps are never
 discarded at write time. Params: `MODE=X|Y`
-(required, exactly one mode) `PARAM=ZETA|LEAD` (required) `VALUES` (comma
-list, nonempty, each validated by the `SERVO_SET_COMPLIANCE`
-`ZETA`/`PIN_LEAD_US` rules) `FREQ_START` `FREQ_END` (Hz, required,
+(required, exactly one mode) `PARAM=ZETA|LEAD|FREQ` (required) `VALUES`
+(comma list, nonempty; `ZETA`/`LEAD` validated by the
+`SERVO_SET_COMPLIANCE` rules, `FREQ` by the coupled-peak ceiling above)
+`FREQ_START` `FREQ_END` (Hz, required,
 hard-limit validated) `HZ_PER_SEC` (default 1.0) `ACCEL_PER_HZ` (mm/s² per
 Hz, default 75 — sets the displacement at `FREQ_START` to
 `ACCEL_PER_HZ/(4π²·FREQ_START)`) `RAMP` `DWELL` (s between sweeps, default 3)

@@ -308,21 +308,14 @@ fn pin_sweep_without_pin_channels_recommends_nothing() {
 /// 70-200 Hz, so the 240/280 Hz bins are out of band.
 const COMPARE_GRID_HZ: [f64; 8] = [0.0, 40.0, 80.0, 120.0, 160.0, 200.0, 240.0, 280.0];
 
-/// mm²/Hz putting a single-sided tone of `amp_um` into one Welch bin of the
-/// grid above (df = 40): the inverse of the arm's amplitude conversion.
-fn psd_for_amp_um(amp_um: f64) -> f64 {
+/// mm²/Hz putting a single-sided tone of `amp_um` into one Welch bin of
+/// width `df`: the inverse of the arm's amplitude conversion.
+fn psd_for_amp_um(amp_um: f64, df: f64) -> f64 {
     let amp_mm = amp_um * 1e-3;
-    amp_mm * amp_mm / (2.0 * 1.5 * 40.0)
+    amp_mm * amp_mm / (2.0 * 1.5 * df)
 }
 
-fn compare_plot(name: &str, in_band_amp_um: f64) -> PlotStep {
-    // The in-band peak rides the 120 Hz bin; both out-of-band bins carry a
-    // tone ten times larger, so a scorer ignoring the swept band would rank
-    // every step by garbage the operator never asked about.
-    let mut psd = vec![0.0; COMPARE_GRID_HZ.len()];
-    psd[3] = psd_for_amp_um(in_band_amp_um);
-    psd[6] = psd_for_amp_um(in_band_amp_um * 10.0);
-    psd[7] = psd_for_amp_um(in_band_amp_um * 10.0);
+fn plot_step_with_psd(name: &str, grid: Vec<f64>, psd: Vec<f64>) -> PlotStep {
     let mut cartesian = BTreeMap::new();
     cartesian.insert("y".to_string(), psd);
     PlotStep {
@@ -339,12 +332,32 @@ fn compare_plot(name: &str, in_band_amp_um: f64) -> PlotStep {
         compliance: None,
         path: None,
         psd: PlotPsd {
-            freq_hz: COMPARE_GRID_HZ.to_vec(),
+            freq_hz: grid,
             per_drive: BTreeMap::new(),
             cartesian: Some(cartesian),
             accel: None,
         },
     }
+}
+
+fn compare_plot(name: &str, in_band_amp_um: f64) -> PlotStep {
+    // The in-band peak rides the 120 Hz bin; both out-of-band bins carry a
+    // tone ten times larger, so a scorer ignoring the swept band would rank
+    // every step by garbage the operator never asked about.
+    let mut psd = vec![0.0; COMPARE_GRID_HZ.len()];
+    psd[3] = psd_for_amp_um(in_band_amp_um, 40.0);
+    psd[6] = psd_for_amp_um(in_band_amp_um * 10.0, 40.0);
+    psd[7] = psd_for_amp_um(in_band_amp_um * 10.0, 40.0);
+    plot_step_with_psd(name, COMPARE_GRID_HZ.to_vec(), psd)
+}
+
+/// Fine grid (df = 5 Hz) for FREQ-compare tests: the migration tolerance is
+/// two bins, which the coarse grid above cannot resolve.
+fn freq_plot(name: &str, amp_um: f64, tone_hz: f64) -> PlotStep {
+    let grid: Vec<f64> = (0..=40).map(|k| k as f64 * 5.0).collect();
+    let mut psd = vec![0.0; grid.len()];
+    psd[(tone_hz / 5.0).round() as usize] = psd_for_amp_um(amp_um, 5.0);
+    plot_step_with_psd(name, grid, psd)
 }
 
 fn compare_plan(param: &str) -> serde_json::Value {
@@ -413,6 +426,86 @@ fn pin_compare_lead_takes_the_outright_minimum() {
         "{}",
         v.reason
     );
+}
+
+/// Bench frequency-ladder signature (2026-07-25): every too-high model f_b
+/// parks its worst tone at one fixed physical frequency (~135 here, NOT its
+/// own f_b), so a winner whose tone still sits with the failing steps'
+/// means the frequency is off, and a winner at the ladder floor means the
+/// ladder should extend - both notes must fire together here.
+#[test]
+fn pin_compare_freq_flags_an_unmigrated_tone_and_the_ladder_floor() {
+    let steps = vec![
+        pin_step("freq136", None),
+        pin_step("freq134", None),
+        pin_step("freq133", None),
+    ];
+    let plots = vec![
+        freq_plot("freq136", 3.0, 135.0),
+        freq_plot("freq134", 2.5, 135.0),
+        freq_plot("freq133", 2.1, 135.0),
+    ];
+    let msteps = vec![
+        manifest_step("freq136", json!({"value": 136.0})),
+        manifest_step("freq134", json!({"value": 134.0})),
+        manifest_step("freq133", json!({"value": 133.0})),
+    ];
+    let m = manifest("pin_compare", compare_plan("FREQ"), msteps);
+    let v = compute_verdict(&m, &steps, &plots).unwrap();
+    assert_eq!(
+        v.recommended_step.as_deref(),
+        Some("freq133"),
+        "{}",
+        v.reason
+    );
+    assert!(v.reason.contains("has not migrated"), "{}", v.reason);
+    assert!(v.reason.contains("ladder floor"), "{}", v.reason);
+}
+
+#[test]
+fn pin_compare_freq_migrated_tone_drops_the_off_note() {
+    // The winner's worst tone moved to unrelated background (160 Hz) while
+    // the failing step's sits at 135: the frequency is right, only the
+    // floor note remains (nothing below it was tested).
+    let steps = vec![pin_step("freq133", None), pin_step("freq130", None)];
+    let plots = vec![
+        freq_plot("freq133", 2.1, 135.0),
+        freq_plot("freq130", 1.6, 160.0),
+    ];
+    let msteps = vec![
+        manifest_step("freq133", json!({"value": 133.0})),
+        manifest_step("freq130", json!({"value": 130.0})),
+    ];
+    let m = manifest("pin_compare", compare_plan("FREQ"), msteps);
+    let v = compute_verdict(&m, &steps, &plots).unwrap();
+    assert_eq!(
+        v.recommended_step.as_deref(),
+        Some("freq130"),
+        "{}",
+        v.reason
+    );
+    assert!(!v.reason.contains("has not migrated"), "{}", v.reason);
+    assert!(v.reason.contains("ladder floor"), "{}", v.reason);
+}
+
+#[test]
+fn pin_compare_freq_flat_ladder_reports_a_tie() {
+    // Both tones already in the background and scores within 25%: the
+    // frequencies are equivalent - say so instead of a false "still off"
+    // (both tones sit at the same background frequency).
+    let steps = vec![pin_step("freq131", None), pin_step("freq130", None)];
+    let plots = vec![
+        freq_plot("freq131", 1.62, 160.0),
+        freq_plot("freq130", 1.59, 160.0),
+    ];
+    let msteps = vec![
+        manifest_step("freq131", json!({"value": 131.0})),
+        manifest_step("freq130", json!({"value": 130.0})),
+    ];
+    let m = manifest("pin_compare", compare_plan("FREQ"), msteps);
+    let v = compute_verdict(&m, &steps, &plots).unwrap();
+    assert!(v.reason.contains("nearly tie"), "{}", v.reason);
+    assert!(!v.reason.contains("has not migrated"), "{}", v.reason);
 }
 
 /// A manifest without a chirp plan (older build, foreign run) cannot be
