@@ -132,11 +132,24 @@ def make_sc(handle=1, engine_values=None, verdict=None):
     return sc, gcode
 
 
-def _manifest(sc):
-    run_dir = os.path.dirname(
+def _capture_run_dir(sc):
+    return os.path.dirname(
         sc.printer.lookup_object("servo_capture").starts[0][0]
     )
-    with open(os.path.join(run_dir, "manifest.json")) as f:
+
+
+def _analyze_argv(sc):
+    """argv of the last servo-cal invocation - the run scope's analyze for
+    every command whose own body never asks for one."""
+    runs = [
+        s for s in sc.gcode.scripts if isinstance(s, tuple) and s[0] == "RUN"
+    ]
+    assert runs, "the run scope invoked servo-cal not at all"
+    return runs[-1][1]
+
+
+def _manifest(sc):
+    with open(os.path.join(_capture_run_dir(sc), "manifest.json")) as f:
         return json.load(f)
 
 
@@ -673,6 +686,21 @@ def test_strain_map_sync_zero_skips_the_zero_point():
     assert _manifest(sc)["stroke_plan"]["zero_sync"] is False
 
 
+def test_strain_map_analyzes_the_raster_at_scope_exit():
+    """The raster body never asks for analysis - the run scope does, so a
+    map cannot land on disk without its results.json."""
+    servo_param.drain_param_writes()
+    sc, _gcode = make_sc()
+    sc.printer.add_object("servo_sync", FakeServoSync())
+    sc.bounds = {"X": (30.0, 270.0), "Y": (30.0, 270.0)}
+    sc.cmd_SERVO_MEASURE_STRAIN_MAP(FakeGcmd(LINE_SPACING="120"))
+    assert _analyze_argv(sc) == [
+        sys.executable,
+        "analyze",
+        _capture_run_dir(sc),
+    ]
+
+
 def test_strain_map_rejects_cartesian_kinematics():
     servo_param.drain_param_writes()
     sc, _gcode = make_sc()
@@ -740,6 +768,9 @@ def test_strain_response_steps_each_pair_along_one_line_and_fits():
     assert m["stroke_plan"]["y"] == 150.0
     assert m["steps"][1]["swept"] == {"belt": 0.0, "offset_um": 50.0}
     assert comp.fits == [os.path.dirname(caps[0][0])]
+    # The scope analyzes inside the with, i.e. before the outer finally
+    # clears the offset session and before the stiffness fit reads the run.
+    assert _analyze_argv(sc)[1:] == ["analyze", _capture_run_dir(sc)]
 
 
 def test_strain_response_without_strain_comp_errors_loudly():
@@ -918,6 +949,7 @@ def test_tune_loops_xy_lines_until_converged():
     assert m["steps"][0]["swept"]["kaa"] == 300.0
     assert m["steps"][0]["swept"]["y"] == 150.0
     assert m["steps"][0]["swept"]["x"] == 150.0
+    assert _analyze_argv(sc)[1:] == ["analyze", _capture_run_dir(sc)]
 
 
 def test_tune_fails_loudly_when_it_does_not_converge():
@@ -925,6 +957,9 @@ def test_tune_fails_loudly_when_it_does_not_converge():
     with pytest.raises(RuntimeError, match="did not converge"):
         sc.cmd_SERVO_STRAIN_COMP_TUNE(FakeGcmd(RUN="ignored"))
     assert comp.tuner.stored == 0
+    # The scope exits cleanly before the non-convergence error is raised,
+    # so the iterations that did run are analyzed, not thrown away.
+    assert _analyze_argv(sc)[1:] == ["analyze", _capture_run_dir(sc)]
 
 
 def test_tune_without_strain_comp_errors_loudly():

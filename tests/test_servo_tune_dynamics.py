@@ -1265,7 +1265,7 @@ def test_tune_dynamics_resume_replays_all_rounds_without_capturing():
     with open(tune1["profile"], "rb") as f:
         prof1 = tomllib.load(f)
 
-    sc2, _gcode2, _path2 = make_calibration()
+    sc2, gcode2, _path2 = make_calibration()
     # deliberately DIFFERENT fake bench: a full replay must never capture,
     # so the resumed tune has to land on the exact same profile anyway
     sc2.fake_rms_fn = quadratic_rms(mass_opt=[0.014, 0.022])
@@ -1280,6 +1280,23 @@ def test_tune_dynamics_resume_replays_all_rounds_without_capturing():
     with open(profiles[0], "rb") as f:
         prof2 = tomllib.load(f)
     assert prof2["mass"] == pytest.approx(prof1["mass"])
+    # A capture-free run is the one legitimate zero-step run: it says where
+    # its evidence came from instead, and there is nothing to analyze.
+    run_dirs = [
+        os.path.join(sc2.captures_root, d)
+        for d in os.listdir(sc2.captures_root)
+        if os.path.isdir(os.path.join(sc2.captures_root, d))
+    ]
+    assert len(run_dirs) == 1
+    with open(os.path.join(run_dirs[0], "manifest.json")) as f:
+        resumed = json.load(f)
+    assert resumed["steps"] == []
+    assert resumed["replayed_from"] == old_dir
+    assert not [
+        s
+        for s in gcode2.scripts
+        if isinstance(s, tuple) and s[0] == "RUN" and s[1][1] == "analyze"
+    ]
 
 
 @requires_tomllib

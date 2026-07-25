@@ -93,10 +93,9 @@ class MeasureCommands(CalibrationHost):
             "amplitude": amplitude,
             "dwell_ms": dwell,
         }
-        run = self._begin_run(
+        with self._run_scope(
             gcmd, "differential", name, belt, pair_names, stroke_plan
-        )
-        try:
+        ) as run:
             self._prep("X", dwell)
             self._prep("Y", dwell)
             gcmd.respond_info(
@@ -131,9 +130,6 @@ class MeasureCommands(CalibrationHost):
             finally:
                 self._stop_capture()
             run.record_step(SweepStep(name, {}, []))
-            self._analyze_and_report(gcmd, run)
-        finally:
-            self._active_run = None
 
     RINGDOWN_MIN_DWELL_MS = 500
     RINGDOWN_DEFAULT_DWELL_MS = 1500
@@ -266,7 +262,7 @@ class MeasureCommands(CalibrationHost):
             "cruise_ms": cruise_ms,
             "accel_chip": chip_name,
         }
-        run = self._begin_run(
+        with self._run_scope(
             gcmd,
             "ringdown",
             tag,
@@ -274,8 +270,7 @@ class MeasureCommands(CalibrationHost):
             servos,
             stroke_plan,
             self._corexy_rails(gcmd, axis),
-        )
-        try:
+        ) as run:
             for prep_axis in plan.prep:
                 self._prep(prep_axis, dwell)
             engine.set_post_processor_bypass(True)
@@ -349,9 +344,6 @@ class MeasureCommands(CalibrationHost):
             finally:
                 engine.set_post_processor_bypass(False)
                 self._restore()
-            self._analyze_and_report(gcmd, run)
-        finally:
-            self._active_run = None
 
     def _ringdown_square_speeds(
         self,
@@ -452,8 +444,9 @@ class MeasureCommands(CalibrationHost):
             "cruise_ms": cruise_ms,
             "accel_chip": chip_name,
         }
-        run = self._begin_run(gcmd, "ringdown", tag, "XY", servos, stroke_plan)
-        try:
+        with self._run_scope(
+            gcmd, "ringdown", tag, "XY", servos, stroke_plan
+        ) as run:
             self._prep("X", dwell)
             self._prep("Y", dwell)
             engine.set_post_processor_bypass(True)
@@ -524,9 +517,6 @@ class MeasureCommands(CalibrationHost):
             finally:
                 engine.set_post_processor_bypass(False)
                 self._restore()
-            self._analyze_and_report(gcmd, run)
-        finally:
-            self._active_run = None
 
     MAX_DAMPER_CLAMP_TENTHS = 300.0
     MAX_DAMPER_LEAD_US = 5000.0
@@ -663,15 +653,6 @@ class MeasureCommands(CalibrationHost):
                 "map" % (zero_x, zero_y)
             )
             sync.run(gcmd)
-        run = self._begin_run(
-            gcmd,
-            "strain_map",
-            tag,
-            "XY",
-            servos,
-            stroke_plan,
-            self._corexy_rails(gcmd, "X"),
-        )
         lines = [
             ("X", x_start, x_end, "y", level)
             for level in self._raster_levels(y_start, y_end, spacing)
@@ -679,7 +660,15 @@ class MeasureCommands(CalibrationHost):
             ("Y", y_start, y_end, "x", level)
             for level in self._raster_levels(x_start, x_end, spacing)
         ]
-        try:
+        with self._run_scope(
+            gcmd,
+            "strain_map",
+            tag,
+            "XY",
+            servos,
+            stroke_plan,
+            self._corexy_rails(gcmd, "X"),
+        ) as run:
             self._prep("X", dwell)
             self._prep("Y", dwell)
             for i, (axis, start, end, fixed_axis, level) in enumerate(lines):
@@ -705,8 +694,6 @@ class MeasureCommands(CalibrationHost):
                 "strain map raster complete: %d lines in %s"
                 % (len(lines), run.run_dir)
             )
-        finally:
-            self._active_run = None
 
     STRAIN_RESPONSE_STEPS = (0.0, 1.0, -1.0, 2.0, -2.0)
     MAX_STRAIN_STEP_UM = servo_strain_tune.MAX_STRAIN_STEP_UM
@@ -781,50 +768,54 @@ class MeasureCommands(CalibrationHost):
                 )
             self._goto_xy(zero_x, zero_y, dwell)
             sync.run(gcmd)
-        run = self._begin_run(
-            gcmd,
-            "strain_response",
-            tag,
-            "XY",
-            servos,
-            stroke_plan,
-            self._corexy_rails(gcmd, "X"),
-        )
         reactor = self.printer.get_reactor()
         total = session.pair_count() * len(steps_um)
         try:
-            self._prep("X", dwell)
-            self._goto_xy(x_start, line_y, dwell)
-            for belt_idx in range(session.pair_count()):
-                for step_idx, value_um in enumerate(steps_um):
-                    slew_s = session.apply(belt_idx, value_um)
-                    reactor.pause(reactor.monotonic() + settle + slew_s)
-                    name = "belt%s_step%d" % ("ab"[belt_idx], step_idx)
-                    gcmd.respond_info(
-                        "strain response %d/%d: belt %s at %+.0f um"
-                        % (
-                            belt_idx * len(steps_um) + step_idx + 1,
-                            total,
-                            "AB"[belt_idx],
-                            value_um,
+            with self._run_scope(
+                gcmd,
+                "strain_response",
+                tag,
+                "XY",
+                servos,
+                stroke_plan,
+                self._corexy_rails(gcmd, "X"),
+            ) as run:
+                self._prep("X", dwell)
+                self._goto_xy(x_start, line_y, dwell)
+                for belt_idx in range(session.pair_count()):
+                    for step_idx, value_um in enumerate(steps_um):
+                        slew_s = session.apply(belt_idx, value_um)
+                        reactor.pause(reactor.monotonic() + settle + slew_s)
+                        name = "belt%s_step%d" % ("ab"[belt_idx], step_idx)
+                        gcmd.respond_info(
+                            "strain response %d/%d: belt %s at %+.0f um"
+                            % (
+                                belt_idx * len(steps_um) + step_idx + 1,
+                                total,
+                                "AB"[belt_idx],
+                                value_um,
+                            )
                         )
-                    )
-                    self._start_capture(name, servos)
-                    self._strokes("X", x_start, x_end, speed, accel, 1, dwell)
-                    self._stop_capture()
-                    run.record_step(
-                        SweepStep(
-                            name,
-                            {"belt": float(belt_idx), "offset_um": value_um},
-                            [],
+                        self._start_capture(name, servos)
+                        self._strokes(
+                            "X", x_start, x_end, speed, accel, 1, dwell
                         )
-                    )
-                slew_s = session.apply(belt_idx, 0.0)
-                reactor.pause(reactor.monotonic() + slew_s)
-            self._restore()
+                        self._stop_capture()
+                        run.record_step(
+                            SweepStep(
+                                name,
+                                {
+                                    "belt": float(belt_idx),
+                                    "offset_um": value_um,
+                                },
+                                [],
+                            )
+                        )
+                    slew_s = session.apply(belt_idx, 0.0)
+                    reactor.pause(reactor.monotonic() + slew_s)
+                self._restore()
         finally:
             session.clear()
-            self._active_run = None
         comp.fit_strain_response(gcmd, run.run_dir)
 
     TUNE_MAX_ITERS = 5
@@ -908,7 +899,10 @@ class MeasureCommands(CalibrationHost):
                 )
             self._goto_xy(zero_xy[0], zero_xy[1], dwell)
             sync.run(gcmd)
-        run = self._begin_run(
+        reactor = self.printer.get_reactor()
+        converged = False
+        results = None
+        with self._run_scope(
             gcmd,
             "strain_tune",
             tag,
@@ -916,11 +910,7 @@ class MeasureCommands(CalibrationHost):
             servos,
             stroke_plan,
             self._corexy_rails(gcmd, "X"),
-        )
-        reactor = self.printer.get_reactor()
-        converged = False
-        results = None
-        try:
+        ) as run:
             self._prep("X", dwell)
             self._prep("Y", dwell)
             for iteration in range(max_iters):
@@ -987,8 +977,6 @@ class MeasureCommands(CalibrationHost):
                     break
                 tuner.apply(results)
             self._restore()
-        finally:
-            self._active_run = None
         if not converged:
             raise gcmd.error(
                 "did not converge within %d iterations — last measured %s; "
@@ -1068,7 +1056,7 @@ class MeasureCommands(CalibrationHost):
             self._reject_pattern_stroke_bounds(gcmd)
         kin = self._kin()
         servos, belts_rails, axis = self._grid_servos(gcmd, kin)
-        self._begin_run(
+        with self._run_scope(
             gcmd,
             "inertia_grid",
             name,
@@ -1076,14 +1064,9 @@ class MeasureCommands(CalibrationHost):
             servos,
             self._grid_stroke_plan(gcmd),
             belts_rails,
-        )
-        try:
+        ) as run:
             self._measure_inertia(gcmd, name)
-            run = self._active_run
-            assert run is not None, "inertia grid ran outside its run"
             run.record_step(SweepStep(name, {}, []))
-        finally:
-            self._active_run = None
 
     def _measure_inertia(self, gcmd: Any, name: str) -> None:
         kin = self._kin()

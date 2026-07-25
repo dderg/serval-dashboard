@@ -1100,7 +1100,14 @@ pub fn compute_verdict(
                 apply: None,
             })
         }
-        "tracking" | "inertia_grid" => Ok(Verdict {
+        // Experiments whose product is computed elsewhere (a fitted profile,
+        // strain.json, a plain measurement) still analyze into per-step
+        // tracking metrics; there is just nothing to recommend. Every run
+        // must be analyzable — the host analyzes each run before its command
+        // returns, and an "unknown experiment" here used to 500 the
+        // dashboard's analyze button for strain and fit runs.
+        "tracking" | "inertia_grid" | "dynamics_fit" | "dynamics_sweep" | "strain_map"
+        | "strain_response" | "strain_tune" => Ok(Verdict {
             recommended_step: None,
             reason: "not a sweep".to_string(),
             flags: Vec::new(),

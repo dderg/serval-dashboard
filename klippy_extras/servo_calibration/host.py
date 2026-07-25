@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import subprocess
 import time
-from typing import Any, overload
+from typing import Any, Iterator, overload
 
 from ... import structured_log
 from .. import servo_axis, servo_param, servo_strokes
@@ -303,6 +304,47 @@ class CalibrationHost:
         self._active_run = run
         return run
 
+    @contextlib.contextmanager
+    def _run_scope(
+        self,
+        gcmd: Any,
+        experiment: str,
+        tag: str,
+        axis: str,
+        servos: list[str],
+        stroke_plan: dict[str, Any],
+        belts_rails: list[Any] | None = None,
+    ) -> Iterator[ExperimentRun]:
+        """The one way to run a calibration experiment. Owning the whole
+        lifecycle here means no command can skip a stage by omission: a body
+        that records zero capture steps is a broken command (raise), a run
+        whose analysis does not cover every recorded step is analyzed before
+        the scope closes, and the active run is always cleared.
+        SERVO_COMPARE_PIN shipped without recording or analyzing precisely
+        because each stage used to be a separate call every command had to
+        remember."""
+        run = self._begin_run(
+            gcmd, experiment, tag, axis, servos, stroke_plan, belts_rails
+        )
+        try:
+            yield run
+            if not run.manifest["steps"]:
+                if run.manifest.get("replayed_from"):
+                    # A full RESUME replay legitimately captures nothing: its
+                    # evidence is the source run named here, so there is
+                    # nothing to analyze either. A partial resume records
+                    # steps and takes the normal path below.
+                    return
+                raise gcmd.error(
+                    "%s finished without recording a single capture step - "
+                    "the command is broken, not the machine (run %s)"
+                    % (experiment, run.run_dir)
+                )
+            if run.analyzed_steps != len(run.manifest["steps"]):
+                self._analyze_and_report(gcmd, run)
+        finally:
+            self._active_run = None
+
     def _on_step_complete(self, step: SweepStep) -> None:
         if self._active_run is not None:
             self._active_run.record_step(step)
@@ -334,7 +376,14 @@ class CalibrationHost:
         if incremental:
             argv.append("--incremental")
         self._run(gcmd, argv, 120.0)
-        return self._read_results(gcmd, run.run_dir)
+        run.results = self._read_results(gcmd, run.run_dir)
+        # Incremental counts as full coverage: --incremental only caches
+        # already-analyzed steps, then recomputes the verdict over ALL steps
+        # and rewrites results.json wholesale (analyze.rs load_step_cache /
+        # write_outputs). _run_scope trusts this stamp to skip a redundant
+        # exit re-analyze.
+        run.analyzed_steps = len(run.manifest["steps"])
+        return run.results
 
     def _analyze_and_report(
         self, gcmd: Any, run: ExperimentRun
@@ -868,10 +917,9 @@ class CalibrationHost:
             "iterations": iterations,
             "dwell_ms": dwell,
         }
-        run = self._begin_run(
+        with self._run_scope(
             gcmd, "tracking", name, axis, servos, stroke_plan, belts_rails
-        )
-        try:
+        ) as run:
             for prep_axis in plan.prep:
                 self._prep(prep_axis, dwell)
             self._start_capture(name, servos)
@@ -890,8 +938,6 @@ class CalibrationHost:
             self._restore()
             run.record_step(SweepStep(name, {}, []))
             results = self._analyze_and_report(gcmd, run)
-        finally:
-            self._active_run = None
         return run, results
 
     def _dynamics_out_path(

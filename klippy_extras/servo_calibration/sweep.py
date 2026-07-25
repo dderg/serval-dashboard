@@ -63,6 +63,12 @@ class ExperimentRun:
     stamp: str
     manifest: dict[str, Any]
     started_s: float = field(default_factory=time.time)
+    # Written by CalibrationHost._run_analyze: the parsed results.json and
+    # how many manifest steps that analysis covered. _run_scope compares the
+    # count against the manifest at exit to decide whether the run still
+    # needs analyzing - a command cannot leave a results-less run behind.
+    results: dict[str, Any] | None = None
+    analyzed_steps: int = -1
 
     @property
     def manifest_path(self) -> str:

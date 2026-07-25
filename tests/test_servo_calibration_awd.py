@@ -222,6 +222,14 @@ def _fit_argv(gcode):
     raise AssertionError("no fit invocation recorded")
 
 
+def _analyze_runs(gcode):
+    return [
+        s[1][2]
+        for s in gcode.scripts
+        if isinstance(s, tuple) and s[0] == "RUN" and s[1][1] == "analyze"
+    ]
+
+
 def _flag(argv, key):
     return argv[argv.index(key) + 1]
 
@@ -396,6 +404,14 @@ def test_fit_dynamics_scalar_fit_selects_drive_via_axes():
     assert _flag(argv, "--frame") == "1"
 
 
+def test_fit_dynamics_grid_analyzes_the_run_at_scope_exit():
+    sc, gcode = make_calibration(cartesian_awd_rails(), coupled=False)
+    sc.cmd_SERVO_FIT_DYNAMICS(FakeGcmd(AXIS="X", DRIVE="motor_a"))
+    # The grid fit only ever ran `servo-cal fit`, handing back a run with
+    # no results.json; the run scope analyzes it on the way out.
+    assert _analyze_runs(gcode) == [os.path.dirname(_cap(sc).starts[0][0])]
+
+
 def test_tracking_combined_view_lists_every_motor_per_belt():
     sc, gcode = make_calibration(awd_rails())
     sc.cmd_SERVO_MEASURE_TRACKING(FakeGcmd(AXIS="X"))
@@ -470,6 +486,14 @@ def test_measure_inertia_corexy_servos_override():
     sc, gcode = make_calibration(awd_rails())
     sc.cmd_SERVO_MEASURE_INERTIA(FakeGcmd(SERVOS="motor_a,motor_b"))
     assert _capture_servos(sc)[0] == ["motor_a", "motor_b"]
+
+
+def test_measure_inertia_analyzes_the_grid_at_scope_exit():
+    """The grid body records its one step and stops; the run scope is what
+    turns it into an analyzed run."""
+    sc, gcode = make_calibration(awd_rails())
+    sc.cmd_SERVO_MEASURE_INERTIA(FakeGcmd(AXIS="X"))
+    assert _analyze_runs(gcode) == [os.path.dirname(_cap(sc).starts[0][0])]
 
 
 def make_differential_calibration():
@@ -682,6 +706,15 @@ def test_fit_dynamics_iterates_pattern_captures_until_convergence():
 
 
 @requires_tomllib
+def test_fit_dynamics_iterative_analyzes_the_run_at_scope_exit():
+    sc, gcode = make_calibration(awd_rails())
+    sc.cmd_SERVO_FIT_DYNAMICS(FakeGcmd())
+    # Three pattern captures, one analysis covering all of them.
+    assert len(_manifest_for(sc)["steps"]) == 3
+    assert _analyze_runs(gcode) == [os.path.dirname(_cap(sc).starts[0][0])]
+
+
+@requires_tomllib
 def test_fit_dynamics_accels_sweep_identifies_without_applying():
     sc, gcode = make_calibration(awd_rails())
     sc.bounds = {"X": (20.0, 280.0), "Y": (20.0, 280.0)}
@@ -705,6 +738,16 @@ def test_fit_dynamics_accels_sweep_identifies_without_applying():
     assert any("mode x mass(accel):" in r for r in gcmd.responses)
     assert any("torque-weighted change" in r for r in gcmd.responses)
     assert any("nothing was applied" in r for r in gcmd.responses)
+
+
+@requires_tomllib
+def test_fit_dynamics_accels_sweep_analyzes_the_run_at_scope_exit():
+    sc, gcode = make_calibration(awd_rails())
+    sc.fake_fit_params = [(0.010, 0.004, 1.0), (0.012, 0.004, 1.0)]
+    sc.cmd_SERVO_FIT_DYNAMICS(FakeGcmd(ACCELS="8000,16000", MAX_SPEED="600"))
+    # Identify-only means nothing is applied - it never meant nothing is
+    # analyzed; the sweep's own captures still get a verdict.
+    assert _analyze_runs(gcode) == [os.path.dirname(_cap(sc).starts[0][0])]
 
 
 @requires_tomllib

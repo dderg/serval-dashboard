@@ -317,112 +317,111 @@ class GainCommands(DynamicsFitCommands):
             stroke_plan.update(pattern_plan)
         else:
             stroke_plan.update({"start": start, "end": end})
-        run = self._begin_run(
-            gcmd,
-            "gain_sweep",
-            tag,
-            axis,
-            servos,
-            stroke_plan,
-            self._corexy_rails(gcmd, axis),
-        )
-        adapter = SingleGainAdapter(
-            self, servos, param, tag, dict(first), first[param]
-        )
         restored = False
         try:
-            if pattern:
-                self._prep("X", dwell)
-                self._prep("Y", dwell)
-                moves = servo_strokes.pattern_moves(
-                    self.gcode, points, start_x, start_y, speed, accel
+            with self._run_scope(
+                gcmd,
+                "gain_sweep",
+                tag,
+                axis,
+                servos,
+                stroke_plan,
+                self._corexy_rails(gcmd, axis),
+            ) as run:
+                adapter = SingleGainAdapter(
+                    self, servos, param, tag, dict(first), first[param]
                 )
-                gcmd.respond_info(
-                    servo_strokes.pattern_reach_summary(moves, speed)
-                )
-                self._goto_xy(start_x, start_y, dwell)
-            else:
-                self._prep(axis, dwell)
-                servo_strokes.goto(
-                    self.gcode,
-                    self.travel_speed,
-                    "%s%.3f" % (axis, start),
-                    dwell,
-                )
-            self._set_manual_tuning(servos)
-            if base_servos:
-                self._set_manual_tuning(base_servos)
-                for s in base_servos:
-                    pinned = dict(prior[s])
-                    pinned[param] = base_gain
-                    self._write_gains([s], pinned)
-                run.manifest["base_gains"] = {
-                    "servos": base_servos,
-                    "param": param,
-                    "value": base_gain,
-                }
-                run.write()
-                _addr, _lo, _hi, desc, unit, scale = GAIN_PARAMS[param]
-                gcmd.respond_info(
-                    "base %s pinned at %d (%.4g %s) on %s (held for the "
-                    "whole sweep)"
-                    % (
-                        desc,
-                        base_gain,
-                        base_gain / scale,
-                        unit,
-                        ", ".join(base_servos),
-                    )
-                )
-
-            def run_step(sg: Any) -> None:
                 if pattern:
-                    servo_strokes.emit_pattern(
+                    self._prep("X", dwell)
+                    self._prep("Y", dwell)
+                    moves = servo_strokes.pattern_moves(
+                        self.gcode, points, start_x, start_y, speed, accel
+                    )
+                    gcmd.respond_info(
+                        servo_strokes.pattern_reach_summary(moves, speed)
+                    )
+                    self._goto_xy(start_x, start_y, dwell)
+                else:
+                    self._prep(axis, dwell)
+                    servo_strokes.goto(
                         self.gcode,
-                        points,
-                        start_x,
-                        start_y,
-                        speed,
-                        accel,
-                        iterations,
+                        self.travel_speed,
+                        "%s%.3f" % (axis, start),
                         dwell,
                     )
-                else:
-                    self._strokes(
-                        axis, start, end, speed, accel, iterations, dwell
+                self._set_manual_tuning(servos)
+                if base_servos:
+                    self._set_manual_tuning(base_servos)
+                    for s in base_servos:
+                        pinned = dict(prior[s])
+                        pinned[param] = base_gain
+                        self._write_gains([s], pinned)
+                    run.manifest["base_gains"] = {
+                        "servos": base_servos,
+                        "param": param,
+                        "value": base_gain,
+                    }
+                    run.write()
+                    _addr, _lo, _hi, desc, unit, scale = GAIN_PARAMS[param]
+                    gcmd.respond_info(
+                        "base %s pinned at %d (%.4g %s) on %s (held for the "
+                        "whole sweep)"
+                        % (
+                            desc,
+                            base_gain,
+                            base_gain / scale,
+                            unit,
+                            ", ".join(base_servos),
+                        )
                     )
 
-            steps = self._engine.run(
-                adapter,
-                values,
-                servos,
-                run_step,
-                gcmd,
-                accel_chip=chip,
-                accel_chip_name=chip_name,
-            )
-            gcmd.respond_info(
-                "sweep done - restoring the pre-sweep gains until you "
-                "apply the recommendation"
-            )
-            restore_prior()
-            restored = True
-            self._restore()
-            results = self._analyze_and_report(gcmd, run)
-            self._last_sweep_run, self._last_sweep_results = run, results
-            if apply:
-                if pattern:
-                    gcmd.respond_info(
-                        "PATTERN=1: APPLY verification runs single-axis X "
-                        "strokes (the tracking measurement is per-axis)"
-                    )
-                self._apply_verdict(
-                    gcmd, run, results, "X" if pattern else axis
+                def run_step(sg: Any) -> None:
+                    if pattern:
+                        servo_strokes.emit_pattern(
+                            self.gcode,
+                            points,
+                            start_x,
+                            start_y,
+                            speed,
+                            accel,
+                            iterations,
+                            dwell,
+                        )
+                    else:
+                        self._strokes(
+                            axis, start, end, speed, accel, iterations, dwell
+                        )
+
+                steps = self._engine.run(
+                    adapter,
+                    values,
+                    servos,
+                    run_step,
+                    gcmd,
+                    accel_chip=chip,
+                    accel_chip_name=chip_name,
                 )
+                gcmd.respond_info(
+                    "sweep done - restoring the pre-sweep gains until you "
+                    "apply the recommendation"
+                )
+                restore_prior()
+                restored = True
+                self._restore()
+                results = self._analyze_and_report(gcmd, run)
+                self._last_sweep_run, self._last_sweep_results = run, results
+                if apply:
+                    if pattern:
+                        gcmd.respond_info(
+                            "PATTERN=1: APPLY verification runs single-axis X "
+                            "strokes (the tracking measurement is per-axis)"
+                        )
+                    self._apply_verdict(
+                        gcmd, run, results, "X" if pattern else axis
+                    )
         finally:
             if not restored:
                 restore_prior()
-            self._active_run = None
         return steps
 
     def _stroke_motion(self, gcmd: Any) -> tuple[float, float, int, int]:

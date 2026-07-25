@@ -55,7 +55,7 @@ class SweepCommands(GainCommands):
             "iterations": iterations,
             "dwell_ms": dwell,
         }
-        run = self._begin_run(
+        with self._run_scope(
             gcmd,
             "inertia_sweep",
             tag,
@@ -63,16 +63,15 @@ class SweepCommands(GainCommands):
             servos,
             stroke_plan,
             self._corexy_rails(gcmd, axis),
-        )
-        adapter = InertiaRatioAdapter(self, servos, tag, original)
+        ) as run:
+            adapter = InertiaRatioAdapter(self, servos, tag, original)
 
-        def on_revert() -> None:
-            gcmd.respond_info(
-                "restoring C00.06 ratio %d%% on %s"
-                % (original, ", ".join(servos))
-            )
+            def on_revert() -> None:
+                gcmd.respond_info(
+                    "restoring C00.06 ratio %d%% on %s"
+                    % (original, ", ".join(servos))
+                )
 
-        try:
             self._prep(axis, dwell)
             steps = self._run_sweep_with_revert(
                 adapter,
@@ -88,8 +87,6 @@ class SweepCommands(GainCommands):
             self._last_sweep_run, self._last_sweep_results = run, results
             if apply:
                 self._apply_verdict(gcmd, run, results, axis)
-        finally:
-            self._active_run = None
         return steps
 
     cmd_SERVO_SWEEP_ACCEL_help = (
@@ -136,7 +133,7 @@ class SweepCommands(GainCommands):
             "iterations": iterations,
             "dwell_ms": dwell,
         }
-        run = self._begin_run(
+        with self._run_scope(
             gcmd,
             "accel_sweep",
             tag,
@@ -144,23 +141,22 @@ class SweepCommands(GainCommands):
             servos,
             stroke_plan,
             self._corexy_rails(gcmd, axis),
-        )
-        adapter = MotionAccelAdapter(tag)
+        ) as run:
+            adapter = MotionAccelAdapter(tag)
 
-        def run_step(av: int) -> None:
-            servo_strokes.emit_strokes(
-                self.gcode,
-                plan.coord,
-                plan.start,
-                plan.end,
-                plan.th_per_unit,
-                speed,
-                float(av),
-                iterations,
-                dwell,
-            )
+            def run_step(av: int) -> None:
+                servo_strokes.emit_strokes(
+                    self.gcode,
+                    plan.coord,
+                    plan.start,
+                    plan.end,
+                    plan.th_per_unit,
+                    speed,
+                    float(av),
+                    iterations,
+                    dwell,
+                )
 
-        try:
             for prep_axis in plan.prep:
                 self._prep(prep_axis, dwell)
             try:
@@ -173,8 +169,6 @@ class SweepCommands(GainCommands):
             self._last_sweep_run, self._last_sweep_results = run, results
             if apply:
                 self._apply_verdict(gcmd, run, results, axis)
-        finally:
-            self._active_run = None
         return steps
 
     cmd_SERVO_AUTOTUNE_help = (

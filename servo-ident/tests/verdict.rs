@@ -117,7 +117,15 @@ fn inertia_sweep_defers_to_human() {
 
 #[test]
 fn tracking_and_grid_are_not_sweeps() {
-    for exp in ["tracking", "inertia_grid"] {
+    for exp in [
+        "tracking",
+        "inertia_grid",
+        "dynamics_fit",
+        "dynamics_sweep",
+        "strain_map",
+        "strain_response",
+        "strain_tune",
+    ] {
         let v = compute_verdict(
             exp,
             &[step_result("a", &[])],
@@ -156,6 +164,39 @@ fn dynamics_tune_defers_to_the_host_macro() {
 #[test]
 fn unknown_experiment_fails_loud() {
     assert!(compute_verdict("bogus", &[], &[]).is_err());
+}
+
+#[test]
+fn every_host_experiment_string_clears_the_whitelist() {
+    // Every `experiment` the Python host passes to `_run_scope` — the scope
+    // analyzes each run before its command returns, so a string missing from
+    // `compute_verdict`'s match fails on the bench, after the motion, instead
+    // of here. Arms needing rich step data may still Err on empty steps;
+    // what this pins is that none of them is "unknown".
+    for exp in [
+        "gain_sweep",
+        "accel_sweep",
+        "inertia_sweep",
+        "inertia_grid",
+        "dynamics_fit",
+        "dynamics_sweep",
+        "dynamics_tune",
+        "compliance",
+        "pin_sweep",
+        "pin_compare",
+        "tracking",
+        "differential",
+        "ringdown",
+        "strain_map",
+        "strain_response",
+        "strain_tune",
+    ] {
+        let v = compute_verdict(exp, &[], &[]);
+        assert!(
+            !matches!(&v, Err(e) if e.contains("unknown experiment")),
+            "{exp} fell through compute_verdict's whitelist"
+        );
+    }
 }
 
 // ---- pin_sweep ------------------------------------------------------------

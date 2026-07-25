@@ -341,7 +341,7 @@ class DynamicsFitCommands(MeasureCommands):
         if gcmd.get_int("PATTERN", 0):
             self._reject_pattern_stroke_bounds(gcmd)
         plan = self._fit_plan(gcmd)
-        run = self._begin_run(
+        with self._run_scope(
             gcmd,
             "inertia_grid",
             name,
@@ -349,8 +349,7 @@ class DynamicsFitCommands(MeasureCommands):
             plan["servos"],
             self._grid_stroke_plan(gcmd),
             plan["rails"],
-        )
-        try:
+        ) as run:
             self._measure_inertia(gcmd, name)
             run.record_step(SweepStep(name, {}, []))
             out_path = self._dynamics_out_path(gcmd, run, name)
@@ -361,8 +360,6 @@ class DynamicsFitCommands(MeasureCommands):
             gcmd.respond_info(
                 "dynamics profile: %s | run %s" % (out_path, run.run_dir)
             )
-        finally:
-            self._active_run = None
         return run, text, out_path
 
     def _reject_fit_grid_params(self, gcmd: Any) -> None:
@@ -512,191 +509,195 @@ class DynamicsFitCommands(MeasureCommands):
             "dwell_ms": dwell,
         }
         stroke_plan.update(pattern_plan)
-        run = self._begin_run(
-            gcmd,
-            "dynamics_fit",
-            name,
-            plan["axis"],
-            plan["servos"],
-            stroke_plan,
-            plan["rails"],
-        )
+        applied = False
+        try:
+            with self._run_scope(
+                gcmd,
+                "dynamics_fit",
+                name,
+                plan["axis"],
+                plan["servos"],
+                stroke_plan,
+                plan["rails"],
+            ) as run:
 
-        def capture_round(step: str, accel: float) -> None:
-            self._start_capture(step, plan["servos"])
-            self._goto_xy(start_x, start_y, dwell)
-            for speed in speeds:
-                servo_strokes.emit_pattern(
-                    self.gcode,
+                def capture_round(step: str, accel: float) -> None:
+                    self._start_capture(step, plan["servos"])
+                    self._goto_xy(start_x, start_y, dwell)
+                    for speed in speeds:
+                        servo_strokes.emit_pattern(
+                            self.gcode,
+                            points,
+                            start_x,
+                            start_y,
+                            speed,
+                            accel,
+                            iterations,
+                            dwell,
+                        )
+                    self._stop_capture()
+                    run.record_step(SweepStep(step, {"accel": accel}, []))
+
+                def torque_changes(
+                    prev: dict[str, Any],
+                    new: dict[str, Any],
+                    accel: float,
+                ) -> list[float]:
+                    try:
+                        return dynamics_torque_changes(
+                            prev, new, accel, max_speed
+                        )
+                    except ValueError as e:
+                        raise gcmd.error(str(e))
+
+                out_path = self._dynamics_out_path(gcmd, run, name)
+                self._prep("X", dwell)
+                self._prep("Y", dwell)
+                self._pattern_reach_report(
+                    gcmd,
                     points,
                     start_x,
                     start_y,
-                    speed,
-                    accel,
-                    iterations,
-                    dwell,
+                    [converge_accel, max_accel],
+                    speeds,
                 )
-            self._stop_capture()
-            run.record_step(SweepStep(step, {"accel": accel}, []))
-
-        def torque_changes(
-            prev: dict[str, Any],
-            new: dict[str, Any],
-            accel: float,
-        ) -> list[float]:
-            try:
-                return dynamics_torque_changes(prev, new, accel, max_speed)
-            except ValueError as e:
-                raise gcmd.error(str(e))
-
-        applied = False
-        try:
-            out_path = self._dynamics_out_path(gcmd, run, name)
-            self._prep("X", dwell)
-            self._prep("Y", dwell)
-            self._pattern_reach_report(
-                gcmd,
-                points,
-                start_x,
-                start_y,
-                [converge_accel, max_accel],
-                speeds,
-            )
-            prev = None
-            fitted = None
-            converged = False
-            last_change = None
-            rounds_run = 0
-            for round_i in range(max_rounds):
-                step = "fit_r%d" % (round_i,)
-                capture_round(step, converge_accel)
-                fitted_full, _text = self._fit_round(
+                prev = None
+                fitted = None
+                converged = False
+                last_change = None
+                rounds_run = 0
+                for round_i in range(max_rounds):
+                    step = "fit_r%d" % (round_i,)
+                    capture_round(step, converge_accel)
+                    fitted_full, _text = self._fit_round(
+                        gcmd,
+                        plan,
+                        run,
+                        step,
+                        os.path.join(run.run_dir, "dynamics_%s.toml" % (step,)),
+                        None,
+                        None,
+                    )
+                    fitted = applied_model(fitted_full)
+                    rounds_run = round_i + 1
+                    if round_i == 0:
+                        self._validate_fit_slots(gcmd, node, fitted)
+                    send_dynamics_model(engine, handle, fitted)
+                    applied = True
+                    if prev is None:
+                        gcmd.respond_info(
+                            "round %d: %s (feedforward now live for the next "
+                            "round)"
+                            % (round_i, round_line(fitted_full, fitted))
+                        )
+                    else:
+                        last_change = max(
+                            torque_changes(prev, fitted, converge_accel)
+                        )
+                        gcmd.respond_info(
+                            "round %d: %s | torque-weighted change %.1f%% "
+                            "(TOL %.1f%%)"
+                            % (
+                                round_i,
+                                round_line(fitted_full, fitted),
+                                100.0 * last_change,
+                                100.0 * tol,
+                            )
+                        )
+                        if last_change <= tol:
+                            converged = True
+                            break
+                    prev = fitted
+                if not converged:
+                    raise gcmd.error(
+                        "dynamics fit did not converge in %d rounds at "
+                        "accel %.0f (last torque-weighted change %.1f%% "
+                        "> TOL %.1f%%) - the identification is not "
+                        "settling; inspect run %s"
+                        % (
+                            max_rounds,
+                            converge_accel,
+                            100.0
+                            * (last_change if last_change is not None else 1.0),
+                            100.0 * tol,
+                            run.run_dir,
+                        )
+                    )
+                capture_round("fit_verify", max_accel)
+                verified_full, text = self._fit_round(
                     gcmd,
                     plan,
                     run,
-                    step,
-                    os.path.join(run.run_dir, "dynamics_%s.toml" % (step,)),
-                    None,
-                    None,
+                    "fit_verify",
+                    os.path.join(run.run_dir, "dynamics_fit_verify.toml"),
+                    torque,
+                    inertia,
                 )
-                fitted = applied_model(fitted_full)
-                rounds_run = round_i + 1
-                if round_i == 0:
-                    self._validate_fit_slots(gcmd, node, fitted)
-                send_dynamics_model(engine, handle, fitted)
-                applied = True
-                if prev is None:
-                    gcmd.respond_info(
-                        "round %d: %s (feedforward now live for the next "
-                        "round)" % (round_i, round_line(fitted_full, fitted))
-                    )
-                else:
-                    last_change = max(
-                        torque_changes(prev, fitted, converge_accel)
-                    )
-                    gcmd.respond_info(
-                        "round %d: %s | torque-weighted change %.1f%% "
-                        "(TOL %.1f%%)"
+                verified = applied_model(verified_full)
+                shift = max(torque_changes(fitted, verified, max_accel))
+                if shift > drift:
+                    raise gcmd.error(
+                        "converged model does not hold at MAX_ACCEL %.0f: "
+                        "re-identification shifted the parameters %.1f%% "
+                        "(DRIFT %.1f%%) - converged %s vs verify %s | the fit "
+                        "at accel %.0f was an artifact of that operating "
+                        "point, not physics; lower MAX_ACCEL below the "
+                        "regime change or investigate | run %s"
                         % (
-                            round_i,
-                            round_line(fitted_full, fitted),
-                            100.0 * last_change,
-                            100.0 * tol,
+                            max_accel,
+                            100.0 * shift,
+                            100.0 * drift,
+                            self._dynamics_params_line(fitted),
+                            self._dynamics_params_line(verified),
+                            converge_accel,
+                            run.run_dir,
                         )
                     )
-                    if last_change <= tol:
-                        converged = True
-                        break
-                prev = fitted
-            if not converged:
-                raise gcmd.error(
-                    "dynamics fit did not converge in %d rounds at accel "
-                    "%.0f (last torque-weighted change %.1f%% > TOL %.1f%%) "
-                    "- the identification is not settling; inspect run %s"
-                    % (
-                        max_rounds,
-                        converge_accel,
-                        100.0
-                        * (last_change if last_change is not None else 1.0),
-                        100.0 * tol,
-                        run.run_dir,
+                with open(out_path, "w") as f:
+                    f.write(
+                        render_fit_dynamics_toml(
+                            verified,
+                            verified_full,
+                            terms,
+                            run.run_dir,
+                            baseline_lead_us,
+                        )
                     )
+                fit_written_path = out_path
+                run.manifest["dynamics_fit"] = {
+                    "rounds": rounds_run,
+                    "converged_change": last_change,
+                    "verify_shift": shift,
+                    "terms": [t.lower() for t in terms],
+                    "fitted_not_applied": {
+                        key: verified_full[key] for key in dropped
+                    },
+                    "profile": out_path,
+                }
+                run.write()
+                structured_log.event(
+                    "calibration",
+                    "dynamics_fit",
+                    run_dir=run.run_dir,
+                    rounds=rounds_run,
+                    converged_change=last_change,
+                    verify_shift=shift,
+                    profile=out_path,
                 )
-            capture_round("fit_verify", max_accel)
-            verified_full, text = self._fit_round(
-                gcmd,
-                plan,
-                run,
-                "fit_verify",
-                os.path.join(run.run_dir, "dynamics_fit_verify.toml"),
-                torque,
-                inertia,
-            )
-            verified = applied_model(verified_full)
-            shift = max(torque_changes(fitted, verified, max_accel))
-            if shift > drift:
-                raise gcmd.error(
-                    "converged model does not hold at MAX_ACCEL %.0f: "
-                    "re-identification shifted the parameters %.1f%% "
-                    "(DRIFT %.1f%%) - converged %s vs verify %s | the fit "
-                    "at accel %.0f was an artifact of that operating "
-                    "point, not physics; lower MAX_ACCEL below the "
-                    "regime change or investigate | run %s"
+                gcmd.respond_info(
+                    "converged in %d rounds (change %.1f%%), holds at "
+                    "MAX_ACCEL %.0f (shift %.1f%% <= DRIFT %.1f%%) | "
+                    "dynamics profile: %s | run %s"
                     % (
+                        rounds_run,
+                        100.0 * (last_change or 0.0),
                         max_accel,
                         100.0 * shift,
                         100.0 * drift,
-                        self._dynamics_params_line(fitted),
-                        self._dynamics_params_line(verified),
-                        converge_accel,
+                        out_path,
                         run.run_dir,
                     )
                 )
-            with open(out_path, "w") as f:
-                f.write(
-                    render_fit_dynamics_toml(
-                        verified,
-                        verified_full,
-                        terms,
-                        run.run_dir,
-                        baseline_lead_us,
-                    )
-                )
-            fit_written_path = out_path
-            run.manifest["dynamics_fit"] = {
-                "rounds": rounds_run,
-                "converged_change": last_change,
-                "verify_shift": shift,
-                "terms": [t.lower() for t in terms],
-                "fitted_not_applied": {
-                    key: verified_full[key] for key in dropped
-                },
-                "profile": out_path,
-            }
-            run.write()
-            structured_log.event(
-                "calibration",
-                "dynamics_fit",
-                run_dir=run.run_dir,
-                rounds=rounds_run,
-                converged_change=last_change,
-                verify_shift=shift,
-                profile=out_path,
-            )
-            gcmd.respond_info(
-                "converged in %d rounds (change %.1f%%), holds at MAX_ACCEL "
-                "%.0f (shift %.1f%% <= DRIFT %.1f%%) | dynamics profile: %s "
-                "| run %s"
-                % (
-                    rounds_run,
-                    100.0 * (last_change or 0.0),
-                    max_accel,
-                    100.0 * shift,
-                    100.0 * drift,
-                    out_path,
-                    run.run_dir,
-                )
-            )
         finally:
             try:
                 if applied:
@@ -715,7 +716,6 @@ class DynamicsFitCommands(MeasureCommands):
                         )
             finally:
                 self._restore()
-                self._active_run = None
         return run, text, out_path
 
     def _run_fit_sweep(
@@ -785,99 +785,100 @@ class DynamicsFitCommands(MeasureCommands):
             "dwell_ms": dwell,
         }
         stroke_plan.update(pattern_plan)
-        run = self._begin_run(
-            gcmd,
-            "dynamics_sweep",
-            name,
-            plan["axis"],
-            plan["servos"],
-            stroke_plan,
-            plan["rails"],
-        )
         text = ""
         out_path = ""
         try:
-            self._prep("X", dwell)
-            self._prep("Y", dwell)
-            self._pattern_reach_report(
-                gcmd, points, start_x, start_y, accels, speeds
-            )
-            fits: list[tuple[float, dict[str, Any]]] = []
-            for accel in accels:
-                step = "fit_a%d" % (round(accel),)
-                self._start_capture(step, plan["servos"])
-                self._goto_xy(start_x, start_y, dwell)
-                for speed in speeds:
-                    servo_strokes.emit_pattern(
-                        self.gcode,
-                        points,
-                        start_x,
-                        start_y,
-                        speed,
-                        accel,
-                        iterations,
-                        dwell,
-                    )
-                self._stop_capture()
-                run.record_step(SweepStep(step, {"accel": accel}, []))
-                out_path = os.path.join(
-                    run.run_dir, "dynamics_%s.toml" % (step,)
-                )
-                fitted, text = self._fit_round(
-                    gcmd, plan, run, step, out_path, torque, inertia
-                )
-                fits.append((accel, fitted))
-                gcmd.respond_info(
-                    "accel %.0f: %s"
-                    % (accel, self._dynamics_params_line(fitted))
-                )
-            for (a0, f0), (a1, f1) in zip(fits, fits[1:]):
-                try:
-                    change = max(dynamics_torque_changes(f0, f1, a1, max_speed))
-                except ValueError as e:
-                    raise gcmd.error(str(e))
-                gcmd.respond_info(
-                    "accel %.0f -> %.0f: torque-weighted change %.1f%%"
-                    % (a0, a1, 100.0 * change)
-                )
-            modes = fits[0][1]["modes"]
-            curve = {
-                mode: [f[1]["mass"][k] for f in fits]
-                for k, mode in enumerate(modes)
-            }
-            for mode in modes:
-                masses = curve[mode]
-                lo, hi = min(masses), max(masses)
-                gcmd.respond_info(
-                    "mode %s mass(accel): %s | spread %.1f%%"
-                    % (
-                        mode,
-                        ", ".join(
-                            "%.0f: %.5g" % (a, m)
-                            for (a, _f), m in zip(fits, masses)
-                        ),
-                        200.0 * (hi - lo) / (hi + lo),
-                    )
-                )
-            run.manifest["dynamics_sweep"] = {
-                "accels": accels,
-                "mass": curve,
-                "max_speed": max_speed,
-            }
-            run.write()
-            structured_log.event(
-                "calibration",
+            with self._run_scope(
+                gcmd,
                 "dynamics_sweep",
-                run_dir=run.run_dir,
-                accels=accels,
-            )
-            gcmd.respond_info(
-                "identify-only sweep done - nothing was applied | run %s"
-                % (run.run_dir,)
-            )
+                name,
+                plan["axis"],
+                plan["servos"],
+                stroke_plan,
+                plan["rails"],
+            ) as run:
+                self._prep("X", dwell)
+                self._prep("Y", dwell)
+                self._pattern_reach_report(
+                    gcmd, points, start_x, start_y, accels, speeds
+                )
+                fits: list[tuple[float, dict[str, Any]]] = []
+                for accel in accels:
+                    step = "fit_a%d" % (round(accel),)
+                    self._start_capture(step, plan["servos"])
+                    self._goto_xy(start_x, start_y, dwell)
+                    for speed in speeds:
+                        servo_strokes.emit_pattern(
+                            self.gcode,
+                            points,
+                            start_x,
+                            start_y,
+                            speed,
+                            accel,
+                            iterations,
+                            dwell,
+                        )
+                    self._stop_capture()
+                    run.record_step(SweepStep(step, {"accel": accel}, []))
+                    out_path = os.path.join(
+                        run.run_dir, "dynamics_%s.toml" % (step,)
+                    )
+                    fitted, text = self._fit_round(
+                        gcmd, plan, run, step, out_path, torque, inertia
+                    )
+                    fits.append((accel, fitted))
+                    gcmd.respond_info(
+                        "accel %.0f: %s"
+                        % (accel, self._dynamics_params_line(fitted))
+                    )
+                for (a0, f0), (a1, f1) in zip(fits, fits[1:]):
+                    try:
+                        change = max(
+                            dynamics_torque_changes(f0, f1, a1, max_speed)
+                        )
+                    except ValueError as e:
+                        raise gcmd.error(str(e))
+                    gcmd.respond_info(
+                        "accel %.0f -> %.0f: torque-weighted change %.1f%%"
+                        % (a0, a1, 100.0 * change)
+                    )
+                modes = fits[0][1]["modes"]
+                curve = {
+                    mode: [f[1]["mass"][k] for f in fits]
+                    for k, mode in enumerate(modes)
+                }
+                for mode in modes:
+                    masses = curve[mode]
+                    lo, hi = min(masses), max(masses)
+                    gcmd.respond_info(
+                        "mode %s mass(accel): %s | spread %.1f%%"
+                        % (
+                            mode,
+                            ", ".join(
+                                "%.0f: %.5g" % (a, m)
+                                for (a, _f), m in zip(fits, masses)
+                            ),
+                            200.0 * (hi - lo) / (hi + lo),
+                        )
+                    )
+                run.manifest["dynamics_sweep"] = {
+                    "accels": accels,
+                    "mass": curve,
+                    "max_speed": max_speed,
+                }
+                run.write()
+                structured_log.event(
+                    "calibration",
+                    "dynamics_sweep",
+                    run_dir=run.run_dir,
+                    accels=accels,
+                )
+                gcmd.respond_info(
+                    "identify-only sweep done - nothing was applied | run %s"
+                    % (run.run_dir,)
+                )
         finally:
             self._restore()
-            self._active_run = None
         return run, text, out_path
 
     def cmd_SERVO_FIT_DYNAMICS(self, gcmd: Any) -> None:
@@ -1118,469 +1119,455 @@ class DynamicsFitCommands(MeasureCommands):
                     "its ferr fits; re-issue the identical command"
                     % (resume_dir, ", ".join(diff))
                 )
-        run = self._begin_run(
-            gcmd,
-            "dynamics_tune",
-            name,
-            plan["axis"],
-            plan["servos"],
-            stroke_plan,
-            plan["rails"],
-        )
-
-        def capture_round(step: str) -> None:
-            self._start_capture(step, plan["servos"])
-            self._goto_xy(start_x, start_y, dwell)
-            for speed in speeds:
-                servo_strokes.emit_pattern(
-                    self.gcode,
-                    points,
-                    start_x,
-                    start_y,
-                    speed,
-                    max_accel,
-                    iterations,
-                    dwell,
-                )
-            self._stop_capture()
-            run.record_step(SweepStep(step, {"accel": max_accel}, []))
-
-        current = _copy_dynamics(baseline)
-        current_lead = configured_lead_s
-        rounds_history: list[dict[str, Any]] = []
-        search_summaries: list[dict[str, Any]] = []
-        measured: dict[tuple[float, ...], dict[str, Any]] = {}
         applied = False
         success = False
-
-        def model_key(
-            values: Mapping[str, Any], lead_s: float
-        ) -> tuple[float, ...]:
-            coeffs = tuple(
-                float(v)
-                for term in ("MASS", "VISCOUS", "COULOMB")
-                for v in values[DYNAMICS_TERM_KEYS[term]]
-            )
-            splits = tuple(
-                round(float(pair["direction_split"]), 9)
-                for pair in values.get("pairs", [])
-            )
-            return coeffs + splits + (round(lead_s * 1e9),)
-
-        def ferr_result(round_i: int, ferr: dict[str, Any]) -> dict[str, Any]:
-            if ferr.get("modes") != plan["modes"]:
-                raise gcmd.error(
-                    "servo-cal fit --response ferr modes %s do not "
-                    "match the requested modes %s"
-                    % (ferr.get("modes"), plan["modes"])
-                )
-            return {
-                "round": round_i,
-                "rms": [float(v) for v in ferr["ferr_rms_raw"]],
-                "ff": ferr["ferr_rms_ff"],
-                "coef": ferr["coef"],
-                "stderr": ferr["stderr"],
-                "onset": [float(v) for v in ferr["onset_bias"]],
-                "samples": ferr.get("samples"),
-            }
-
-        def measure(
-            round_i: int, trial: dict[str, Any], lead_s: float
-        ) -> dict[str, Any]:
-            if resume_dir is not None:
-                src = os.path.join(resume_dir, "ferr_r%d.json" % (round_i,))
-                if os.path.isfile(src):
-                    ferr = self._load_ferr_fit(gcmd, src)
-                    result = ferr_result(round_i, ferr)
-                    shutil.copyfile(
-                        src,
-                        os.path.join(run.run_dir, "ferr_r%d.json" % (round_i,)),
-                    )
-                    gcmd.respond_info(
-                        "r%d replayed from %s (no capture)" % (round_i, src)
-                    )
-                    return result
-            send_dynamics_model(engine, handle, trial)
-            if lead_enabled:
-                send_ff_lead(engine, handle, node, plan["servos"], lead_s)
-            step = "tune_r%d" % (round_i,)
-            capture_round(step)
-            results = self._run_analyze(gcmd, run, incremental=True)
-            flags = set(self._step_flags(results, step))
-            if "torque_saturated" in flags:
-                raise gcmd.error(
-                    "step %s hit the torque rail - clipped strokes "
-                    "cannot score tracking error, aborting "
-                    "SERVO_TUNE_DYNAMICS" % (step,)
-                )
-            if "resonance_detected" in flags:
-                gcmd.respond_info(
-                    "WARNING step %s flagged resonance_detected - "
-                    "continuing (feedforward tuning does not move the "
-                    "loop's resonances)" % (step,)
-                )
-            ferr_out = os.path.join(run.run_dir, "ferr_r%d.json" % (round_i,))
-            argv = self._fit_argv_for(
-                gcmd,
-                plan,
-                run.step_scap(step),
-                ferr_out,
-                None,
-                None,
-                response="ferr",
-            )
-            self._run(gcmd, argv, 120.0)
-            ferr = self._load_ferr_fit(gcmd, ferr_out)
-            return ferr_result(round_i, ferr)
-
-        def term_objective(
-            cached: dict[str, Any], ff_key: str
-        ) -> tuple[list[float], list[float]]:
-            entry = cached["ff"].get(ff_key)
-            if entry is None:
-                raise gcmd.error(
-                    "ferr fit has no ferr_rms_ff[%r] to score" % (ff_key,)
-                )
-            if ff_key == "direction_split":
-                n_pairs = len(current["pairs"])
-                for field in (
-                    "pairs",
-                    "lambda",
-                    "q",
-                    "rms",
-                    "sigma",
-                    "windows",
-                ):
-                    vec = entry.get(field)
-                    if not isinstance(vec, list) or len(vec) != n_pairs:
-                        raise gcmd.error(
-                            "ferr fit direction_split[%r] must be a list of "
-                            "%d per-pair values matching the profile pairs - "
-                            "rebuild servo-cal (./install.sh)"
-                            % (field, n_pairs)
-                        )
-                for pair_idx, pair in enumerate(current["pairs"]):
-                    label = pair["slots"][0]
-                    if not entry["windows"][pair_idx] or (
-                        entry["rms"][pair_idx] is None
-                    ):
-                        raise gcmd.error(
-                            "direction_split pair %s has no direction-run "
-                            "windows - the excitation never reversed it, "
-                            "feedforward cannot be scored" % (label,)
-                        )
-                    if entry["sigma"][pair_idx] is None:
-                        raise gcmd.error(
-                            "direction_split pair %s has fewer than 2 windows "
-                            "per direction so its scatter (sigma) is "
-                            "unmeasurable - cannot apply the 2-sigma "
-                            "acceptance test" % (label,)
-                        )
-                return (
-                    [float(r) for r in entry["rms"]],
-                    [float(s) for s in entry["sigma"]],
-                )
-            rms_v = entry["rms"]
-            sigma_v = entry["sigma"]
-            windows_v = entry["windows"]
-            for fit_idx, mode in enumerate(plan["modes"]):
-                if not windows_v[fit_idx] or rms_v[fit_idx] is None:
-                    raise gcmd.error(
-                        "term %s mode %s has no transient windows - the "
-                        "excitation never triggered it, feedforward cannot "
-                        "be scored" % (ff_key, mode)
-                    )
-                if sigma_v[fit_idx] is None:
-                    raise gcmd.error(
-                        "term %s mode %s has fewer than 2 transient windows "
-                        "so its per-window scatter (sigma) is unmeasurable - "
-                        "cannot apply the 2-sigma acceptance test"
-                        % (ff_key, mode)
-                    )
-            return (
-                [float(r) for r in rms_v],
-                [float(s) for s in sigma_v],
-            )
-
         try:
-            out_path = self._dynamics_out_path(gcmd, run, name)
-            self._prep("X", dwell)
-            self._prep("Y", dwell)
-            self._pattern_reach_report(
-                gcmd, points, start_x, start_y, [max_accel], speeds
-            )
-            phase_idx = 0
-            searches: dict[str, RmsLineSearch] | None = None
-            pass_improved = False
-            round_i = 0
-            while True:
-                term = terms[phase_idx]
-                is_lead = term == "LEAD"
-                is_split = term == "DIRECTION_SPLIT"
-                key = (
-                    None if (is_lead or is_split) else DYNAMICS_TERM_KEYS[term]
-                )
-                trial = _copy_dynamics(current)
-                trial_lead = current_lead
-                if searches is not None:
-                    if is_lead:
-                        search = searches["xy"]
-                        trial_lead = (
-                            search.best if search.done else search.trial
+            with self._run_scope(
+                gcmd,
+                "dynamics_tune",
+                name,
+                plan["axis"],
+                plan["servos"],
+                stroke_plan,
+                plan["rails"],
+            ) as run:
+                if resume_dir is not None:
+                    # Provenance for the run scope: a resumed tune that
+                    # replays every round captures nothing of its own,
+                    # which is a legitimate run - not a command that
+                    # forgot to record a step.
+                    run.manifest["replayed_from"] = resume_dir
+                    run.write()
+
+                def capture_round(step: str) -> None:
+                    self._start_capture(step, plan["servos"])
+                    self._goto_xy(start_x, start_y, dwell)
+                    for speed in speeds:
+                        servo_strokes.emit_pattern(
+                            self.gcode,
+                            points,
+                            start_x,
+                            start_y,
+                            speed,
+                            max_accel,
+                            iterations,
+                            dwell,
                         )
-                    elif is_split:
+                    self._stop_capture()
+                    run.record_step(SweepStep(step, {"accel": max_accel}, []))
+
+                current = _copy_dynamics(baseline)
+                current_lead = configured_lead_s
+                rounds_history: list[dict[str, Any]] = []
+                search_summaries: list[dict[str, Any]] = []
+                measured: dict[tuple[float, ...], dict[str, Any]] = {}
+
+                def model_key(
+                    values: Mapping[str, Any], lead_s: float
+                ) -> tuple[float, ...]:
+                    coeffs = tuple(
+                        float(v)
+                        for term in ("MASS", "VISCOUS", "COULOMB")
+                        for v in values[DYNAMICS_TERM_KEYS[term]]
+                    )
+                    splits = tuple(
+                        round(float(pair["direction_split"]), 9)
+                        for pair in values.get("pairs", [])
+                    )
+                    return coeffs + splits + (round(lead_s * 1e9),)
+
+                def ferr_result(
+                    round_i: int, ferr: dict[str, Any]
+                ) -> dict[str, Any]:
+                    if ferr.get("modes") != plan["modes"]:
+                        raise gcmd.error(
+                            "servo-cal fit --response ferr modes %s do not "
+                            "match the requested modes %s"
+                            % (ferr.get("modes"), plan["modes"])
+                        )
+                    return {
+                        "round": round_i,
+                        "rms": [float(v) for v in ferr["ferr_rms_raw"]],
+                        "ff": ferr["ferr_rms_ff"],
+                        "coef": ferr["coef"],
+                        "stderr": ferr["stderr"],
+                        "onset": [float(v) for v in ferr["onset_bias"]],
+                        "samples": ferr.get("samples"),
+                    }
+
+                def measure(
+                    round_i: int, trial: dict[str, Any], lead_s: float
+                ) -> dict[str, Any]:
+                    if resume_dir is not None:
+                        src = os.path.join(
+                            resume_dir, "ferr_r%d.json" % (round_i,)
+                        )
+                        if os.path.isfile(src):
+                            ferr = self._load_ferr_fit(gcmd, src)
+                            result = ferr_result(round_i, ferr)
+                            shutil.copyfile(
+                                src,
+                                os.path.join(
+                                    run.run_dir, "ferr_r%d.json" % (round_i,)
+                                ),
+                            )
+                            gcmd.respond_info(
+                                "r%d replayed from %s (no capture)"
+                                % (round_i, src)
+                            )
+                            return result
+                    send_dynamics_model(engine, handle, trial)
+                    if lead_enabled:
+                        send_ff_lead(
+                            engine, handle, node, plan["servos"], lead_s
+                        )
+                    step = "tune_r%d" % (round_i,)
+                    capture_round(step)
+                    results = self._run_analyze(gcmd, run, incremental=True)
+                    flags = set(self._step_flags(results, step))
+                    if "torque_saturated" in flags:
+                        raise gcmd.error(
+                            "step %s hit the torque rail - clipped strokes "
+                            "cannot score tracking error, aborting "
+                            "SERVO_TUNE_DYNAMICS" % (step,)
+                        )
+                    if "resonance_detected" in flags:
+                        gcmd.respond_info(
+                            "WARNING step %s flagged resonance_detected - "
+                            "continuing (feedforward tuning does not move the "
+                            "loop's resonances)" % (step,)
+                        )
+                    ferr_out = os.path.join(
+                        run.run_dir, "ferr_r%d.json" % (round_i,)
+                    )
+                    argv = self._fit_argv_for(
+                        gcmd,
+                        plan,
+                        run.step_scap(step),
+                        ferr_out,
+                        None,
+                        None,
+                        response="ferr",
+                    )
+                    self._run(gcmd, argv, 120.0)
+                    ferr = self._load_ferr_fit(gcmd, ferr_out)
+                    return ferr_result(round_i, ferr)
+
+                def term_objective(
+                    cached: dict[str, Any], ff_key: str
+                ) -> tuple[list[float], list[float]]:
+                    entry = cached["ff"].get(ff_key)
+                    if entry is None:
+                        raise gcmd.error(
+                            "ferr fit has no ferr_rms_ff[%r] to score"
+                            % (ff_key,)
+                        )
+                    if ff_key == "direction_split":
+                        n_pairs = len(current["pairs"])
+                        for field in (
+                            "pairs",
+                            "lambda",
+                            "q",
+                            "rms",
+                            "sigma",
+                            "windows",
+                        ):
+                            vec = entry.get(field)
+                            if not isinstance(vec, list) or len(vec) != n_pairs:
+                                raise gcmd.error(
+                                    "ferr fit direction_split[%r] must "
+                                    "be a list of %d per-pair values "
+                                    "matching the profile pairs - rebuild "
+                                    "servo-cal (./install.sh)"
+                                    % (field, n_pairs)
+                                )
                         for pair_idx, pair in enumerate(current["pairs"]):
-                            search = searches[pair["slots"][0]]
-                            value = search.best if search.done else search.trial
-                            delta = (
-                                value
-                                - trial["pairs"][pair_idx]["direction_split"]
+                            label = pair["slots"][0]
+                            if not entry["windows"][pair_idx] or (
+                                entry["rms"][pair_idx] is None
+                            ):
+                                raise gcmd.error(
+                                    "direction_split pair %s has no "
+                                    "direction-run windows - the "
+                                    "excitation never reversed it, "
+                                    "feedforward cannot be scored" % (label,)
+                                )
+                            if entry["sigma"][pair_idx] is None:
+                                raise gcmd.error(
+                                    "direction_split pair %s has fewer "
+                                    "than 2 windows per direction so its "
+                                    "scatter (sigma) is unmeasurable - "
+                                    "cannot apply the 2-sigma acceptance "
+                                    "test" % (label,)
+                                )
+                        return (
+                            [float(r) for r in entry["rms"]],
+                            [float(s) for s in entry["sigma"]],
+                        )
+                    rms_v = entry["rms"]
+                    sigma_v = entry["sigma"]
+                    windows_v = entry["windows"]
+                    for fit_idx, mode in enumerate(plan["modes"]):
+                        if not windows_v[fit_idx] or rms_v[fit_idx] is None:
+                            raise gcmd.error(
+                                "term %s mode %s has no transient "
+                                "windows - the excitation never triggered "
+                                "it, feedforward cannot be scored"
+                                % (ff_key, mode)
                             )
-                            trial = add_dynamics_direction_split(
-                                trial, pair_idx, delta
+                        if sigma_v[fit_idx] is None:
+                            raise gcmd.error(
+                                "term %s mode %s has fewer than 2 "
+                                "transient windows so its per-window "
+                                "scatter (sigma) is unmeasurable - cannot "
+                                "apply the 2-sigma acceptance test"
+                                % (ff_key, mode)
                             )
-                    else:
-                        for mode, search in searches.items():
-                            idx = baseline_modes.index(mode)
-                            trial[key][idx] = (
+                    return (
+                        [float(r) for r in rms_v],
+                        [float(s) for s in sigma_v],
+                    )
+
+                out_path = self._dynamics_out_path(gcmd, run, name)
+                self._prep("X", dwell)
+                self._prep("Y", dwell)
+                self._pattern_reach_report(
+                    gcmd, points, start_x, start_y, [max_accel], speeds
+                )
+                phase_idx = 0
+                searches: dict[str, RmsLineSearch] | None = None
+                pass_improved = False
+                round_i = 0
+                while True:
+                    term = terms[phase_idx]
+                    is_lead = term == "LEAD"
+                    is_split = term == "DIRECTION_SPLIT"
+                    key = (
+                        None
+                        if (is_lead or is_split)
+                        else DYNAMICS_TERM_KEYS[term]
+                    )
+                    trial = _copy_dynamics(current)
+                    trial_lead = current_lead
+                    if searches is not None:
+                        if is_lead:
+                            search = searches["xy"]
+                            trial_lead = (
                                 search.best if search.done else search.trial
                             )
-                cache_key = model_key(trial, trial_lead)
-                cached = measured.get(cache_key)
-                ff_key = term.lower()
-                if cached is None:
-                    applied = True
-                    cached = measure(round_i, trial, trial_lead)
-                    measured[cache_key] = cached
-                    obj_rms, obj_sigma = term_objective(cached, ff_key)
-                    rms = cached["rms"]
-                    label = "baseline" if searches is None else term.lower()
-                    if is_lead:
-                        n_modes = len(obj_rms)
-                        line = "xy lead=%.1fus rms=%.2fum (onset %+.2fum)" % (
-                            trial_lead * 1e6,
-                            sum(obj_rms) / n_modes * 1e3,
-                            sum(cached["onset"]) * 1e3,
-                        )
-                    elif is_split:
-                        split_q = cached["ff"]["direction_split"]["q"]
-                        line = " | ".join(
-                            "%s split=%.4f q=%+.2fum rms=%.2fum"
-                            % (
-                                pair["slots"][0],
-                                trial["pairs"][pair_idx]["direction_split"],
-                                float(split_q[pair_idx]) * 1e3,
-                                obj_rms[pair_idx] * 1e3,
-                            )
-                            for pair_idx, pair in enumerate(current["pairs"])
-                        )
-                    else:
-                        line = " | ".join(
-                            "%s %s=%.6g rms=%.2fum (onset %+.2fum, g=%+.3g)"
-                            % (
-                                mode,
-                                key,
-                                trial[key][baseline_modes.index(mode)],
-                                obj_rms[fit_idx] * 1e3,
-                                cached["onset"][fit_idx] * 1e3,
-                                cached["coef"][key][fit_idx],
-                            )
-                            for fit_idx, mode in enumerate(plan["modes"])
-                        )
-                    gcmd.respond_info("r%d [%s] %s" % (round_i, label, line))
-                    rounds_history.append(
-                        {
-                            "round": round_i,
-                            "term": label,
-                            "values": {
-                                DYNAMICS_TERM_KEYS[t]: list(
-                                    trial[DYNAMICS_TERM_KEYS[t]]
+                        elif is_split:
+                            for pair_idx, pair in enumerate(current["pairs"]):
+                                search = searches[pair["slots"][0]]
+                                value = (
+                                    search.best if search.done else search.trial
                                 )
-                                for t in terms
-                                if t not in ("LEAD", "DIRECTION_SPLIT")
-                            },
-                            "direction_split": (
-                                [
-                                    {
-                                        "slots": list(pair["slots"]),
-                                        "direction_split": pair[
-                                            "direction_split"
-                                        ],
-                                    }
-                                    for pair in trial["pairs"]
-                                ]
-                                if split_enabled
-                                else None
-                            ),
-                            "lead_us": (
-                                trial_lead * 1e6 if lead_enabled else None
-                            ),
-                            "ferr_rms_raw": list(rms),
-                            "ferr_rms_ff": cached["ff"],
-                            "coef": dict(cached["coef"]),
-                            "stderr": dict(cached["stderr"]),
-                            "onset_bias": list(cached["onset"]),
-                            "samples": cached["samples"],
-                        }
-                    )
-                    round_i += 1
-                else:
-                    obj_rms, obj_sigma = term_objective(cached, ff_key)
-                if searches is None:
-                    searches = {}
-                    if is_lead:
-                        hint = sum(cached["onset"])
-                        step_size = (
-                            step_frac * current_lead
-                            if current_lead > 0.0
-                            else 0.5 * cycle_us * 1e-6
-                        )
-                        n_modes = len(obj_rms)
-                        searches["xy"] = RmsLineSearch(
-                            current_lead,
-                            sum(obj_rms) / n_modes,
-                            math.hypot(*obj_sigma) / n_modes,
-                            step_size,
-                            lo=0.0,
-                            hint=hint if hint != 0.0 else 1.0,
-                        )
-                    elif is_split:
-                        split_q = cached["ff"]["direction_split"]["q"]
-                        for pair_idx, pair in enumerate(current["pairs"]):
-                            value = pair["direction_split"]
-                            step_size = max(step_frac * abs(value), 0.02)
-                            q = float(split_q[pair_idx])
-                            searches[pair["slots"][0]] = RmsLineSearch(
-                                value,
-                                obj_rms[pair_idx],
-                                obj_sigma[pair_idx],
-                                step_size,
-                                lo=-0.45,
-                                hi=0.45,
-                                hint=-q if q != 0.0 else 1.0,
-                            )
-                    else:
-                        for fit_idx, mode in enumerate(plan["modes"]):
-                            idx = baseline_modes.index(mode)
-                            value = current[key][idx]
-                            if term == "MASS":
-                                lo = (
-                                    TUNE_MASS_FLOOR_FRACTION
-                                    * baseline[key][idx]
+                                delta = (
+                                    value
+                                    - trial["pairs"][pair_idx][
+                                        "direction_split"
+                                    ]
                                 )
-                                step_size = step_frac * abs(value)
-                            else:
-                                lo = 0.0
-                                step_size = (
-                                    step_frac * abs(value)
-                                    if value != 0.0
-                                    else TUNE_ZERO_FLOOR_STEPS[term]
+                                trial = add_dynamics_direction_split(
+                                    trial, pair_idx, delta
                                 )
-                            hint = float(cached["coef"][key][fit_idx])
-                            if (
-                                term == "MASS"
-                                and cached["onset"][fit_idx] != 0.0
-                            ):
-                                hint = cached["onset"][fit_idx]
-                            searches[mode] = RmsLineSearch(
-                                value,
-                                obj_rms[fit_idx],
-                                obj_sigma[fit_idx],
-                                step_size,
-                                lo=lo,
-                                hint=hint if hint != 0.0 else 1.0,
+                        else:
+                            for mode, search in searches.items():
+                                idx = baseline_modes.index(mode)
+                                trial[key][idx] = (
+                                    search.best if search.done else search.trial
+                                )
+                    cache_key = model_key(trial, trial_lead)
+                    cached = measured.get(cache_key)
+                    ff_key = term.lower()
+                    if cached is None:
+                        applied = True
+                        cached = measure(round_i, trial, trial_lead)
+                        measured[cache_key] = cached
+                        obj_rms, obj_sigma = term_objective(cached, ff_key)
+                        rms = cached["rms"]
+                        label = "baseline" if searches is None else term.lower()
+                        if is_lead:
+                            n_modes = len(obj_rms)
+                            line = (
+                                "xy lead=%.1fus rms=%.2fum (onset %+.2fum)"
+                                % (
+                                    trial_lead * 1e6,
+                                    sum(obj_rms) / n_modes * 1e3,
+                                    sum(cached["onset"]) * 1e3,
+                                )
                             )
-                elif is_lead:
-                    search = searches["xy"]
-                    if not search.done:
-                        n_modes = len(obj_rms)
-                        search.feed(
-                            sum(obj_rms) / n_modes,
-                            math.hypot(*obj_sigma) / n_modes,
-                        )
-                elif is_split:
-                    for pair_idx, pair in enumerate(current["pairs"]):
-                        search = searches[pair["slots"][0]]
-                        if not search.done:
-                            search.feed(obj_rms[pair_idx], obj_sigma[pair_idx])
-                else:
-                    for fit_idx, mode in enumerate(plan["modes"]):
-                        search = searches[mode]
-                        if not search.done:
-                            search.feed(obj_rms[fit_idx], obj_sigma[fit_idx])
-                if all(search.done for search in searches.values()):
-                    lines = []
-                    if is_lead:
-                        search = searches["xy"]
-                        pass_improved = pass_improved or search.improved
-                        current_lead = search.best
-                        lines.append(
-                            "xy %.1fus @ %.2fum (%s)"
-                            % (
-                                search.best * 1e6,
-                                search.best_rms * 1e3,
-                                search.note,
+                        elif is_split:
+                            split_q = cached["ff"]["direction_split"]["q"]
+                            line = " | ".join(
+                                "%s split=%.4f q=%+.2fum rms=%.2fum"
+                                % (
+                                    pair["slots"][0],
+                                    trial["pairs"][pair_idx]["direction_split"],
+                                    float(split_q[pair_idx]) * 1e3,
+                                    obj_rms[pair_idx] * 1e3,
+                                )
+                                for pair_idx, pair in enumerate(
+                                    current["pairs"]
+                                )
                             )
+                        else:
+                            line = " | ".join(
+                                "%s %s=%.6g rms=%.2fum (onset %+.2fum, g=%+.3g)"
+                                % (
+                                    mode,
+                                    key,
+                                    trial[key][baseline_modes.index(mode)],
+                                    obj_rms[fit_idx] * 1e3,
+                                    cached["onset"][fit_idx] * 1e3,
+                                    cached["coef"][key][fit_idx],
+                                )
+                                for fit_idx, mode in enumerate(plan["modes"])
+                            )
+                        gcmd.respond_info(
+                            "r%d [%s] %s" % (round_i, label, line)
                         )
-                        search_summaries.append(
+                        rounds_history.append(
                             {
-                                "term": "lead",
-                                "mode": "xy",
-                                "best": search.best,
-                                "best_rms": search.best_rms,
-                                "best_sigma": search.best_sigma,
-                                "improved": search.improved,
-                                "note": search.note,
-                                "probes": len(search.history) - 1,
+                                "round": round_i,
+                                "term": label,
+                                "values": {
+                                    DYNAMICS_TERM_KEYS[t]: list(
+                                        trial[DYNAMICS_TERM_KEYS[t]]
+                                    )
+                                    for t in terms
+                                    if t not in ("LEAD", "DIRECTION_SPLIT")
+                                },
+                                "direction_split": (
+                                    [
+                                        {
+                                            "slots": list(pair["slots"]),
+                                            "direction_split": pair[
+                                                "direction_split"
+                                            ],
+                                        }
+                                        for pair in trial["pairs"]
+                                    ]
+                                    if split_enabled
+                                    else None
+                                ),
+                                "lead_us": (
+                                    trial_lead * 1e6 if lead_enabled else None
+                                ),
+                                "ferr_rms_raw": list(rms),
+                                "ferr_rms_ff": cached["ff"],
+                                "coef": dict(cached["coef"]),
+                                "stderr": dict(cached["stderr"]),
+                                "onset_bias": list(cached["onset"]),
+                                "samples": cached["samples"],
                             }
                         )
+                        round_i += 1
+                    else:
+                        obj_rms, obj_sigma = term_objective(cached, ff_key)
+                    if searches is None:
+                        searches = {}
+                        if is_lead:
+                            hint = sum(cached["onset"])
+                            step_size = (
+                                step_frac * current_lead
+                                if current_lead > 0.0
+                                else 0.5 * cycle_us * 1e-6
+                            )
+                            n_modes = len(obj_rms)
+                            searches["xy"] = RmsLineSearch(
+                                current_lead,
+                                sum(obj_rms) / n_modes,
+                                math.hypot(*obj_sigma) / n_modes,
+                                step_size,
+                                lo=0.0,
+                                hint=hint if hint != 0.0 else 1.0,
+                            )
+                        elif is_split:
+                            split_q = cached["ff"]["direction_split"]["q"]
+                            for pair_idx, pair in enumerate(current["pairs"]):
+                                value = pair["direction_split"]
+                                step_size = max(step_frac * abs(value), 0.02)
+                                q = float(split_q[pair_idx])
+                                searches[pair["slots"][0]] = RmsLineSearch(
+                                    value,
+                                    obj_rms[pair_idx],
+                                    obj_sigma[pair_idx],
+                                    step_size,
+                                    lo=-0.45,
+                                    hi=0.45,
+                                    hint=-q if q != 0.0 else 1.0,
+                                )
+                        else:
+                            for fit_idx, mode in enumerate(plan["modes"]):
+                                idx = baseline_modes.index(mode)
+                                value = current[key][idx]
+                                if term == "MASS":
+                                    lo = (
+                                        TUNE_MASS_FLOOR_FRACTION
+                                        * baseline[key][idx]
+                                    )
+                                    step_size = step_frac * abs(value)
+                                else:
+                                    lo = 0.0
+                                    step_size = (
+                                        step_frac * abs(value)
+                                        if value != 0.0
+                                        else TUNE_ZERO_FLOOR_STEPS[term]
+                                    )
+                                hint = float(cached["coef"][key][fit_idx])
+                                if (
+                                    term == "MASS"
+                                    and cached["onset"][fit_idx] != 0.0
+                                ):
+                                    hint = cached["onset"][fit_idx]
+                                searches[mode] = RmsLineSearch(
+                                    value,
+                                    obj_rms[fit_idx],
+                                    obj_sigma[fit_idx],
+                                    step_size,
+                                    lo=lo,
+                                    hint=hint if hint != 0.0 else 1.0,
+                                )
+                    elif is_lead:
+                        search = searches["xy"]
+                        if not search.done:
+                            n_modes = len(obj_rms)
+                            search.feed(
+                                sum(obj_rms) / n_modes,
+                                math.hypot(*obj_sigma) / n_modes,
+                            )
                     elif is_split:
                         for pair_idx, pair in enumerate(current["pairs"]):
                             search = searches[pair["slots"][0]]
-                            pass_improved = pass_improved or search.improved
-                            current["pairs"][pair_idx]["direction_split"] = (
-                                search.best
-                            )
-                            lines.append(
-                                "%s %.4f @ %.2fum (%s)"
-                                % (
-                                    pair["slots"][0],
-                                    search.best,
-                                    search.best_rms * 1e3,
-                                    search.note,
+                            if not search.done:
+                                search.feed(
+                                    obj_rms[pair_idx], obj_sigma[pair_idx]
                                 )
-                            )
-                            search_summaries.append(
-                                {
-                                    "term": "direction_split",
-                                    "mode": pair["slots"][0],
-                                    "best": search.best,
-                                    "best_rms": search.best_rms,
-                                    "best_sigma": search.best_sigma,
-                                    "improved": search.improved,
-                                    "note": search.note,
-                                    "probes": len(search.history) - 1,
-                                }
-                            )
                     else:
                         for fit_idx, mode in enumerate(plan["modes"]):
                             search = searches[mode]
+                            if not search.done:
+                                search.feed(
+                                    obj_rms[fit_idx], obj_sigma[fit_idx]
+                                )
+                    if all(search.done for search in searches.values()):
+                        lines = []
+                        if is_lead:
+                            search = searches["xy"]
                             pass_improved = pass_improved or search.improved
-                            idx = baseline_modes.index(mode)
-                            current[key][idx] = search.best
+                            current_lead = search.best
                             lines.append(
-                                "%s %.6g @ %.2fum (%s)"
+                                "xy %.1fus @ %.2fum (%s)"
                                 % (
-                                    mode,
-                                    search.best,
+                                    search.best * 1e6,
                                     search.best_rms * 1e3,
                                     search.note,
                                 )
                             )
                             search_summaries.append(
                                 {
-                                    "term": term.lower(),
-                                    "mode": mode,
+                                    "term": "lead",
+                                    "mode": "xy",
                                     "best": search.best,
                                     "best_rms": search.best_rms,
                                     "best_sigma": search.best_sigma,
@@ -1589,71 +1576,128 @@ class DynamicsFitCommands(MeasureCommands):
                                     "probes": len(search.history) - 1,
                                 }
                             )
-                    gcmd.respond_info(
-                        "%s settled: %s" % (term.lower(), " | ".join(lines))
+                        elif is_split:
+                            for pair_idx, pair in enumerate(current["pairs"]):
+                                search = searches[pair["slots"][0]]
+                                pass_improved = pass_improved or search.improved
+                                current["pairs"][pair_idx][
+                                    "direction_split"
+                                ] = search.best
+                                lines.append(
+                                    "%s %.4f @ %.2fum (%s)"
+                                    % (
+                                        pair["slots"][0],
+                                        search.best,
+                                        search.best_rms * 1e3,
+                                        search.note,
+                                    )
+                                )
+                                search_summaries.append(
+                                    {
+                                        "term": "direction_split",
+                                        "mode": pair["slots"][0],
+                                        "best": search.best,
+                                        "best_rms": search.best_rms,
+                                        "best_sigma": search.best_sigma,
+                                        "improved": search.improved,
+                                        "note": search.note,
+                                        "probes": len(search.history) - 1,
+                                    }
+                                )
+                        else:
+                            for fit_idx, mode in enumerate(plan["modes"]):
+                                search = searches[mode]
+                                pass_improved = pass_improved or search.improved
+                                idx = baseline_modes.index(mode)
+                                current[key][idx] = search.best
+                                lines.append(
+                                    "%s %.6g @ %.2fum (%s)"
+                                    % (
+                                        mode,
+                                        search.best,
+                                        search.best_rms * 1e3,
+                                        search.note,
+                                    )
+                                )
+                                search_summaries.append(
+                                    {
+                                        "term": term.lower(),
+                                        "mode": mode,
+                                        "best": search.best,
+                                        "best_rms": search.best_rms,
+                                        "best_sigma": search.best_sigma,
+                                        "improved": search.improved,
+                                        "note": search.note,
+                                        "probes": len(search.history) - 1,
+                                    }
+                                )
+                        gcmd.respond_info(
+                            "%s settled: %s" % (term.lower(), " | ".join(lines))
+                        )
+                        searches = None
+                        phase_idx += 1
+                        if phase_idx == len(terms):
+                            if not pass_improved:
+                                success = True
+                                break
+                            phase_idx = 0
+                            pass_improved = False
+                send_dynamics_model(engine, handle, current)
+                if lead_enabled:
+                    send_ff_lead(
+                        engine, handle, node, plan["servos"], current_lead
                     )
-                    searches = None
-                    phase_idx += 1
-                    if phase_idx == len(terms):
-                        if not pass_improved:
-                            success = True
-                            break
-                        phase_idx = 0
-                        pass_improved = False
-            send_dynamics_model(engine, handle, current)
-            if lead_enabled:
-                send_ff_lead(engine, handle, node, plan["servos"], current_lead)
-            with open(out_path, "w") as f:
-                f.write(
-                    render_fit_dynamics_toml(
-                        current,
-                        current,
-                        [t.lower() for t in terms if t != "LEAD"],
+                with open(out_path, "w") as f:
+                    f.write(
+                        render_fit_dynamics_toml(
+                            current,
+                            current,
+                            [t.lower() for t in terms if t != "LEAD"],
+                            run.run_dir,
+                            current_lead * 1e6,
+                        )
+                    )
+                node.set_live_dynamics_profile(out_path)
+                run.manifest["dynamics_tune"] = {
+                    "terms": [t.lower() for t in terms],
+                    "max_accel": max_accel,
+                    "max_speed": max_speed,
+                    "step": step_frac,
+                    "objective": "transient_rms",
+                    "accept_z": ACCEPT_Z,
+                    "rounds": rounds_history,
+                    "search": search_summaries,
+                    "lead_us": current_lead * 1e6 if lead_enabled else None,
+                    "converged": True,
+                    "profile": out_path,
+                }
+                run.write()
+                structured_log.event(
+                    "calibration",
+                    "dynamics_tune",
+                    run_dir=run.run_dir,
+                    rounds=len(rounds_history),
+                    profile=out_path,
+                )
+                lead_note = ""
+                if lead_enabled:
+                    lead_note = (
+                        " | tuned ff lead %.1fus - carried in the tuned profile"
+                        % (current_lead * 1e6,)
+                    )
+                gcmd.respond_info(
+                    "SERVO_TUNE_DYNAMICS converged in %d captures | tuned "
+                    "dynamics profile: %s | tuned model stays live until "
+                    "RESTART - point [ethercat_node %s] dynamics_profile at "
+                    "it to keep it%s | run %s"
+                    % (
+                        len(rounds_history),
+                        out_path,
+                        node.name,
+                        lead_note,
                         run.run_dir,
-                        current_lead * 1e6,
                     )
                 )
-            node.set_live_dynamics_profile(out_path)
-            run.manifest["dynamics_tune"] = {
-                "terms": [t.lower() for t in terms],
-                "max_accel": max_accel,
-                "max_speed": max_speed,
-                "step": step_frac,
-                "objective": "transient_rms",
-                "accept_z": ACCEPT_Z,
-                "rounds": rounds_history,
-                "search": search_summaries,
-                "lead_us": current_lead * 1e6 if lead_enabled else None,
-                "converged": True,
-                "profile": out_path,
-            }
-            run.write()
-            structured_log.event(
-                "calibration",
-                "dynamics_tune",
-                run_dir=run.run_dir,
-                rounds=len(rounds_history),
-                profile=out_path,
-            )
-            lead_note = ""
-            if lead_enabled:
-                lead_note = (
-                    " | tuned ff lead %.1fus - carried in the tuned profile"
-                    % (current_lead * 1e6,)
-                )
-            gcmd.respond_info(
-                "SERVO_TUNE_DYNAMICS converged in %d captures | tuned "
-                "dynamics profile: %s | tuned model stays live until "
-                "RESTART - point [ethercat_node %s] dynamics_profile at "
-                "it to keep it%s | run %s"
-                % (
-                    len(rounds_history),
-                    out_path,
-                    node.name,
-                    lead_note,
-                    run.run_dir,
-                )
-            )
         finally:
             try:
                 if applied and not success:
@@ -1673,7 +1717,6 @@ class DynamicsFitCommands(MeasureCommands):
                     )
             finally:
                 self._restore()
-                self._active_run = None
 
     cmd_SERVO_SET_COMPLIANCE_help = (
         "Write the per-mode belt-compliance term 1/omega_b^2 into the "
@@ -2046,67 +2089,66 @@ class DynamicsFitCommands(MeasureCommands):
             "dwell_ms": dwell,
             "modes": modes,
         }
-        run = self._begin_run(
-            gcmd, "compliance", name, "XY", servos, stroke_plan
-        )
         try:
-            self._prep("X", dwell)
-            self._prep("Y", dwell)
-            reactor = self.printer.get_reactor()
-            for mode in modes:
-                row = spatial["frame"][spatial["modes"].index(mode)]
-                slot_mask = 0
-                sign_mask = 0
-                step_servos = []
-                for servo, weight in zip(servos, row):
-                    if weight == 0.0:
-                        continue
-                    slot = slot_for[servo]
-                    slot_mask |= 1 << slot
-                    step_servos.append(servo)
-                    # The buzz sign acts in command mm (before the signed
-                    # counts-per-mm); the spatial frame is in RAW drive mm
-                    # with invert folded in - unfold it for the mask.
-                    sign_cmd = (1.0 if weight > 0.0 else -1.0) * (
-                        -1.0 if invert_for[servo] else 1.0
+            with self._run_scope(
+                gcmd, "compliance", name, "XY", servos, stroke_plan
+            ) as run:
+                self._prep("X", dwell)
+                self._prep("Y", dwell)
+                reactor = self.printer.get_reactor()
+                for mode in modes:
+                    row = spatial["frame"][spatial["modes"].index(mode)]
+                    slot_mask = 0
+                    sign_mask = 0
+                    step_servos = []
+                    for servo, weight in zip(servos, row):
+                        if weight == 0.0:
+                            continue
+                        slot = slot_for[servo]
+                        slot_mask |= 1 << slot
+                        step_servos.append(servo)
+                        # The buzz sign acts in command mm (before the signed
+                        # counts-per-mm); the spatial frame is in RAW drive mm
+                        # with invert folded in - unfold it for the mask.
+                        sign_cmd = (1.0 if weight > 0.0 else -1.0) * (
+                            -1.0 if invert_for[servo] else 1.0
+                        )
+                        if sign_cmd < 0.0:
+                            sign_mask |= 1 << slot
+                    gcmd.respond_info(
+                        "compliance sweep, mode %s: %.0f->%.0f Hz over %.1f s, "
+                        "amplitude %.3f mm on %s"
+                        % (
+                            mode,
+                            freq_start,
+                            freq_end,
+                            duration,
+                            amplitude,
+                            "+".join(step_servos),
+                        )
                     )
-                    if sign_cmd < 0.0:
-                        sign_mask |= 1 << slot
-                gcmd.respond_info(
-                    "compliance sweep, mode %s: %.0f->%.0f Hz over %.1f s, "
-                    "amplitude %.3f mm on %s"
-                    % (
-                        mode,
-                        freq_start,
-                        freq_end,
-                        duration,
-                        amplitude,
-                        "+".join(step_servos),
-                    )
-                )
-                self._start_capture(mode, step_servos)
-                try:
-                    self._resonance_buzz(
-                        gcmd,
-                        engine,
-                        handle,
-                        slot_mask,
-                        sign_mask,
-                        int(round(freq_start * 1000.0)),
-                        int(round(freq_end * 1000.0)),
-                        int(round(amplitude * 1e6)),
-                        int(round(duration * 1000.0)),
-                        int(round(ramp * 1000.0)),
-                    )
-                    reactor.pause(reactor.monotonic() + duration + 0.2)
-                finally:
-                    self._stop_capture()
-                run.record_step(SweepStep(mode, {}, []))
-                if dwell:
-                    reactor.pause(reactor.monotonic() + dwell / 1000.0)
-            results = self._analyze_and_report(gcmd, run)
+                    self._start_capture(mode, step_servos)
+                    try:
+                        self._resonance_buzz(
+                            gcmd,
+                            engine,
+                            handle,
+                            slot_mask,
+                            sign_mask,
+                            int(round(freq_start * 1000.0)),
+                            int(round(freq_end * 1000.0)),
+                            int(round(amplitude * 1e6)),
+                            int(round(duration * 1000.0)),
+                            int(round(ramp * 1000.0)),
+                        )
+                        reactor.pause(reactor.monotonic() + duration + 0.2)
+                    finally:
+                        self._stop_capture()
+                    run.record_step(SweepStep(mode, {}, []))
+                    if dwell:
+                        reactor.pause(reactor.monotonic() + dwell / 1000.0)
+                results = self._analyze_and_report(gcmd, run)
         finally:
-            self._active_run = None
             if pin_restore is not None:
                 # Put the live (pinned) model back, success or failure.
                 send_dynamics_model(engine, handle, pin_restore)
@@ -2589,122 +2631,122 @@ class DynamicsFitCommands(MeasureCommands):
             "param": param,
             "values": values,
         }
-        run = self._begin_run(
-            gcmd, "pin_sweep", name, "XY", servos, stroke_plan
-        )
-        reactor = self.printer.get_reactor()
-        gcmd.respond_info(
-            "pin sweep, mode %s: %s over %d values x %.1f s at %.1f Hz, "
-            "amplitude %.3f mm on %s"
-            % (
-                mode,
-                param,
-                len(values),
-                dwell_s,
-                freq,
-                amplitude,
-                "+".join(step_servos),
-            )
-        )
-        self._prep("X", 0)
-        self._prep("Y", 0)
-        toolhead = self.printer.lookup_object("toolhead")
-        tone_end = 0.0
-        accels: list[float | None] = []
         try:
-            for i, value in enumerate(values):
-                # The endpoint refuses a new buzz while one is armed: wait
-                # out the previous step's tone tail (it is oversized past
-                # the scored window on purpose).
-                now = reactor.monotonic()
-                if now < tone_end:
-                    reactor.pause(tone_end + 0.1)
-                # Buzz dwells are invisible to the toolhead, so a long
-                # staircase looks idle to idle_timeout - whose M84 would
-                # yank torque mid-sweep (observed on the bench: the disable
-                # landed one second after an 11-step run). Advancing the
-                # print time each step keeps the machine "busy".
-                toolhead.get_last_move_time()
-                updated = self._pin_sweep_model(baseline, mode_i, param, value)
-                send_dynamics_model(engine, handle, updated)
-                step_name = self._pin_step_name(param, i, value)
-                # Tone covers this dwell only; generously oversized (it is
-                # duration-bounded and lapses harmlessly after the capture
-                # stops - the next step re-streams and starts its own).
-                self._resonance_buzz(
-                    gcmd,
-                    engine,
-                    handle,
-                    slot_mask,
-                    sign_mask,
-                    int(round(freq * 1000.0)),
-                    int(round(freq * 1000.0)),
-                    int(round(amplitude * 1e6)),
-                    int(round((ramp + dwell_s + 2.0) * 1000.0)),
-                    int(round(ramp * 1000.0)),
-                )
-                tone_end = reactor.monotonic() + ramp + dwell_s + 2.0
-                # Let the tone ramp and the demodulator settle before the
-                # scored window opens.
-                reactor.pause(reactor.monotonic() + ramp)
-                t_start = round(reactor.monotonic(), 3)
-                # The toolhead accelerometer captures the same scored dwell
-                # window as the pin-residual capture, so its settled-tail
-                # bin lines up with the residual's.
-                aclient = (
-                    None
-                    if accel_chip is None
-                    else accel_chip.start_internal_client()
-                )
-                self._start_capture(step_name, step_servos)
-                try:
-                    reactor.pause(reactor.monotonic() + dwell_s)
-                finally:
-                    self._stop_capture()
-                    if aclient is not None:
-                        aclient.finish_measurements()
-                accel_csv: str | None = None
-                if aclient is None:
-                    accels.append(None)
-                else:
-                    samples = (
-                        list(aclient.get_samples())
-                        if aclient.has_valid_samples()
-                        else []
+            with self._run_scope(
+                gcmd, "pin_sweep", name, "XY", servos, stroke_plan
+            ) as run:
+                reactor = self.printer.get_reactor()
+                gcmd.respond_info(
+                    "pin sweep, mode %s: %s over %d values x %.1f s at "
+                    "%.1f Hz, amplitude %.3f mm on %s"
+                    % (
+                        mode,
+                        param,
+                        len(values),
+                        dwell_s,
+                        freq,
+                        amplitude,
+                        "+".join(step_servos),
                     )
-                    accels.append(self._pin_accel_amplitude(samples, freq))
-                    # Keep the samples, not just the scalar at the tone. The
-                    # analyzer turns this CSV into the per-step accel PSD the
-                    # dashboard already renders beside the following-error
-                    # PSD, which is how a reader sees whether the pin
-                    # collapsed the coupled spike or merely added a second
-                    # one - something a single amplitude cannot show.
-                    if samples:
-                        accel_csv = os.path.basename(
-                            self._write_accel_csv(
-                                gcmd, aclient, accel_name, step_name
-                            )
+                )
+                self._prep("X", 0)
+                self._prep("Y", 0)
+                toolhead = self.printer.lookup_object("toolhead")
+                tone_end = 0.0
+                accels: list[float | None] = []
+                for i, value in enumerate(values):
+                    # The endpoint refuses a new buzz while one is armed: wait
+                    # out the previous step's tone tail (it is oversized past
+                    # the scored window on purpose).
+                    now = reactor.monotonic()
+                    if now < tone_end:
+                        reactor.pause(tone_end + 0.1)
+                    # Buzz dwells are invisible to the toolhead, so a long
+                    # staircase looks idle to idle_timeout - whose M84 would
+                    # yank torque mid-sweep (observed on the bench: the disable
+                    # landed one second after an 11-step run). Advancing the
+                    # print time each step keeps the machine "busy".
+                    toolhead.get_last_move_time()
+                    updated = self._pin_sweep_model(
+                        baseline, mode_i, param, value
+                    )
+                    send_dynamics_model(engine, handle, updated)
+                    step_name = self._pin_step_name(param, i, value)
+                    # Tone covers this dwell only; generously oversized (it is
+                    # duration-bounded and lapses harmlessly after the capture
+                    # stops - the next step re-streams and starts its own).
+                    self._resonance_buzz(
+                        gcmd,
+                        engine,
+                        handle,
+                        slot_mask,
+                        sign_mask,
+                        int(round(freq * 1000.0)),
+                        int(round(freq * 1000.0)),
+                        int(round(amplitude * 1e6)),
+                        int(round((ramp + dwell_s + 2.0) * 1000.0)),
+                        int(round(ramp * 1000.0)),
+                    )
+                    tone_end = reactor.monotonic() + ramp + dwell_s + 2.0
+                    # Let the tone ramp and the demodulator settle before the
+                    # scored window opens.
+                    reactor.pause(reactor.monotonic() + ramp)
+                    t_start = round(reactor.monotonic(), 3)
+                    # The toolhead accelerometer captures the same scored dwell
+                    # window as the pin-residual capture, so its settled-tail
+                    # bin lines up with the residual's.
+                    aclient = (
+                        None
+                        if accel_chip is None
+                        else accel_chip.start_internal_client()
+                    )
+                    self._start_capture(step_name, step_servos)
+                    try:
+                        reactor.pause(reactor.monotonic() + dwell_s)
+                    finally:
+                        self._stop_capture()
+                        if aclient is not None:
+                            aclient.finish_measurements()
+                    accel_csv: str | None = None
+                    if aclient is None:
+                        accels.append(None)
+                    else:
+                        samples = (
+                            list(aclient.get_samples())
+                            if aclient.has_valid_samples()
+                            else []
                         )
-                run.record_step(
-                    SweepStep(
-                        step_name,
-                        {
-                            "value": value,
-                            "t_start_s": t_start,
-                            "t_end_s": round(reactor.monotonic(), 3),
-                        },
-                        [],
-                        accel=accel_csv,
+                        accels.append(self._pin_accel_amplitude(samples, freq))
+                        # Keep the samples, not just the scalar at the
+                        # tone. The analyzer turns this CSV into the
+                        # per-step accel PSD the dashboard already
+                        # renders beside the following-error PSD, which
+                        # is how a reader sees whether the pin collapsed
+                        # the coupled spike or merely added a second
+                        # one - something a single amplitude cannot show.
+                        if samples:
+                            accel_csv = os.path.basename(
+                                self._write_accel_csv(
+                                    gcmd, aclient, accel_name, step_name
+                                )
+                            )
+                    run.record_step(
+                        SweepStep(
+                            step_name,
+                            {
+                                "value": value,
+                                "t_start_s": t_start,
+                                "t_end_s": round(reactor.monotonic(), 3),
+                            },
+                            [],
+                            accel=accel_csv,
+                        )
                     )
-                )
-            results = self._run_analyze(gcmd, run)
+                results = self._run_analyze(gcmd, run)
         finally:
             # Restore the pre-sweep model (also on failure).
-            try:
-                send_dynamics_model(engine, handle, baseline)
-                node.set_live_dynamics_profile(profile_path)
-            finally:
-                self._active_run = None
+            send_dynamics_model(engine, handle, baseline)
+            node.set_live_dynamics_profile(profile_path)
         scored = self._pin_sweep_scores(gcmd, results, values, param)
         rows = [(v, r, a) for (v, r), a in zip(scored, accels)]
         best_value, best_score, metric = self._pick_pin_value(
@@ -3196,10 +3238,9 @@ class DynamicsFitCommands(MeasureCommands):
             "dwell_s": dwell_s,
             "baseline_profile": profile_path,
         }
-        run = self._begin_run(
+        with self._run_scope(
             gcmd, "pin_compare", name, mode.upper(), servos, stroke_plan
-        )
-        try:
+        ) as run:
             self._run_compare_sweep(
                 gcmd,
                 node,
@@ -3225,12 +3266,6 @@ class DynamicsFitCommands(MeasureCommands):
                 accel_name,
                 run,
             )
-            # Every other calibration command analyzes its own run before it
-            # returns; a comparison that did not left the dashboard holding a
-            # results-less run and an analyze button to press by hand.
-            self._analyze_and_report(gcmd, run)
-        finally:
-            self._active_run = None
         steps = run.manifest["steps"]
         structured_log.event(
             "calibration",
@@ -3526,11 +3561,8 @@ class DynamicsFitCommands(MeasureCommands):
         except Exception as exc:
             # Restore the pre-tune model (also on failure) and report the
             # partial results, matching the sweep/gain restore discipline.
-            try:
-                send_dynamics_model(engine, handle, pre_tune)
-                node.set_live_dynamics_profile(profile_path)
-            finally:
-                self._active_run = None
+            send_dynamics_model(engine, handle, pre_tune)
+            node.set_live_dynamics_profile(profile_path)
             done = (
                 ", ".join(
                     "%s zeta=%g" % (m, summary[m]["zeta"]) for m in summary
