@@ -141,13 +141,11 @@ fn a_comparison_analyzes_end_to_end_from_standstill_captures() {
             "{name}: PSD taken over the whole capture"
         );
     }
-    // No pin demodulator channels in a synthetic buzz, so the ranking has
-    // nothing to rank — it must say so rather than fail the run.
+    // The synthetic fixture has no chirp plan and no spatial frame, so the
+    // band ranking has nothing to score - the verdict must say so while the
+    // charts survive, not fail the run.
     assert!(
-        results
-            .verdict
-            .reason
-            .contains("no step carries pin residual"),
+        results.verdict.reason.contains("cannot rank the sweep"),
         "{}",
         results.verdict.reason
     );

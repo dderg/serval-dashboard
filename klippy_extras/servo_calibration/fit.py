@@ -2608,10 +2608,12 @@ class DynamicsFitCommands(MeasureCommands):
         pin parameter through VALUES, re-streaming the model live per step,
         and read each step's settled pin-residual magnitude. When
         ``accel_chip`` is given, a toolhead-accelerometer capture runs over
-        each scored dwell window and the single-bin accel amplitude at the
-        tone is scored alongside the residual (an extra reported column and
-        its own flagged minimum; the residual still picks the applied
-        value). Restores the passed ``baseline`` model at the end (also on
+        each scored dwell window, the single-bin accel amplitude at the
+        tone is scored alongside the residual, and the ACCEL column picks
+        the applied value (see _pick_pin_value: the residual scores the
+        rotor holding its own path, not a quiet toolhead, and the two
+        disagreed on the bench). Restores the passed ``baseline`` model at
+        the end (also on
         failure), matching the gain-sweep restore discipline. Returns
         (rows, best_value, best_res, run_dir) where rows are
         (value, residual_mm|None, accel_mm_s2|None). Shared by
@@ -2766,6 +2768,18 @@ class DynamicsFitCommands(MeasureCommands):
             node.set_live_dynamics_profile(profile_path)
         scored = self._pin_sweep_scores(gcmd, results, values, param)
         rows = [(v, r, a) for (v, r), a in zip(scored, accels)]
+        if accel_chip is not None and all(a is None for _v, _r, a in rows):
+            # A fitted accelerometer that yielded nothing on every step is a
+            # broken measurement, not a preference: silently falling back to
+            # the drive-side residual re-picks on the metric that chose
+            # LEAD=0 over the bench-correct 600. Refuse instead.
+            raise gcmd.error(
+                "ACCEL_CHIP was given but no staircase step yielded accel "
+                "samples - refusing to score on the drive-side residual "
+                "alone. Check the accelerometer, or drop ACCEL_CHIP to "
+                "accept residual-only scoring explicitly. Run kept: %s"
+                % (run.run_dir,)
+            )
         best_value, best_score, metric = self._pick_pin_value(
             rows, param, zeta_tol
         )

@@ -689,15 +689,19 @@ each step also runs an accelerometer capture over the same scored dwell
 window and reports an extra `mm/s²` column: the single-bin accel amplitude
 at the tone frequency (a direct DFT bin over the settled tail, windowed the
 same way as the pin-residual scorer so the two columns are comparable), the
-three axes combined as vector magnitude. The pin-residual verdict is
-unchanged — it still picks the applied value — but the command additionally
-prints the accel-minimum step and, when it disagrees with the residual
-minimum, says so explicitly. The residual is what the drive *thinks* it left
-behind; the accelerometer measures the real toolhead, so this scores the
-physical spike directly. Suggested use: set `FREQ` to the old coupled peak
-(or the mode's `f_b`) and pick the `ZETA`/`LEAD` that minimizes the measured
-toolhead accel there. Steps whose capture yields no samples report `n/a`,
-never a fake zero (the same honesty rule as the residual column).
+three axes combined as vector magnitude. **The accel column picks the
+applied value whenever it exists**; the pin residual is reported alongside
+and, when the two disagree, the dissent is printed explicitly. The residual
+is what the drive *thinks* it left behind — the rotor holding its own
+commanded path, the pin's mechanism — while the accelerometer measures the
+real toolhead, the pin's purpose (on the bench the residual picked `LEAD=0`
+while the accel picked the plainly-better `600`). Suggested use: set `FREQ`
+to the old coupled peak (or the mode's `f_b`) and read the `ZETA`/`LEAD`
+that minimizes the measured toolhead accel there. Steps whose capture
+yields no samples report `n/a`, never a fake zero (the same honesty rule as
+the residual column); if **every** step comes back empty the command
+refuses to fall back to residual-only scoring — drop `ACCEL_CHIP` to accept
+that explicitly.
 
 A pin staircase is an ordinary run on the dashboard's tune tab. Each step's
 capture yields a following-error PSD, and — whenever the step recorded an
@@ -727,6 +731,20 @@ amplitude constant, so displacement shrinks as `1/f` and the commanded accel
 is exactly `ACCEL_PER_HZ · f`. Per value the command reports the step name
 and the accelerometer sample count the sweep captured — a peak or a ratio
 would need exactly the reduction the PSD replaces.
+
+The run's verdict ranks the values by the **worst in-band following-error
+tone** of the swept cartesian mode — the largest chart peak inside
+`FREQ_START..FREQ_END`. An over-driven pin (ζ too low) rings at the
+locked-rotor resonance, an under-driven one (ζ too high) leaves the old
+coupled peak standing; both fail exactly that number. The settled pin
+residual is *not* consulted: on a chirp the demodulator tail sits at the top
+of the swept band, nowhere near the mode. The toolhead accel PSD is charted
+but not scored either — the better the pin, the more of the band's energy
+piles into the one sharp locked-rotor peak, so in-band accel peak height is
+anti-correlated with quality on a chirp. For `PARAM=ZETA` the verdict takes
+the lowest value within 15 % of the best (under-driving splits the spectrum
+into two shaper spikes, worse than no pin); `LEAD` takes the outright
+minimum.
 
 Each invocation is an **ordinary run** — the same
 `<captures_root>/<NAME>_<stamp>/manifest.json` every other calibration
@@ -932,7 +950,7 @@ Schemas: [servo-cal-contracts.md](servo-cal-contracts.md).
 | `SERVO_SWEEP_INERTIA` | `servo-cal analyze` | run dir + `results.json` (no automated pick, so `APPLY=1` always errors) |
 | `SERVO_SWEEP_ACCEL` | `servo-cal analyze` | run dir + `results.json` verdict (max non-railing accel); `APPLY=1` verifies at the recommended accel (no SDO write) |
 | `SERVO_SWEEP_PIN` | `servo-cal analyze` | run dir + `results.json` (per-step settled pin-residual magnitude; prints the `value → µm` table + winning `SERVO_SET_COMPLIANCE` line; nothing applied) |
-| `SERVO_COMPARE_PIN` | `servo-cal analyze` (dashboard-side, on demand) | run dir + one ordinary step per swept value (`.scap` capture + accel CSV, named for the value); charted like a pin sweep — following-error PSD + toolhead accel PSD, one trace per value; one invocation is one run (re-using `NAME` never merges); nothing applied |
+| `SERVO_COMPARE_PIN` | `servo-cal analyze` | run dir + one ordinary step per swept value (`.scap` capture + accel CSV, named for the value); charted like a pin sweep — following-error PSD + toolhead accel PSD, one trace per value; verdict = flattest in-band ferr (lowest `ZETA` within 15 % of best / outright-min `LEAD`); one invocation is one run (re-using `NAME` never merges); nothing applied |
 | `SERVO_TUNE_PIN` | `servo-cal analyze` (per staircase) | run dir(s) + tuned `dynamics_<name>_<stamp>.toml` (per-mode coarse→fine `ZETA` + shared `LEAD` staircases; model stays live until RESTART; restores pre-tune model on failure) |
 | `SERVO_FIT_DYNAMICS`, `SERVO_CALIBRATE_INERTIA_RATIO` | `servo-cal fit` | run dir + `~/printer_data/config/servo_dynamics/dynamics_<name>_<stamp>.toml` + C00.06 |
 | `SERVO_TUNE_DYNAMICS` | `servo-cal fit --response ferr` (per capture) | run dir + tuned `dynamics_<name>_<stamp>.toml` when a pass beats the baseline (search is host-side; tuned model stays live until RESTART) |

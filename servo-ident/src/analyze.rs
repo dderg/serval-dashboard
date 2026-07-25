@@ -883,10 +883,12 @@ pub fn analyze_compliance_capture(
 }
 
 pub fn compute_verdict(
-    experiment: &str,
+    run: &Manifest,
     steps: &[StepResult],
-    manifest: &[Step],
+    plots: &[PlotStep],
 ) -> Result<Verdict, String> {
+    let experiment = run.experiment.as_str();
+    let manifest = &run.steps;
     let has_flag = |sr: &StepResult, f: &str| sr.flags.iter().any(|x| x == f);
     let clean =
         |sr: &StepResult| !has_flag(sr, "resonance_detected") && !has_flag(sr, "torque_saturated");
@@ -1058,11 +1060,10 @@ pub fn compute_verdict(
                 apply: None,
             })
         }
-        "pin_sweep" | "pin_compare" => {
-            // A staircase dwells on one tone per step, a comparison chirps the
-            // whole band per step; either way one step is one swept value, so
-            // the settled residual magnitude (max over the step's drives - the
-            // mode rides one drive block) ranks the values.
+        "pin_sweep" => {
+            // A staircase dwells one settled tone per step, so the settled
+            // residual magnitude (max over the step's drives - the mode
+            // rides one drive block) ranks the values.
             let mut best: Option<(usize, f64)> = None;
             let mut lines = Vec::new();
             for (i, sr) in steps.iter().enumerate() {
@@ -1095,6 +1096,166 @@ pub fn compute_verdict(
             };
             Ok(Verdict {
                 recommended_step: idx,
+                reason,
+                flags: Vec::new(),
+                apply: None,
+            })
+        }
+        "pin_compare" => {
+            // A comparison chirps the whole band per step, so the settled-
+            // tail residual is one demodulator sample at whatever frequency
+            // the tail happens to hold - the top of the sweep, nowhere near
+            // the mode (on the bench it ranked 8 zetas by their 148-200 Hz
+            // behavior and "picked" the largest). Score what the operator
+            // reads off the chart instead: the worst in-band following-error
+            // tone of the swept cartesian mode. An over-driven pin rings at
+            // the locked-rotor resonance, an under-driven one leaves the
+            // coupled peak standing; both are exactly a band peak.
+            // The toolhead accel PSD stays a chart, not a score: a chirp
+            // dwells everywhere, so the better the pin the more of the
+            // band's energy piles into the one sharp locked-rotor peak -
+            // in-band accel peak height is anti-correlated with quality
+            // (bench 2026-07-25: monotone decreasing over 8 zetas, best at
+            // the worst value). Accel-at-tone scoring belongs to the dwell
+            // staircase, where the tone is fixed and quiet means quiet.
+            if steps.is_empty() {
+                return Ok(Verdict {
+                    recommended_step: None,
+                    reason: "no sweeps captured".to_string(),
+                    flags: Vec::new(),
+                    apply: None,
+                });
+            }
+            // Ranking failures degrade to a no-recommendation verdict, never
+            // an Err: the comparison's product is the per-step charts, and a
+            // verdict Err here fails the whole analyze - on the bench that
+            // fails the command after the motion, and on the dashboard it
+            // takes plot_series down with it. Same shape as pin_sweep's
+            // "no step carries pin residual channels".
+            let rank = || -> Result<(String, String), String> {
+                let plan_f64 = |key: &str| {
+                    run.stroke_plan
+                        .get(key)
+                        .and_then(Value::as_f64)
+                        .ok_or_else(|| format!("manifest is missing stroke_plan.{key}"))
+                };
+                let plan_str = |key: &str| {
+                    run.stroke_plan
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| format!("manifest is missing stroke_plan.{key}"))
+                };
+                let f_lo = plan_f64("freq_start")?;
+                let f_hi = plan_f64("freq_end")?;
+                let mode = plan_str("mode")?;
+                let param = plan_str("param")?;
+                // (swept value, step index, worst in-band ferr amplitude in
+                // um, the frequency it sits at)
+                let mut scored: Vec<(f64, usize, f64, f64)> = Vec::new();
+                let mut lines = Vec::new();
+                for (i, sr) in steps.iter().enumerate() {
+                    let ps = plots
+                        .iter()
+                        .find(|p| p.name == sr.name)
+                        .ok_or_else(|| format!("step {:?} has no plot series entry", sr.name))?;
+                    let cart = ps
+                        .psd
+                        .cartesian
+                        .as_ref()
+                        .and_then(|c| c.get(mode))
+                        .ok_or_else(|| {
+                            format!(
+                                "step {:?} has no cartesian {mode:?} ferr PSD - a \
+                                 comparison must capture every motor of the \
+                                 spatial frame",
+                                sr.name
+                            )
+                        })?;
+                    let freq = &ps.psd.freq_hz;
+                    if freq.len() < 2 {
+                        return Err(format!("step {:?} psd grid too short", sr.name));
+                    }
+                    let df = freq[1] - freq[0];
+                    let mut band_peak: Option<(f64, f64)> = None;
+                    for (&f, &p) in freq.iter().zip(cart) {
+                        if f < f_lo || f > f_hi {
+                            continue;
+                        }
+                        // Welch PSD (mm^2/Hz) -> single-sided tone amplitude
+                        // in um, the dashboard chart's convention: A =
+                        // sqrt(2 * ENBW * psd) with ENBW = 1.5 * df for the
+                        // Hann window.
+                        let amp_um = (2.0 * 1.5 * df * p).sqrt() * 1e3;
+                        if band_peak.is_none_or(|(a, _)| amp_um > a) {
+                            band_peak = Some((amp_um, f));
+                        }
+                    }
+                    let (amp_um, f_at) = band_peak.ok_or_else(|| {
+                        format!(
+                            "step {:?}: swept band {f_lo}-{f_hi} Hz contains \
+                             no PSD bins",
+                            sr.name
+                        )
+                    })?;
+                    let value = find_step(&sr.name)
+                        .ok_or_else(|| format!("step {:?} missing from manifest", sr.name))?
+                        .swept_value("value")
+                        .ok_or_else(|| format!("step {:?} has no swept value", sr.name))?;
+                    scored.push((value, i, amp_um, f_at));
+                    lines.push(format!("{}: {:.2} um @ {:.0} Hz", sr.name, amp_um, f_at));
+                }
+                let &(_, best_i, best_amp, _) = scored
+                    .iter()
+                    .min_by(|a, b| a.2.total_cmp(&b.2))
+                    .expect("steps is non-empty");
+                // ZETA takes the lowest value tying the best within 15% (the
+                // staircase picker's ZETA_TOL default): zeta is the
+                // predictor's inverse gain, and under-driving the pin leaves
+                // the coupled resonance standing next to the locked-rotor
+                // one - two shaper spikes where an unpinned machine had one.
+                // LEAD is not a gain, so it takes the outright minimum.
+                let (win_i, win_amp, win_f) = if param == "ZETA" {
+                    let ceiling = best_amp * 1.15;
+                    let mut by_value = scored.clone();
+                    by_value.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    let &(_, i, a, f) = by_value
+                        .iter()
+                        .find(|&&(_, _, a, _)| a <= ceiling)
+                        .expect("the best step is always under its own ceiling");
+                    (i, a, f)
+                } else {
+                    let &(_, i, a, f) = scored
+                        .iter()
+                        .min_by(|a, b| a.2.total_cmp(&b.2))
+                        .expect("steps is non-empty");
+                    (i, a, f)
+                };
+                let tie_note = if win_i != best_i {
+                    format!(
+                        " (lowest {param} within 15% of {}'s {:.2} um)",
+                        steps[best_i].name, best_amp
+                    )
+                } else {
+                    String::new()
+                };
+                Ok((
+                    steps[win_i].name.clone(),
+                    format!(
+                        "flattest in-band ferr {:.2} um @ {:.0} Hz at {}{}; {}",
+                        win_amp,
+                        win_f,
+                        steps[win_i].name,
+                        tie_note,
+                        lines.join(", ")
+                    ),
+                ))
+            };
+            let (recommended_step, reason) = match rank() {
+                Ok((name, reason)) => (Some(name), reason),
+                Err(e) => (None, format!("cannot rank the sweep: {e}")),
+            };
+            Ok(Verdict {
+                recommended_step,
                 reason,
                 flags: Vec::new(),
                 apply: None,
@@ -1314,7 +1475,7 @@ fn build_run_reusing(
         step_results.push(sr);
         plot_steps.push(ps);
     }
-    let verdict = compute_verdict(&manifest.experiment, &step_results, &manifest.steps)?;
+    let verdict = compute_verdict(&manifest, &step_results, &plot_steps)?;
     let results = Results {
         version: 1,
         fs_hz,
