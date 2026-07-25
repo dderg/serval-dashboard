@@ -1355,3 +1355,34 @@ def test_measure_compliance_clears_pin_for_the_sweep_and_restores():
     assert cleared[7] == [0.0, 0.0]
     assert restored[6] == [0.010, 0.012], "pinned model must be restored"
     assert restored[7] == [0.05, 0.06]
+
+
+@requires_tomllib
+def test_measure_compliance_without_a_profile_sweeps_with_nothing_to_clear():
+    # No dynamics_profile configured means nothing is pinned, so there is
+    # no baseline to clear and no model to restore - the sweep still runs.
+    sc, _gcode, _path = make_calibration(configure_profile=False)
+    sc.fake_compliance_by_step = {"y": _fake_notch("y", 141.0, 175.0)}
+    sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({"MODE": "Y"}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == []
+
+
+@requires_tomllib
+def test_measure_compliance_refuses_to_sweep_behind_an_unreadable_profile():
+    # A configured-but-broken profile is NOT "nothing is pinned": sweeping
+    # anyway would run against whatever model is still live - a stale pin
+    # included - and hand back a contaminated f_b. Today the guarantee is
+    # direct (the pin-clear load refuses to treat a broken file as absent);
+    # before that it was incidental, resting on _begin_run happening to
+    # re-load the same profile two frames later. Pin the contract, not the
+    # accident: a bad baseline stops the command before it excites anything.
+    sc, gcode, path = make_calibration()
+    with open(path, "w") as f:
+        f.write("version = 8\nmass = [\n")
+    sc.fake_compliance_by_step = {"y": _fake_notch("y", 141.0, 175.0)}
+    with pytest.raises(RuntimeError, match="failed to load dynamics profile"):
+        sc.cmd_SERVO_MEASURE_COMPLIANCE(FakeGcmd({"MODE": "Y"}))
+    engine = sc.printer.lookup_object("motion_engine")
+    assert engine.dynamics_calls == [], "must not stream behind a bad profile"
+    assert gcode.scripts == [], "must not buzz before validating the baseline"

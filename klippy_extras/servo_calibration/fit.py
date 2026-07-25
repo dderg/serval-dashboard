@@ -100,11 +100,21 @@ class DynamicsFitCommands(MeasureCommands):
         return nodes.popitem()[1]
 
     def _load_baseline_dynamics(
-        self, gcmd: Any, node: Any
-    ) -> tuple[str, dict[str, Any]]:
+        self, gcmd: Any, node: Any, optional: bool = False
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Resolve and parse the node's baseline dynamics profile.
+
+        ``optional`` only tolerates there being no profile configured at
+        all - it returns None for that. A profile that is configured but
+        unreadable, unparseable, or mismatched against the node still
+        raises: a caller that clears the pin off the baseline before an
+        identification sweep must not silently sweep with a stale pinned
+        model still live because the file had a typo."""
         explicit = gcmd.get("PROFILE", None)
         profile_path = explicit or node.get_live_dynamics_profile()
         if profile_path is None:
+            if optional:
+                return None
             raise gcmd.error(
                 "no baseline dynamics profile - set dynamics_profile on "
                 "[ethercat_node %s] or pass PROFILE= (per-motor profiles "
@@ -2013,10 +2023,8 @@ class DynamicsFitCommands(MeasureCommands):
         # pin live). Stream a pin-cleared copy for the sweep and restore the
         # live model afterwards (also on failure). No profile is written.
         pin_restore: dict[str, Any] | None = None
-        try:
-            _bp, live = self._load_baseline_dynamics(gcmd, node)
-        except Exception:
-            live = None  # no baseline profile: nothing pinned, nothing to do
+        loaded = self._load_baseline_dynamics(gcmd, node, optional=True)
+        live = loaded[1] if loaded is not None else None
         if live is not None and any(
             m > 0.0 for m in live.get("pin_mass") or []
         ):
@@ -2162,7 +2170,13 @@ class DynamicsFitCommands(MeasureCommands):
         "compliance_notch_shallow (< 6 dB - raise AMPLITUDE or narrow "
         "the band), compliance_flanks_incoherent, "
         "compliance_peak_below_notch (model violation - do not apply). "
-        "Measurement only: it changes nothing on the drives. It prints "
+        "Writes no profile, and leaves the drives as it found them - but "
+        "it is NOT passive: an active pin cancels torque exactly in the "
+        "band around f_b, so it streams a pin-cleared copy of the baseline "
+        "for the sweep and restores the live model afterwards (also on "
+        "failure). Leave dynamics_profile configured - clearing it by hand "
+        "to get a clean measurement is unnecessary, and leaves "
+        "SERVO_SET_COMPLIANCE with no baseline to write into. It prints "
         "the ready-to-run SERVO_SET_COMPLIANCE line (with X_PEAK/Y_PEAK "
         "so it is pin-complete), which writes/streams the compliance "
         "identification data + pin omega_b source; then point "
