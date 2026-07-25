@@ -488,47 +488,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/runs/{name}/pin_compare": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Pin-parameter comparison curves of a pin_compare run. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Run name. */
-                    name: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description The run's pin_compare manifest block. */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["PinCompare"];
-                    };
-                };
-                404: components["responses"]["NotFound"];
-                500: components["responses"]["ServerError"];
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/runs/{name}/plot_series": {
         parameters: {
             query?: never;
@@ -852,47 +811,6 @@ export interface components {
         };
         NoteResponse: {
             note: string;
-        };
-        /**
-         * @description The `pin_compare` block a comparison run's `manifest.json` carries: the
-         *     swept parameter's identity and one curve per swept value. Runs of every
-         *     other experiment have no such block.
-         */
-        PinCompare: {
-            baseline_profile?: string | null;
-            /** Format: double */
-            freq_end: number;
-            /** Format: double */
-            freq_start: number;
-            mode: string;
-            param: string;
-            sweeps: components["schemas"]["PinCompareSweep"][];
-        };
-        /**
-         * @description One swept-sine buzz reduced to an accel-vs-frequency curve, plus the
-         *     normalized `response_ratio` (accel relative to commanded accel). Schema
-         *     mirrors the sweep entries `SERVO_COMPARE_PIN` writes into its run
-         *     manifest.
-         */
-        PinCompareSweep: {
-            accel_mm_s2: number[];
-            /**
-             * Format: double
-             * @description Excitation strength in mm/s^2 per Hz (commanded accel = ApH * f).
-             */
-            accel_per_hz: number;
-            /**
-             * Format: double
-             * @description Displacement at freq_start (the chirp holds velocity amplitude
-             *     constant, so displacement shrinks as 1/f above it).
-             */
-            amplitude_mm: number;
-            curve_hz: number[];
-            /** Format: double */
-            hz_per_sec: number;
-            response_ratio: number[];
-            /** Format: double */
-            value: number;
         };
         PlotAccel: {
             magnitude: number[];

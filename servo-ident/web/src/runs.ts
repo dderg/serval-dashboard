@@ -24,21 +24,14 @@ import {
 } from "./metrics";
 import { FrfSection, RingdownSection } from "./dynamics";
 import { SectionHead, TimeDomainSection, PathSection } from "./charts-core";
-import { PinCompareSection, PIN_COMPARE_EXPERIMENT } from "./pin-compare";
 import { applyAccordionState, bindAnalysisControls, currentPageDef } from "./shell";
 import { PALETTE, INITIAL_SELECTED_RUNS, state } from "./state";
 import { notify, useStore } from "./store";
 import type { PageDef } from "./state";
 import type { RunSummary } from "./api/runs";
 
-/// A run is worth selecting when it has something to chart: analyzer
-/// results, or — for a comparison — the curves its own manifest carries.
-function chartable(run: RunSummary): boolean {
-  return run.has_results || run.experiment === PIN_COMPARE_EXPERIMENT;
-}
-
 function toggleRunSelection(run: RunSummary, ev: MouseEvent) {
-  if (!chartable(run)) return;
+  if (!run.has_results) return;
   if (ev.shiftKey) {
     if (state.selected.has(run.name)) {
       state.selected.delete(run.name);
@@ -82,7 +75,7 @@ function DotCell({ run }: { run: RunSummary }) {
     ? html`<span class="swatch" style=${{ background: runColor(run.name) }}></span>`
     : null;
   const pinned = state.pinned.has(run.name);
-  const pin = chartable(run)
+  const pin = run.has_results
     ? html`<button
         class=${pinned ? "pin-toggle pinned" : "pin-toggle"}
         title=${pinned
@@ -218,13 +211,12 @@ function ContextMenu() {
       ${label}
     </button>`;
   return html`<div class="context-menu" style=${style} ref=${ref}>
-    ${chartable(run) ? item(pinned ? "unpin" : "pin", () => togglePin(run)) : null}
+    ${run.has_results ? item(pinned ? "unpin" : "pin", () => togglePin(run)) : null}
     ${item("→ console", () => loadRerunForm(run.name), { disabled: !detail?.manifest })}
-    ${chartable(run) ? null : item("analyze", () => analyze.mutate(run.name))}
+    ${run.has_results ? null : item("analyze", () => analyze.mutate(run.name))}
     ${item("delete", () => del.mutate(run.name), { danger: true })}
   </div>`;
 }
-
 
 function RunRow({ run, def }: { run: RunSummary; def: PageDef }) {
   const analyze = useAnalyzeRun();
@@ -239,7 +231,7 @@ function RunRow({ run, def }: { run: RunSummary; def: PageDef }) {
   const diff = manifest ? ambientDiff(prevManifest, manifest) : "";
   const cls = [
     state.selected.has(run.name) ? "selected" : "",
-    chartable(run) ? "selectable" : "",
+    run.has_results ? "selectable" : "",
   ]
     .filter(Boolean)
     .join("");
@@ -271,7 +263,7 @@ function RunRow({ run, def }: { run: RunSummary; def: PageDef }) {
       >
         → console
       </button>
-      ${chartable(run)
+      ${run.has_results
         ? null
         : html`<button
             onClick=${(e: MouseEvent) => {
@@ -333,7 +325,6 @@ function TunePage() {
         <${SweepMetricsSection} />
         <${PathSection} />
         <${FrfSection} />
-        <${PinCompareSection} />
         <${RingdownSection} />
         <${PsdSection} />
         <${AccelPsdSection} />

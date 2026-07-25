@@ -5,13 +5,15 @@
 //! false`), while genuinely move-based experiments (`require_moving = true`)
 //! keep erroring when no moves are present.
 
-use servo_ident::analyze::analyze_capture;
+use serde_json::json;
+
+use servo_ident::analyze::{analyze_capture, build_run};
 use servo_ident::metrics::{DEFAULT_SETTLE_BAND_COUNTS, DEFAULT_TORQUE_LIMIT_PER_MILLE};
 use servo_ident::scap::Scap;
 
 /// One-drive capture whose target never moves and whose motion-active flag is
 /// never set — the following error is a pure position wiggle (a buzz tone).
-fn buzz_capture(n: usize) -> Scap {
+fn buzz_bytes(n: usize) -> Vec<u8> {
     // Global: cycle_index(u64)@0, flags(u8)@8 -> prefix 9.
     // Per-drive block (16 bytes): target_counts@9, position_actual@13,
     // following_error@17, torque_actual@21. record_size 25.
@@ -37,7 +39,11 @@ fn buzz_capture(n: usize) -> Scap {
         b.extend_from_slice(&ferr.to_le_bytes()); // following_error
         b.extend_from_slice(&5i32.to_le_bytes()); // torque_actual
     }
-    Scap::from_bytes(&b).unwrap()
+    b
+}
+
+fn buzz_capture(n: usize) -> Scap {
+    Scap::from_bytes(&buzz_bytes(n)).unwrap()
 }
 
 #[test]
@@ -86,4 +92,65 @@ fn move_based_still_errors_without_moving_segments() {
         err.contains("no moving segments"),
         "unexpected error: {err}"
     );
+}
+
+/// `SERVO_COMPARE_PIN` chirps at standstill, so its captures carry no moving
+/// segments either — and it reaches the generic analyzer only through
+/// `build_run`'s experiment classification, which no public entry point
+/// exposes. Drop `pin_compare` from that classification and this dies at "no
+/// moving segments"; drop it from the verdict match and it dies at "unknown
+/// experiment". Both kill the whole run, taking the PSDs the dashboard charts
+/// with them, which is why the comparison is analyzed here end to end.
+#[test]
+fn a_comparison_analyzes_end_to_end_from_standstill_captures() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("servo_cal_cmp_{}_{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let steps = ["v0_zeta0p005", "v1_zeta0p02"];
+    for name in steps {
+        std::fs::write(dir.join(format!("step_{name}.scap")), buzz_bytes(4096)).unwrap();
+    }
+    let manifest = json!({
+        "version": 1,
+        "experiment": "pin_compare",
+        "tag": "cmp",
+        "axis": "X",
+        "steps": steps.iter().map(|name| json!({
+            "name": name,
+            "capture": format!("step_{name}.scap"),
+            "swept": {"value": 0.02},
+        })).collect::<Vec<_>>(),
+    });
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let (results, plot) = build_run(&dir).expect("comparison analyzes like any other stepped run");
+
+    assert_eq!(results.steps.len(), steps.len());
+    for (step, name) in plot.steps.iter().zip(steps) {
+        assert_eq!(step.name, name);
+        assert!(
+            !step.psd.freq_hz.is_empty(),
+            "{name}: PSD taken over the whole capture"
+        );
+    }
+    // No pin demodulator channels in a synthetic buzz, so the ranking has
+    // nothing to rank — it must say so rather than fail the run.
+    assert!(
+        results
+            .verdict
+            .reason
+            .contains("no step carries pin residual"),
+        "{}",
+        results.verdict.reason
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }

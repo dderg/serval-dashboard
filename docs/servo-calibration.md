@@ -715,41 +715,37 @@ dwells a single constant tone and scores one settled residual per value —
 this runs a full **swept-sine buzz (chirp)** `FREQ_START → FREQ_END` in the
 selected mode's frame pattern once per value, re-streaming the dynamics
 model live before each sweep (only the swept `PARAM` changes; the other pin
-parameter keeps its baseline value) and capturing the accelerometer over the
-whole sweep window.
+parameter keeps its baseline value) and capturing both the drives and the
+accelerometer across the whole sweep window.
 
-Each capture is reduced to an accel-vs-frequency curve. The chirp is linear,
-so sample time maps to instantaneous frequency
-(`f = FREQ_START + HZ_PER_SEC·t`); samples fall into ~1 Hz bins and each
-bin's mean 3-axis vector magnitude is the raw accel (`accel_mm_s2`). The
-excitation is **constant accel-per-Hz** (klipper's `accel_per_hz`
-convention): the endpoint chirp holds the velocity amplitude constant, so
-displacement shrinks as `1/f` and the commanded accel is exactly
-`ACCEL_PER_HZ · f`. The normalized
-`response_ratio = accel / (ACCEL_PER_HZ · f)` divides each bin by that
-commanded accel — 1.0 means perfect command tracking, and peaks mark the
-resonances. Per value the command reports the peak-response frequency and
-its ratio.
+Nothing is reduced host-side. A linear chirp dwells equally at every
+frequency, so the accelerometer PSD of the capture *is* that value's
+frequency-response curve — the same per-step PSD the dashboard already
+draws for a pin staircase. The excitation is **constant accel-per-Hz**
+(klipper's `accel_per_hz` convention): the endpoint chirp holds the velocity
+amplitude constant, so displacement shrinks as `1/f` and the commanded accel
+is exactly `ACCEL_PER_HZ · f`. Per value the command reports the step name
+and the accelerometer sample count the sweep captured — a peak or a ratio
+would need exactly the reduction the PSD replaces.
 
 Each invocation is an **ordinary run** — the same
 `<captures_root>/<NAME>_<stamp>/manifest.json` every other calibration
 command writes, with `experiment: "pin_compare"`, the originating command
 line, and the usual ambient/motor/`git_rev` block, so a comparison is one
 more row in the dashboard's runs table and takes a note like any other run.
-The curves live in that manifest's `pin_compare` block
-(`{mode, param, freq_start, freq_end, baseline_profile,
-sweeps:[{value, hz_per_sec, accel_per_hz, amplitude_mm, curve_hz,
-accel_mm_s2, response_ratio}]}` — `amplitude_mm` is the derived displacement
-at `FREQ_START`), appended and rewritten after each value so a crash keeps
-whatever was measured. Re-using a `NAME` produces a **second, separate
-run**; sweeps are never merged across invocations. The dashboard overlays
-them from `GET /api/runs/<name>/pin_compare`, and plots raw `accel_mm_s2` on
-a zero-based linear axis — spike height is the comparison.
+Every swept value is an **ordinary step** inside it, named for the value
+(`v0_zeta0p02`): a `.scap` drive capture plus an accelerometer CSV, the
+manifest rewritten as each sweep completes so a crash keeps whatever was
+measured. That layout is the whole feature — the tune tab charts a
+comparison with the sections it draws for any stepped run: a following-error
+PSD and a toolhead accel PSD, one trace per swept value, legends reading the
+values off the step names. Re-using a `NAME` produces a **second, separate
+run**; sweeps are never merged across invocations.
 
 Measurement only — the pre-sweep model is restored at the end (also on any
 failure mid-sweep). Every check that can reject the command (mode, param,
 frequency bounds, amplitude representability, accelerometer, baseline
-profile) runs **before** the first excitation, so measured curves are never
+profile) runs **before** the first excitation, so measured sweeps are never
 discarded at write time. Params: `MODE=X|Y`
 (required, exactly one mode) `PARAM=ZETA|LEAD` (required) `VALUES` (comma
 list, nonempty, each validated by the `SERVO_SET_COMPLIANCE`
@@ -936,7 +932,7 @@ Schemas: [servo-cal-contracts.md](servo-cal-contracts.md).
 | `SERVO_SWEEP_INERTIA` | `servo-cal analyze` | run dir + `results.json` (no automated pick, so `APPLY=1` always errors) |
 | `SERVO_SWEEP_ACCEL` | `servo-cal analyze` | run dir + `results.json` verdict (max non-railing accel); `APPLY=1` verifies at the recommended accel (no SDO write) |
 | `SERVO_SWEEP_PIN` | `servo-cal analyze` | run dir + `results.json` (per-step settled pin-residual magnitude; prints the `value → µm` table + winning `SERVO_SET_COMPLIANCE` line; nothing applied) |
-| `SERVO_COMPARE_PIN` | host-side chirp reduction (no `servo-cal`) | run dir + a `pin_compare` manifest block — one accel-vs-frequency curve (raw `accel_mm_s2` + normalized `response_ratio`) per swept value; one invocation is one run (re-using `NAME` never merges); dashboard overlays via `/api/runs/<name>/pin_compare`; nothing applied |
+| `SERVO_COMPARE_PIN` | `servo-cal analyze` (dashboard-side, on demand) | run dir + one ordinary step per swept value (`.scap` capture + accel CSV, named for the value); charted like a pin sweep — following-error PSD + toolhead accel PSD, one trace per value; one invocation is one run (re-using `NAME` never merges); nothing applied |
 | `SERVO_TUNE_PIN` | `servo-cal analyze` (per staircase) | run dir(s) + tuned `dynamics_<name>_<stamp>.toml` (per-mode coarse→fine `ZETA` + shared `LEAD` staircases; model stays live until RESTART; restores pre-tune model on failure) |
 | `SERVO_FIT_DYNAMICS`, `SERVO_CALIBRATE_INERTIA_RATIO` | `servo-cal fit` | run dir + `~/printer_data/config/servo_dynamics/dynamics_<name>_<stamp>.toml` + C00.06 |
 | `SERVO_TUNE_DYNAMICS` | `servo-cal fit --response ferr` (per capture) | run dir + tuned `dynamics_<name>_<stamp>.toml` when a pass beats the baseline (search is host-side; tuned model stays live until RESTART) |

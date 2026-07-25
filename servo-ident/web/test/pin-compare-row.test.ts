@@ -14,6 +14,7 @@ import {
 import type * as ClientMod from "../src/queries/client";
 import type * as RunsQueryMod from "../src/queries/runs";
 import type * as RunsMod from "../src/runs";
+import type * as StateMod from "../src/state";
 import type { RunSummary } from "../src/api/runs";
 import type { html as htmlTag, render as renderFn } from "htm/preact";
 import type { VNode } from "preact";
@@ -30,7 +31,12 @@ const defaultScheduler = (cb: () => void) => setTimeout(cb, 0);
 notifyManager.setScheduler((cb: () => void) => cb());
 
 const COMPARE_RUN = "cmp_20260725_101500";
-const COMPARE_COMMAND = "SERVO_COMPARE_PIN MODE=Y PARAM=LEAD VALUES=0,300,600 NAME=cmp";
+const COMPARE_COMMAND = "SERVO_COMPARE_PIN MODE=Y PARAM=LEAD VALUES=0,600 NAME=cmp";
+// A comparison names each step after the value it swept, exactly as the pin
+// staircase does — those names are what the chart legends print, so they are
+// the thing under test.
+const STEP_NAMES = ["v0_lead0", "v1_lead600"];
+const STEP_LEAD = [0, 600];
 
 const compareSummary: RunSummary = {
   name: COMPARE_RUN,
@@ -39,31 +45,74 @@ const compareSummary: RunSummary = {
   tag: "cmp",
   axis: "Y",
   command: COMPARE_COMMAND,
-  has_results: false,
+  has_results: true,
   verdict: null,
   note: null,
 };
 
-const compareBlock = {
-  mode: "y",
-  param: "LEAD",
-  freq_start: 100,
-  freq_end: 150,
-  baseline_profile: "/cfg/baseline.toml",
-  sweeps: [0, 300, 600].map((value, i) => ({
-    value,
-    hz_per_sec: 3,
-    accel_per_hz: 75,
-    amplitude_mm: 0.019,
-    curve_hz: [117.5, 122.5],
-    accel_mm_s2: [9000 - i * 500, 7000 - i * 500],
-    response_ratio: [1.02, 0.79],
-  })),
+/// A comparison carries the same per-step payload as any other captured
+/// sweep — following-error PSD plus the toolhead accel PSD — so the gain
+/// sweep fixtures are reused under the comparison's experiment and step names.
+function stepDoc<T extends { steps: { name: string }[] }>(name: string): T {
+  const doc = fixtureJson<T>(name);
+  if (doc.steps.length !== STEP_NAMES.length) {
+    throw new Error(
+      `${name} fixture has ${doc.steps.length} steps, this test needs ${STEP_NAMES.length}`
+    );
+  }
+  doc.steps.forEach((s, i) => {
+    s.name = STEP_NAMES[i];
+  });
+  return doc;
+}
+
+interface PlotFixtureStep {
+  name: string;
+  psd: { accel: unknown } | null;
+  path: { cmd_x_mm: number[]; cmd_y_mm: number[]; act_x_mm: number[]; act_y_mm: number[] } | null;
+}
+
+const comparePlot = stepDoc<{ version: number; steps: PlotFixtureStep[] }>("plot_series");
+if (!comparePlot.steps.every((s) => s.psd && s.psd.accel)) {
+  throw new Error("plot_series fixture lost its per-step accel PSD — nothing left to assert");
+}
+
+// The ambient block stays as the fixture wrote it, so the diff against the
+// neighbouring gain sweep is empty and the row's diff column reads like any
+// other run's.
+const compareManifest = stepDoc<{
+  experiment: string;
+  command: string;
+  tag: string;
+  axis: string;
+  steps: { name: string; swept: Record<string, number> }[];
+}>("manifest");
+compareManifest.experiment = "pin_compare";
+compareManifest.command = COMPARE_COMMAND;
+compareManifest.tag = "cmp";
+compareManifest.axis = "Y";
+compareManifest.steps.forEach((s, i) => {
+  s.swept = { value: STEP_LEAD[i] };
+});
+
+const compareResults = stepDoc<{ version: number; steps: { name: string }[] }>("results");
+
+const comparePath = {
+  version: 1,
+  steps: comparePlot.steps
+    .filter((s) => s.path)
+    .map((s) => ({
+      name: s.name,
+      n_records: s.path!.cmd_x_mm.length,
+      truncated: false,
+      path: s.path,
+    })),
 };
 
 // The shared stub serves one gain_sweep run; this layer prepends a
-// pin comparison so both row kinds render side by side, and answers the
-// endpoints only that run has.
+// pin comparison so both row kinds render side by side. Every endpoint it
+// answers is one the gain sweep answers too — a comparison has no route of
+// its own any more.
 const posted: string[] = [];
 const baseFetch = globalThis.fetch;
 const json = (body: unknown) =>
@@ -82,21 +131,10 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (path === "/api/runs") {
     return json([compareSummary, ...fixtureJson<RunSummary[]>("runs")]);
   }
-  if (path === `/api/runs/${COMPARE_RUN}/pin_compare`) return json(compareBlock);
-  if (path === `/api/runs/${COMPARE_RUN}/manifest`) {
-    return json({
-      version: 1,
-      experiment: "pin_compare",
-      command: COMPARE_COMMAND,
-      tag: "cmp",
-      axis: "Y",
-      steps: [],
-      // same ambient as the neighbouring run so the diff column stays empty
-      // — a real comparison manifest carries one, `_begin_run` writes it
-      ambient: fixtureJson<{ ambient: unknown }>("manifest").ambient,
-      pin_compare: compareBlock,
-    });
-  }
+  if (path === `/api/runs/${COMPARE_RUN}/manifest`) return json(compareManifest);
+  if (path === `/api/runs/${COMPARE_RUN}/results`) return json(compareResults);
+  if (path === `/api/runs/${COMPARE_RUN}/plot_series`) return json(comparePlot);
+  if (path === `/api/runs/${COMPARE_RUN}/path`) return json(comparePath);
   return baseFetch(req);
 }) as typeof fetch;
 
@@ -112,6 +150,7 @@ let render: typeof renderFn;
 let client: typeof ClientMod;
 let runsQ: typeof RunsQueryMod;
 let runs: typeof RunsMod;
+let state: typeof StateMod.state;
 
 function pageRoot(): HTMLElement {
   const el = document.getElementById("page-root");
@@ -127,6 +166,12 @@ function rowFor(name: string): HTMLTableRowElement {
   return row;
 }
 
+function chartBox(containerId: string): HTMLElement {
+  const boxes = document.querySelectorAll<HTMLElement>(`#${containerId} .chart-box`);
+  if (boxes.length !== 1) throw new Error(`#${containerId} holds ${boxes.length} chart boxes`);
+  return boxes[0];
+}
+
 beforeAll(async () => {
   document.body.innerHTML = indexHtmlBody();
   document.body.insertAdjacentHTML("afterbegin", `<input type="text" id="moonraker-url">`);
@@ -139,6 +184,20 @@ beforeAll(async () => {
   client = await import("../src/queries/client");
   runsQ = await import("../src/queries/runs");
   runs = await import("../src/runs");
+  ({ state } = await import("../src/state"));
+
+  state.selected.clear();
+  state.pinned.clear();
+  state.runColors.clear();
+  // The comparison heads the list and carries results, so the initial
+  // auto-select would chart it before the selection test ever clicks. Latching
+  // the flag makes the click the only thing that selects; afterAll's
+  // resetRunState unlatches it again.
+  state.autoSelected = true;
+  // Chart filters are module singletons too; a stale one from another file
+  // would silently thin these traces.
+  state.stepFilter = null;
+  state.accelAxisFilter = null;
 
   // Deliberately not `startRunsPolling`: that installs a module-level observer
   // singleton with no teardown, and a later file's own startRunsPolling would
@@ -157,6 +216,8 @@ afterAll(async () => {
   cleanup();
   globalThis.fetch = baseFetch;
   notifyManager.setScheduler(defaultScheduler);
+  state.stepFilter = null;
+  state.accelAxisFilter = null;
   await resetRunState([COMPARE_RUN]);
 });
 
@@ -200,25 +261,35 @@ test("a comparison takes a note like any other run", async () => {
   );
 });
 
-test("selecting the comparison row charts it, and deselecting hides the section", async () => {
-  expect(document.querySelector(".pin-compare-section")).toBeNull();
+test("selecting a comparison mounts the standard PSD sections, deselecting drops them", async () => {
+  expect(document.querySelector("#psd-charts .chart-box")).toBeNull();
 
-  // act() flushes the effects that subscribe the section's query observer;
+  // act() flushes the effects that subscribe the chart query observers;
   // outside a browser paint they would otherwise stay pending
   await act(async () => {
     rowFor(COMPARE_RUN).click();
     await settle();
   });
   for (let i = 0; i < 3; i++) await settle();
-  const section = document.querySelector(".pin-compare-section");
-  expect(section).not.toBeNull();
-  expect(section!.querySelector("h2")?.textContent).toContain(COMPARE_RUN);
-  // raw accel on a linear axis only — no y-mode or scale selectors
-  expect(section!.querySelectorAll("select").length).toBe(0);
-  expect(section!.querySelectorAll('.legend span[role="button"]').length).toBe(3);
-  expect(section!.querySelector(".legend")?.textContent).toContain("LEAD=0 @3 Hz/s 75 ApH");
+
+  const ferr = chartBox("psd-charts");
+  expect(ferr.querySelector("h3")?.textContent).toBe("following error");
+  expect(ferr.querySelector(".uplot")).not.toBeNull();
+
+  const accelSection = document.getElementById("accel-psd-section") as HTMLElement;
+  expect(accelSection.hidden).toBe(false);
+  const accel = chartBox("accel-psd-charts");
+  expect(accel.querySelector("h3")?.textContent).toBe("accelerometer");
+  expect(accel.querySelector(".uplot")).not.toBeNull();
+
+  // one trace per swept value, named by the step the comparison recorded
+  for (const id of ["psd-charts", "accel-psd-charts"]) {
+    const legend = chartBox(id).querySelector(".legend")?.textContent ?? "";
+    for (const step of STEP_NAMES) expect(legend).toContain(step);
+  }
 
   rowFor(COMPARE_RUN).click();
-  await settle();
-  expect(document.querySelector(".pin-compare-section")).toBeNull();
+  for (let i = 0; i < 3; i++) await settle();
+  expect(document.querySelector("#psd-charts .chart-box")).toBeNull();
+  expect(accelSection.hidden).toBe(true);
 });

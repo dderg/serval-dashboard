@@ -7,7 +7,6 @@ import {
   getRunManifest,
   getRunResults,
   getRunPlotSeries,
-  getRunPinCompare,
   postRunNote,
   postRunAnalyze,
   deleteRun as apiDeleteRun,
@@ -21,7 +20,6 @@ export const runKeys = {
   run: (name: string) => ["runs", name] as const,
   detail: (name: string) => ["runs", name, "detail"] as const,
   plot: (name: string) => ["runs", name, "plot"] as const,
-  pinCompare: (name: string) => ["runs", name, "pin_compare"] as const,
 };
 
 export interface RunDetail {
@@ -129,10 +127,6 @@ async function fetchRuns(): Promise<RunSummary[]> {
 
 export function runsQuery() {
   return { queryKey: runKeys.all, queryFn: fetchRuns };
-}
-
-export function runPinCompareQuery(name: string) {
-  return { queryKey: runKeys.pinCompare(name), queryFn: () => getRunPinCompare(name) };
 }
 
 let runsObserver: QueryObserver<RunSummary[]> | null = null;

@@ -60,70 +60,6 @@ pub struct RunPath {
     pub steps: Vec<RunPathStep>,
 }
 
-/// One swept-sine buzz reduced to an accel-vs-frequency curve, plus the
-/// normalized `response_ratio` (accel relative to commanded accel). Schema
-/// mirrors the sweep entries `SERVO_COMPARE_PIN` writes into its run
-/// manifest.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct PinCompareSweep {
-    pub value: f64,
-    pub hz_per_sec: f64,
-    /// Excitation strength in mm/s^2 per Hz (commanded accel = ApH * f).
-    pub accel_per_hz: f64,
-    /// Displacement at freq_start (the chirp holds velocity amplitude
-    /// constant, so displacement shrinks as 1/f above it).
-    pub amplitude_mm: f64,
-    pub curve_hz: Vec<f64>,
-    pub accel_mm_s2: Vec<f64>,
-    pub response_ratio: Vec<f64>,
-}
-
-/// The `pin_compare` block a comparison run's `manifest.json` carries: the
-/// swept parameter's identity and one curve per swept value. Runs of every
-/// other experiment have no such block.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct PinCompare {
-    pub mode: String,
-    pub param: String,
-    pub freq_start: f64,
-    pub freq_end: f64,
-    pub baseline_profile: Option<String>,
-    pub sweeps: Vec<PinCompareSweep>,
-}
-
-#[derive(Deserialize)]
-struct ManifestPinCompareOnly {
-    pin_compare: Option<PinCompare>,
-}
-
-/// `GET /api/runs/<name>/pin_compare`: the comparison curves of a
-/// `pin_compare` run, lifted out of its manifest so the overlay does not
-/// have to carry the ambient/motor bulk around. 404 on any run that is not
-/// a comparison.
-fn handle_pin_compare(captures_root: &Path, name: &str) -> Response {
-    if !valid_run_name(name) {
-        return Response::not_found(&format!("invalid run name {name:?}"));
-    }
-    let path = captures_root.join(name).join("manifest.json");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) => return Response::not_found(&format!("{}: {e}", path.display())),
-    };
-    let parsed: ManifestPinCompareOnly = match serde_json::from_str(&text) {
-        Ok(p) => p,
-        Err(e) => {
-            return Response::text(500, "text/plain", format!("{}: parse: {e}", path.display()))
-        }
-    };
-    match parsed.pin_compare {
-        Some(block) => Response::json(
-            200,
-            serde_json::to_string(&block).expect("PinCompare always serializes"),
-        ),
-        None => Response::not_found(&format!("run {name:?} is not a pin comparison")),
-    }
-}
-
 const NOTE_FILE: &str = "note.txt";
 
 fn read_note(run_dir: &Path) -> Result<Option<String>, String> {
@@ -651,7 +587,6 @@ pub fn handle(captures_root: &Path, req: &Request) -> Response {
         }
         ("GET", ["api", "runs", name, "path"]) => handle_path(captures_root, name),
         ("GET", ["api", "runs", name, "strain"]) => handle_strain(captures_root, name),
-        ("GET", ["api", "runs", name, "pin_compare"]) => handle_pin_compare(captures_root, name),
         ("POST", ["api", "runs", name, "analyze"]) => handle_analyze(captures_root, name),
         ("POST", ["api", "runs", name, "note"]) => handle_note(captures_root, name, &req.body),
         ("DELETE", ["api", "runs", name]) => handle_delete_run(captures_root, name),

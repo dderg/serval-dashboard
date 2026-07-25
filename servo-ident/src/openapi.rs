@@ -14,9 +14,7 @@ use serde_json::{json, Map, Value};
 
 use crate::demo::DriveStatePayload;
 use crate::results::{PlotSeries, Results};
-use crate::serve::{
-    DeleteResponse, LiveStatus, NoteBody, NoteResponse, PinCompare, RunPath, RunSummary,
-};
+use crate::serve::{DeleteResponse, LiveStatus, NoteBody, NoteResponse, RunPath, RunSummary};
 use crate::strain::StrainMap;
 
 fn generator() -> SchemaGenerator {
@@ -297,7 +295,6 @@ pub fn document() -> Value {
     let note_request = schema_ref::<NoteBody>(&mut generator);
     let note_response = schema_ref::<NoteResponse<'static>>(&mut generator);
     let delete_response = schema_ref::<DeleteResponse<'static>>(&mut generator);
-    let pin_compare = schema_ref::<PinCompare>(&mut generator);
 
     let openapi_doc = free_form("This OpenAPI 3.1 document.");
     let manifest = json!({ "$ref": "#/components/schemas/Manifest" });
@@ -326,21 +323,6 @@ pub fn document() -> Value {
                 "summary": "List runs, newest first.",
                 "responses": {
                     "200": ok("Run summaries, newest first.", runs_list),
-                    "500": error_ref("ServerError"),
-                },
-            }
-        }),
-    );
-
-    paths.insert(
-        "/api/runs/{name}/pin_compare".into(),
-        json!({
-            "get": {
-                "summary": "Pin-parameter comparison curves of a pin_compare run.",
-                "parameters": [path_name_param("Run name.")],
-                "responses": {
-                    "200": ok("The run's pin_compare manifest block.", pin_compare),
-                    "404": error_ref("NotFound"),
                     "500": error_ref("ServerError"),
                 },
             }

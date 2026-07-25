@@ -18,8 +18,8 @@ async function redrawCharts() {
   const plots: PlotSeries[] = [];
   const okNames: string[] = [];
   for (const n of names) {
-    // A run with no analyzer results has no plot_series to fetch — a
-    // pin comparison charts straight off its own manifest instead.
+    // A run with no analyzer results has no plot_series to fetch — the
+    // selection is legal, there is simply nothing to draw for it yet.
     if (!runData(n)?.has_results) continue;
     try {
       plots.push(await ensurePlotSeries(n));

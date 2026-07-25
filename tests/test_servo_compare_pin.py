@@ -13,6 +13,9 @@ from test_servo_calibration_awd import (
 from test_servo_sweep_pin import FakeAccelClient, _pinned_profile
 
 GRAVITY_MM_S2 = 9810.0
+# The header servo-ident's read_accel_csv skips and the column order it
+# parses; a comparison is only charted if its CSVs match it.
+ACCEL_CSV_HEADER = "#time,accel_x,accel_y,accel_z"
 
 
 class FakeChirpChip:
@@ -21,8 +24,8 @@ class FakeChirpChip:
     oscillation: the two horizontal axes share a sine of total amplitude
     ``amp`` (per-value, popped from ``amps``; None -> empty capture) at the
     instantaneous chirp frequency, and the vertical axis carries gravity
-    the way a real accelerometer reports it. The timestamps map, via the
-    reducer's f = freq_start + hz_per_sec*(t - t0), across the whole band."""
+    the way a real accelerometer reports it. The timestamps cover the whole
+    sweep window, which is what the per-step accel PSD is computed over."""
 
     def __init__(self, freq_start, freq_end, hz_per_sec, amps=None, fs=1000.0):
         self.freq_start = freq_start
@@ -101,91 +104,22 @@ def _run_dirs(sc):
     )
 
 
-def _manifest(sc):
-    dirs = _run_dirs(sc)
-    assert len(dirs) == 1, dirs
-    with open(os.path.join(dirs[0], "manifest.json")) as f:
+def _manifest_at(run_dir):
+    with open(os.path.join(run_dir, "manifest.json")) as f:
         return json.load(f)
 
 
-def _compare_at(run_dir):
-    with open(os.path.join(run_dir, "manifest.json")) as f:
-        return json.load(f)["pin_compare"]
+def _manifest(sc):
+    dirs = _run_dirs(sc)
+    assert len(dirs) == 1, dirs
+    return _manifest_at(dirs[0])
 
 
-def _compare(sc):
-    return _manifest(sc)["pin_compare"]
+def _steps(run_dir):
+    return _manifest_at(run_dir)["steps"]
 
 
-# ---- reduction / normalization math -----------------------------------
-
-
-def _sine_bin(f_tone, amp, t0, n=400, fs=1000.0, offset=0.0):
-    """One axis oscillating at f_tone with amplitude amp, riding on offset."""
-    out = []
-    for k in range(n):
-        t = t0 + k / fs
-        out.append(
-            (t, amp * math.sin(2.0 * math.pi * f_tone * (t - t0)) + offset)
-        )
-    return out
-
-
-def test_chirp_reduction_recovers_amplitude_and_rejects_gravity():
-    sc, *_ = _setup()
-    # A pure 100.5 Hz tone of amplitude 400 on x, gravity parked on z. The
-    # bin must report the sine AMPLITUDE, not its rectified mean (0.637*A)
-    # and not the gravity-dominated vector magnitude.
-    samples = [
-        (t, x, 0.0, GRAVITY_MM_S2)
-        for t, x in _sine_bin(100.5, 400.0, 0.0, n=400)
-    ]
-    curve, accel, ratio = sc._chirp_accel_curve(
-        samples, 100.0, 103.0, 1.0, 75.0
-    )
-    assert curve == [100.5]
-    assert accel == pytest.approx([400.0], rel=2e-3)
-    assert ratio == pytest.approx([400.0 / (75.0 * 100.5)], rel=2e-3)
-
-
-def test_chirp_reduction_bins_by_instantaneous_frequency():
-    sc, *_ = _setup()
-    # freq_start=100, hz_per_sec=1 -> f = 100 + (t - t0), so bin idx =
-    # int(f - 100): [100,101) is bin 0 (center 100.5), [101,102) is bin 1
-    # (center 101.5). Samples past freq_end are dropped, never a fake tail
-    # bin. Two axes at equal amplitude combine as vector magnitude.
-    samples = []
-    for t, x in _sine_bin(100.5, 300.0, 0.0, n=400):
-        samples.append((t, x, x, GRAVITY_MM_S2))
-    for t, x in _sine_bin(101.5, 100.0, 1.05, n=400):
-        samples.append((t, x, 0.0, GRAVITY_MM_S2))
-    samples.append((5.0, 9.0, 9.0, 9.0))  # f=105 > freq_end -> dropped
-    curve, accel, ratio = sc._chirp_accel_curve(
-        samples, 100.0, 103.0, 1.0, 75.0
-    )
-    assert curve == [100.5, 101.5]
-    assert accel == pytest.approx([300.0 * math.sqrt(2.0), 100.0], rel=2e-3)
-    for f_c, a, r in zip(curve, accel, ratio):
-        assert r == pytest.approx(a / (75.0 * f_c))
-
-
-def test_chirp_reduction_reports_zero_for_a_dc_only_capture():
-    sc, *_ = _setup()
-    # Gravity with no excitation is not a response. The old rectified-mean
-    # reduction reported the full vector magnitude here.
-    samples = [(k / 1000.0, 0.0, 0.0, GRAVITY_MM_S2) for k in range(400)]
-    _curve, accel, _ratio = sc._chirp_accel_curve(
-        samples, 100.0, 103.0, 1.0, 75.0
-    )
-    assert accel == pytest.approx([0.0], abs=1e-6)
-
-
-def test_chirp_reduction_empty_capture_is_empty_not_zero():
-    sc, *_ = _setup()
-    assert sc._chirp_accel_curve([], 100.0, 104.0, 5.0, 75.0) == ([], [], [])
-
-
-# ---- the run and its pin_compare block ---------------------------------
+# ---- the run layout: one ordinary step per swept value -----------------
 
 
 @requires_tomllib
@@ -200,35 +134,79 @@ def test_compare_writes_an_ordinary_run():
     assert man["axis"] == "X"
     assert man["command"].startswith("FAKE_CMD ")
     assert isinstance(man["created_utc"], str) and man["created_utc"]
-    assert man["steps"] == []
-    assert man["stroke_plan"]["param"] == "ZETA"
-    assert man["stroke_plan"]["freq_start"] == 100.0
+    plan = man["stroke_plan"]
+    assert plan["param"] == "ZETA"
+    assert plan["freq_start"] == 100.0
+    assert plan["freq_end"] == 104.0
+    assert plan["baseline_profile"] == path
+    # ... and indistinguishable at the step level too, which is what makes
+    # the standard following-error and accel PSD charts render it: one
+    # ordinary step per swept value, named for the value so the chart
+    # legends say which zeta produced which trace.
+    steps = man["steps"]
+    assert [s["name"] for s in steps] == ["v0_zeta0p02", "v1_zeta0p05"]
+    assert [s["swept"]["value"] for s in steps] == [0.02, 0.05]
+    for step in steps:
+        assert step["swept"]["t_end_s"] >= step["swept"]["t_start_s"]
+        assert step["applied"] == []
 
-    cmp_block = man["pin_compare"]
-    assert cmp_block["mode"] == "x"
-    assert cmp_block["param"] == "ZETA"
-    assert cmp_block["freq_start"] == 100.0
-    assert cmp_block["freq_end"] == 104.0
-    assert cmp_block["baseline_profile"] == path
-    assert [s["value"] for s in cmp_block["sweeps"]] == [0.02, 0.05]
-    for s, amp in zip(cmp_block["sweeps"], (2.0, 6.0)):
-        assert s["hz_per_sec"] == 5.0
-        assert s["accel_per_hz"] == 75.0
-        # wire amplitude is the displacement at freq_start
-        assert s["amplitude_mm"] == pytest.approx(
-            75.0 / (4.0 * math.pi**2 * 100.0)
-        )
-        n = len(s["curve_hz"])
-        assert n > 0
-        assert len(s["accel_mm_s2"]) == n
-        assert len(s["response_ratio"]) == n
-        # constant-amplitude chirp -> every bin recovers that amplitude,
-        # to within the edge effect of a finite (non-integer-cycle) bin
-        assert s["accel_mm_s2"] == pytest.approx([amp] * n, rel=1e-2)
-        for f_c, a, r in zip(
-            s["curve_hz"], s["accel_mm_s2"], s["response_ratio"]
-        ):
-            assert r == pytest.approx(a / (s["accel_per_hz"] * f_c))
+
+@requires_tomllib
+def test_every_sweep_starts_its_own_drive_capture():
+    sc, _gcode, _node, _path, _chip = _setup(amps=[2.0, 6.0])
+    sc.cmd_SERVO_COMPARE_PIN(_gcmd())
+    run_dir = _run_dirs(sc)[0]
+    cap = sc.printer.lookup_object("servo_capture")
+    # A .scap per sweep over the drives the mode's frame row excites - the
+    # comparison had none at all while it only reduced the accelerometer,
+    # which is why the following-error PSD came up empty.
+    assert [p for p, _servos in cap.starts] == [
+        os.path.join(run_dir, "step_v0_zeta0p02.scap.zst"),
+        os.path.join(run_dir, "step_v1_zeta0p05.scap.zst"),
+    ]
+    assert [servos for _p, servos in cap.starts] == [["motor_a"]] * 2
+    # started and stopped around each sweep, never left running across one
+    assert cap.events == ["capture_start", "capture_stop"] * 2
+    assert [s["capture"] for s in _steps(run_dir)] == [
+        "step_v0_zeta0p02.scap.zst",
+        "step_v1_zeta0p05.scap.zst",
+    ]
+
+
+@requires_tomllib
+def test_every_sweep_writes_the_accel_csv_the_analyzer_parses():
+    sc, _gcode, _node, _path, chip = _setup(amps=[2.0, 6.0])
+    sc.cmd_SERVO_COMPARE_PIN(_gcmd())
+    run_dir = _run_dirs(sc)[0]
+    steps = _steps(run_dir)
+    assert [s["accel"] for s in steps] == [
+        "step_v0_zeta0p02_accel.csv",
+        "step_v1_zeta0p05_accel.csv",
+    ]
+    for step, client in zip(steps, chip.clients):
+        with open(os.path.join(run_dir, step["accel"])) as f:
+            lines = f.read().splitlines()
+        assert lines[0] == ACCEL_CSV_HEADER
+        rows = [[float(v) for v in line.split(",")] for line in lines[1:]]
+        assert all(len(r) == 4 for r in rows)
+        # Raw samples across the whole chirp, not a reduction and not a
+        # settled tail: the PSD of a linear chirp IS the response curve,
+        # and a truncated capture is a truncated band.
+        assert len(rows) == len(client.samples)
+        assert rows[0] == pytest.approx(list(client.samples[0]), abs=1e-6)
+        assert rows[-1] == pytest.approx(list(client.samples[-1]), abs=1e-6)
+
+
+@requires_tomllib
+def test_a_sweep_that_captured_nothing_fails_loudly():
+    """The accelerometer is the whole point of a comparison, so an empty
+    capture stops the run instead of leaving a value-shaped hole in the
+    overlay - and the baseline model still comes back."""
+    sc, _gcode, node, path, _chip = _setup(amps=[1.0, None])
+    with pytest.raises(Exception, match="measured no data"):
+        sc.cmd_SERVO_COMPARE_PIN(_gcmd(VALUES="0.02,0.05"))
+    assert node.live_dynamics_profile == path
+    assert [s["name"] for s in _steps(_run_dirs(sc)[0])] == ["v0_zeta0p02"]
 
 
 @requires_tomllib
@@ -237,18 +215,25 @@ def test_compare_defaults_one_hz_per_sec_and_75_aph():
     gcmd = _gcmd(VALUES="0.02,0.05")
     del gcmd.params["HZ_PER_SEC"]
     sc.cmd_SERVO_COMPARE_PIN(gcmd)
-    for s in _compare(sc)["sweeps"]:
-        assert s["hz_per_sec"] == 1.0
-        assert s["accel_per_hz"] == 75.0
+    plan = _manifest(sc)["stroke_plan"]
+    assert plan["hz_per_sec"] == 1.0
+    assert plan["accel_per_hz"] == 75.0
+    # wire amplitude is the displacement at freq_start
+    assert plan["amplitude"] == pytest.approx(75.0 / (4.0 * math.pi**2 * 100.0))
 
 
 @requires_tomllib
-def test_compare_reports_peak_and_run_dir():
-    sc, _gcode, _node, _path, _chip = _setup(amps=[2.0, 6.0])
+def test_compare_reports_each_sweep_and_the_run_dir():
+    sc, _gcode, _node, _path, chip = _setup(amps=[2.0, 6.0])
     gcmd = _gcmd()
     sc.cmd_SERVO_COMPARE_PIN(gcmd)
     report = " ".join(gcmd.responses)
-    assert "peak response" in report
+    # Progress names the step (the chart legend) and the sample count that
+    # says the capture landed. No peak or ratio: nothing is reduced here
+    # any more, and a single-bin amplitude means nothing on a chirp.
+    n = len(chip.clients[0].samples)
+    assert "step v0_zeta0p02 captured %d accel samples" % (n,) in report
+    assert "step v1_zeta0p05 captured %d accel samples" % (n,) in report
     assert _run_dirs(sc)[0] in report
 
 
@@ -263,9 +248,10 @@ def test_each_invocation_is_its_own_run():
     sc.cmd_SERVO_COMPARE_PIN(_gcmd(VALUES="0.1,0.2"))
     dirs = _run_dirs(sc)
     assert len(dirs) == 2, "one command, one run - never a merge"
-    assert sorted(
-        [s["value"] for s in _compare_at(d)["sweeps"]] for d in dirs
-    ) == [[0.02, 0.05], [0.1, 0.2]]
+    assert sorted([s["swept"]["value"] for s in _steps(d)] for d in dirs) == [
+        [0.02, 0.05],
+        [0.1, 0.2],
+    ]
 
 
 @requires_tomllib
@@ -274,8 +260,12 @@ def test_a_second_run_may_sweep_a_different_param_or_mode():
     sc, _gcode, _node, _path, _chip = _setup(amps=[1.0, 1.0, 1.0, 1.0])
     sc.cmd_SERVO_COMPARE_PIN(_gcmd(PARAM="ZETA", VALUES="0.02,0.05"))
     sc.cmd_SERVO_COMPARE_PIN(_gcmd(PARAM="LEAD", VALUES="100,200"))
-    params = sorted(_compare_at(d)["param"] for d in _run_dirs(sc))
-    assert params == ["LEAD", "ZETA"]
+    runs = [_manifest_at(d) for d in _run_dirs(sc)]
+    assert sorted(m["stroke_plan"]["param"] for m in runs) == ["LEAD", "ZETA"]
+    assert sorted([s["name"] for s in m["steps"]] for m in runs) == [
+        ["v0_lead100", "v1_lead200"],
+        ["v0_zeta0p02", "v1_zeta0p05"],
+    ]
 
 
 # ---- streaming, baseline restore, required params ----------------------
@@ -312,8 +302,8 @@ def test_compare_restores_baseline_on_failure_mid_sweep():
     assert engine.dynamics_calls[-1][7] == [0.05, 0.0]
     assert engine.dynamics_calls[-1][8] == 100.0
     assert node.live_dynamics_profile == path
-    # the crashed run keeps the sweeps it did finish, and no more
-    assert [s["value"] for s in _compare(sc)["sweeps"]] == [0.02]
+    # the crashed run keeps the steps it did finish, and no more
+    assert [s["name"] for s in _steps(_run_dirs(sc)[0])] == ["v0_zeta0p02"]
 
 
 @requires_tomllib
@@ -321,6 +311,10 @@ def test_compare_requires_accel_chip():
     sc, _gcode, _node, _path, _chip = _setup()
     with pytest.raises(Exception, match="ACCEL_CHIP"):
         sc.cmd_SERVO_COMPARE_PIN(_gcmd(ACCEL_CHIP=None))
+    # validation lands before the first excitation: nothing buzzed, and no
+    # run directory was left behind to look like a measurement
+    assert sc.printer.lookup_object("motion_engine").buzzes == []
+    assert _run_dirs(sc) == []
 
 
 @requires_tomllib
@@ -332,3 +326,4 @@ def test_compare_requires_freq_bounds_and_param():
         sc.cmd_SERVO_COMPARE_PIN(_gcmd(FREQ_START=None))
     with pytest.raises(Exception, match="FREQ_END"):
         sc.cmd_SERVO_COMPARE_PIN(_gcmd(FREQ_END=None))
+    assert sc.printer.lookup_object("motion_engine").buzzes == []

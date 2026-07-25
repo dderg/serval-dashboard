@@ -402,7 +402,7 @@ fn step_flags(drives: &BTreeMap<String, DriveResult>) -> Vec<String> {
 /// (`analyze_compliance_capture`/`analyze_differential_capture`), so they never
 /// reach the generic `analyze_capture` and are not listed here.
 fn experiment_requires_moving(experiment: &str) -> bool {
-    !matches!(experiment, "pin_sweep")
+    !matches!(experiment, "pin_sweep" | "pin_compare")
 }
 
 /// Analyze one capture into a `StepResult` and a `PlotStep`.
@@ -1058,10 +1058,11 @@ pub fn compute_verdict(
                 apply: None,
             })
         }
-        "pin_sweep" => {
-            // One dwell tone per step; the swept pin parameter changes per
-            // step, so the settled residual magnitude (max over the step's
-            // drives - the mode rides one drive block) ranks the values.
+        "pin_sweep" | "pin_compare" => {
+            // A staircase dwells on one tone per step, a comparison chirps the
+            // whole band per step; either way one step is one swept value, so
+            // the settled residual magnitude (max over the step's drives - the
+            // mode rides one drive block) ranks the values.
             let mut best: Option<(usize, f64)> = None;
             let mut lines = Vec::new();
             for (i, sr) in steps.iter().enumerate() {

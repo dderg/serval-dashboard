@@ -2915,81 +2915,25 @@ class DynamicsFitCommands(MeasureCommands):
         "For each VALUES entry the dynamics model is re-streamed live (only "
         "the swept PARAM changes; the other pin parameter keeps its baseline "
         "value), a linear chirp FREQ_START->FREQ_END runs in the mode's "
-        "frame pattern, and the accelerometer captures the whole sweep "
-        "window. Each capture is reduced to accel-vs-frequency curves: the "
-        "linear chirp maps sample time to instantaneous frequency, samples "
-        "fall into ~1 Hz bins, and each bin's 3-axis vector-magnitude mean "
-        "is the raw accel. The chirp excites at constant accel-per-Hz "
-        "(commanded accel = ACCEL_PER_HZ * f; the endpoint holds the "
-        "velocity amplitude constant so displacement shrinks as 1/f), and "
-        "response_ratio divides each bin by that commanded accel - 1.0 = "
-        "perfect tracking. Every invocation is its own run, exactly like "
-        "every other calibration command: the sweeps land in the "
-        "pin_compare block of <captures_root>/<NAME>_<stamp>/manifest.json "
-        "for the dashboard to overlay, and re-using NAME makes a second, "
-        "separate run - sweeps are never merged across invocations. "
-        "Measurement only: the pre-sweep model is restored at "
+        "frame pattern, and both the drives and the accelerometer are "
+        "captured across the whole sweep. Every value lands as an ordinary "
+        "run step - a .scap capture plus an accel CSV, named for the value - "
+        "so the dashboard draws the comparison with the same following-error "
+        "and accelerometer PSDs it already draws for a pin sweep, one trace "
+        "per value. A linear chirp dwells equally at every frequency, so "
+        "those PSDs are the frequency response; nothing is reduced "
+        "host-side. The chirp excites at constant accel-per-Hz (commanded "
+        "accel = ACCEL_PER_HZ * f; the endpoint holds the velocity amplitude "
+        "constant so displacement shrinks as 1/f). Every invocation is its "
+        "own run, exactly like every other calibration command: re-using "
+        "NAME makes a second, separate run - sweeps are never merged across "
+        "invocations. Measurement only: the pre-sweep model is restored at "
         "the end (also on failure). Params MODE=X|Y PARAM=ZETA|LEAD "
         "VALUES (comma list) FREQ_START FREQ_END (Hz, required) HZ_PER_SEC "
         "(1.0) ACCEL_PER_HZ (mm/s^2 per Hz, 75) RAMP DWELL (s "
         "between sweeps, 3) ACCEL_CHIP (required; config accel_chip) "
         "NAME (compare) PROFILE"
     )
-
-    def _chirp_accel_curve(
-        self,
-        samples: list[tuple[float, float, float, float]],
-        freq_start: float,
-        freq_end: float,
-        hz_per_sec: float,
-        accel_per_hz: float,
-    ) -> tuple[list[float], list[float], list[float]]:
-        """Reduce a swept-sine accel capture to accel-vs-frequency curves.
-        The linear chirp maps capture time to instantaneous frequency
-        (f = freq_start + hz_per_sec*(t - t0)), so samples land in 1 Hz
-        bins. Per bin each axis is mean-removed and converted to a sine
-        amplitude (rms*sqrt(2)), then the axes combine as vector magnitude.
-        Mean removal is what drops the ~9810 mm/s^2 gravity vector the
-        accelerometer reports on top of the excitation; amplitude (not
-        rectified mean) is what makes the number comparable to the
-        commanded accel. The endpoint's chirp holds the velocity amplitude
-        constant (displacement scales as 1/f), so the commanded accel is
-        accel_per_hz * f - the response_ratio column divides each bin by
-        exactly that, making 1.0 = perfect command tracking at every
-        frequency. Returns (curve_hz, accel_mm_s2, response_ratio) sorted
-        by frequency. Empty capture -> three empty lists (never a fake
-        zero)."""
-        if not samples:
-            return [], [], []
-        t0 = samples[0][0]
-        bins: dict[int, list[list[float]]] = {}
-        for sample in samples:
-            f = freq_start + hz_per_sec * (sample[0] - t0)
-            if f < freq_start or f > freq_end:
-                continue
-            idx = int(f - freq_start)  # 1 Hz bins anchored at freq_start
-            axes = bins.setdefault(idx, [[], [], []])
-            for axis in range(3):
-                axes[axis].append(sample[1 + axis])
-        curve_hz: list[float] = []
-        accel_mm_s2: list[float] = []
-        response_ratio: list[float] = []
-        for idx in sorted(bins):
-            axes = bins[idx]
-            if len(axes[0]) < 2:
-                continue
-            f_c = freq_start + idx + 0.5
-            total_sq = 0.0
-            for values in axes:
-                mean = sum(values) / len(values)
-                var = sum((v - mean) * (v - mean) for v in values) / len(values)
-                total_sq += 2.0 * var
-            a = math.sqrt(total_sq)
-            curve_hz.append(round(f_c, 4))
-            accel_mm_s2.append(a)
-            denom = accel_per_hz * f_c
-            response_ratio.append(a / denom if denom > 0.0 else 0.0)
-        return curve_hz, accel_mm_s2, response_ratio
 
     def _run_compare_sweep(
         self,
@@ -3014,14 +2958,19 @@ class DynamicsFitCommands(MeasureCommands):
         ramp: float,
         dwell_s: float,
         accel_chip: Any,
+        accel_name: str,
         run: ExperimentRun,
     ) -> None:
-        """One chirp per value: re-stream the model, buzz FREQ_START->
-        FREQ_END in the mode's frame pattern, capture the accelerometer over
-        the sweep, and reduce to curves. Restores the passed baseline model
-        at the end (also on failure), matching the staircase discipline.
-        Each reduced sweep is appended to the run's pin_compare block and
-        the manifest rewritten, so a crash keeps whatever was measured."""
+        """One chirp per value, each recorded as an ordinary run step:
+        re-stream the model, capture the drives and the toolhead
+        accelerometer across the whole FREQ_START->FREQ_END buzz, and record
+        the step with its accel CSV. A linear chirp dwells equally at every
+        frequency, so each capture's PSD already is that value's frequency
+        response - the per-step following-error and accel PSDs the dashboard
+        draws for any stepped run are the comparison. The manifest is
+        rewritten as each sweep completes, so a crash keeps partial truth.
+        Restores the passed baseline model at the end (also on failure),
+        matching the staircase discipline."""
         row = spatial["frame"][spatial["modes"].index(mode)]
         slot_mask = 0
         sign_mask = 0
@@ -3061,7 +3010,6 @@ class DynamicsFitCommands(MeasureCommands):
         self._prep("X", 0)
         self._prep("Y", 0)
         toolhead = self.printer.lookup_object("toolhead")
-        sweeps = run.manifest["pin_compare"]["sweeps"]
         try:
             for i, value in enumerate(values):
                 # Keep idle_timeout from parking the servos mid-comparison
@@ -3069,53 +3017,65 @@ class DynamicsFitCommands(MeasureCommands):
                 toolhead.get_last_move_time()
                 updated = self._pin_sweep_model(baseline, mode_i, param, value)
                 send_dynamics_model(engine, handle, updated)
+                step_name = self._pin_step_name(param, i, value)
                 aclient = accel_chip.start_internal_client()
-                self._resonance_buzz(
-                    gcmd,
-                    engine,
-                    handle,
-                    slot_mask,
-                    sign_mask,
-                    int(round(freq_start * 1000.0)),
-                    int(round(freq_end * 1000.0)),
-                    int(round(amplitude * 1e6)),
-                    int(round(duration * 1000.0)),
-                    int(round(ramp * 1000.0)),
-                )
-                reactor.pause(reactor.monotonic() + duration + 0.2)
-                aclient.finish_measurements()
-                samples = (
-                    list(aclient.get_samples())
-                    if aclient.has_valid_samples()
-                    else []
-                )
-                curve_hz, accel, ratio = self._chirp_accel_curve(
-                    samples, freq_start, freq_end, hz_per_sec, accel_per_hz
-                )
-                sweeps.append(
-                    {
-                        "value": value,
-                        "hz_per_sec": hz_per_sec,
-                        "accel_per_hz": accel_per_hz,
-                        "amplitude_mm": amplitude,
-                        "curve_hz": curve_hz,
-                        "accel_mm_s2": accel,
-                        "response_ratio": ratio,
-                    }
-                )
-                run.write()
-                if ratio:
-                    pk = max(range(len(ratio)), key=lambda k: ratio[k])
-                    gcmd.respond_info(
-                        "pin compare %s=%g: peak response %.1f Hz "
-                        "(response ratio %.4g)"
-                        % (param, value, curve_hz[pk], ratio[pk])
+                t_start = round(reactor.monotonic(), 3)
+                # Drive capture and accel capture both span the whole chirp,
+                # not a settled window: the swept band is the measurement.
+                self._start_capture(step_name, step_servos)
+                try:
+                    self._resonance_buzz(
+                        gcmd,
+                        engine,
+                        handle,
+                        slot_mask,
+                        sign_mask,
+                        int(round(freq_start * 1000.0)),
+                        int(round(freq_end * 1000.0)),
+                        int(round(amplitude * 1e6)),
+                        int(round(duration * 1000.0)),
+                        int(round(ramp * 1000.0)),
                     )
-                else:
-                    gcmd.respond_info(
-                        "pin compare %s=%g: no accel samples captured "
-                        "(no curve)" % (param, value)
+                    reactor.pause(reactor.monotonic() + duration + 0.2)
+                finally:
+                    self._stop_capture()
+                    aclient.finish_measurements()
+                # An empty capture fails the run here (_write_accel_csv
+                # raises): the accelerometer is the whole point of a
+                # comparison, so a silent value-shaped hole in the overlay
+                # would be worse than stopping.
+                accel_csv = os.path.basename(
+                    self._write_accel_csv(gcmd, aclient, accel_name, step_name)
+                )
+                run.record_step(
+                    SweepStep(
+                        step_name,
+                        {
+                            "value": value,
+                            "t_start_s": t_start,
+                            "t_end_s": round(reactor.monotonic(), 3),
+                        },
+                        [],
+                        accel=accel_csv,
                     )
+                )
+                # Sample count, not a peak or a ratio: a single-bin amplitude
+                # is meaningless on a chirp (the tone passes each frequency
+                # once), and the spectrum this stage would have to reduce is
+                # exactly what the per-step PSD draws. What the operator
+                # needs mid-run is that the capture landed.
+                gcmd.respond_info(
+                    "pin compare %s=%g: step %s captured %d accel samples "
+                    "over the %.0f->%.0f Hz chirp"
+                    % (
+                        param,
+                        value,
+                        step_name,
+                        len(aclient.get_samples()),
+                        freq_start,
+                        freq_end,
+                    )
+                )
                 if dwell_s and i < len(values) - 1:
                     reactor.pause(reactor.monotonic() + dwell_s)
         finally:
@@ -3189,7 +3149,7 @@ class DynamicsFitCommands(MeasureCommands):
         )
         dwell_s = gcmd.get_float("DWELL", 3.0, minval=0.0)
         name = gcmd.get("NAME", "compare")
-        accel_chip, _accel_name = self._accel_chip(gcmd)
+        accel_chip, accel_name = self._accel_chip(gcmd)
         if accel_chip is None:
             raise gcmd.error(
                 "ACCEL_CHIP= is required (pass it or set [servo_calibration] "
@@ -3234,19 +3194,11 @@ class DynamicsFitCommands(MeasureCommands):
             "duration": duration,
             "ramp": ramp,
             "dwell_s": dwell_s,
+            "baseline_profile": profile_path,
         }
         run = self._begin_run(
             gcmd, "pin_compare", name, mode.upper(), servos, stroke_plan
         )
-        run.manifest["pin_compare"] = {
-            "mode": mode,
-            "param": param,
-            "freq_start": freq_start,
-            "freq_end": freq_end,
-            "baseline_profile": profile_path,
-            "sweeps": [],
-        }
-        run.write()
         try:
             self._run_compare_sweep(
                 gcmd,
@@ -3270,11 +3222,12 @@ class DynamicsFitCommands(MeasureCommands):
                 ramp,
                 dwell_s,
                 accel_chip,
+                accel_name,
                 run,
             )
         finally:
             self._active_run = None
-        sweeps = run.manifest["pin_compare"]["sweeps"]
+        steps = run.manifest["steps"]
         structured_log.event(
             "calibration",
             "pin_compare",
@@ -3284,11 +3237,11 @@ class DynamicsFitCommands(MeasureCommands):
             values=values,
             freq_start=freq_start,
             freq_end=freq_end,
-            n_sweeps=len(sweeps),
+            n_sweeps=len(steps),
         )
         gcmd.respond_info(
             "pin compare %s (mode %s, %s): %d sweep(s) in run %s"
-            % (name, mode, param, len(sweeps), run.run_dir)
+            % (name, mode, param, len(steps), run.run_dir)
         )
 
     cmd_SERVO_TUNE_PIN_help = (

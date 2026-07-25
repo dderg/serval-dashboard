@@ -236,3 +236,26 @@ fn pin_sweep_without_pin_channels_recommends_nothing() {
         v.reason
     );
 }
+
+/// A comparison sweeps the same pin parameter a staircase does, one chirp per
+/// step instead of one dwell tone, so it ranks through the same arm. Dropping
+/// it from that arm would fail the whole run's analyze as an unknown
+/// experiment, not just lose the verdict line.
+#[test]
+fn pin_compare_ranks_through_the_pin_sweep_arm() {
+    let steps = vec![
+        pin_step("v0_zeta0p005", Some(0.004)),
+        pin_step("v1_zeta0p02", Some(0.0012)),
+    ];
+    let manifest = vec![
+        manifest_step("v0_zeta0p005", json!({"value": 0.005})),
+        manifest_step("v1_zeta0p02", json!({"value": 0.02})),
+    ];
+    let v = compute_verdict("pin_compare", &steps, &manifest).unwrap();
+    assert_eq!(v.recommended_step.as_deref(), Some("v1_zeta0p02"));
+    assert!(
+        v.reason.contains("min residual 1.20 um at v1_zeta0p02"),
+        "{}",
+        v.reason
+    );
+}

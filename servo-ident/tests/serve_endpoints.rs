@@ -230,9 +230,10 @@ fn missing_run_is_404_with_reason_body() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// A pin comparison is an ordinary run: the same `<captures_root>/<name>`
-/// layout every other experiment uses, with the sweep curves in a
-/// `pin_compare` manifest block.
+/// A pin comparison is an ordinary stepped run: the same
+/// `<captures_root>/<name>` layout every other experiment uses, one step per
+/// swept value carrying a drive capture and an accelerometer CSV. It has no
+/// manifest block and no route of its own.
 fn write_pin_compare_run(run_dir: &Path, tag: &str) {
     std::fs::create_dir_all(run_dir).unwrap();
     let manifest = serde_json::json!({
@@ -241,23 +242,20 @@ fn write_pin_compare_run(run_dir: &Path, tag: &str) {
         "command": format!("SERVO_COMPARE_PIN MODE=X PARAM=ZETA NAME={tag}"),
         "tag": tag,
         "axis": "X",
-        "steps": [],
-        "pin_compare": {
-            "mode": "x",
-            "param": "ZETA",
-            "freq_start": 100.0,
-            "freq_end": 104.0,
-            "baseline_profile": "/cfg/baseline.toml",
-            "sweeps": [{
-                "value": 0.02,
-                "hz_per_sec": 5.0,
-                "accel_per_hz": 75.0,
-                "amplitude_mm": 0.019,
-                "curve_hz": [100.5, 101.5],
-                "accel_mm_s2": [2.0, 3.0],
-                "response_ratio": [0.5, 0.75],
-            }],
-        },
+        "steps": [
+            {
+                "name": "v0_zeta0p005",
+                "capture": "step_v0_zeta0p005.scap",
+                "swept": {"value": 0.005},
+                "accel": "accel_v0_zeta0p005.csv",
+            },
+            {
+                "name": "v1_zeta0p02",
+                "capture": "step_v1_zeta0p02.scap",
+                "swept": {"value": 0.02},
+                "accel": "accel_v1_zeta0p02.csv",
+            },
+        ],
     });
     std::fs::write(
         run_dir.join("manifest.json"),
@@ -267,7 +265,7 @@ fn write_pin_compare_run(run_dir: &Path, tag: &str) {
 }
 
 #[test]
-fn a_pin_comparison_lists_as_an_ordinary_run_and_serves_its_curves() {
+fn a_pin_comparison_lists_and_serves_its_steps_like_any_other_run() {
     let root = temp_dir("pin_compare");
     write_pin_compare_run(&root.join("cmp_20260725_101500"), "cmp");
     let port = spawn_server(root.clone());
@@ -280,31 +278,14 @@ fn a_pin_comparison_lists_as_an_ordinary_run_and_serves_its_curves() {
     assert_eq!(row["axis"], Value::from("X"));
     assert_eq!(row["has_results"], Value::Bool(false));
 
-    let resp = request(port, "GET", "/api/runs/cmp_20260725_101500/pin_compare");
+    let resp = request(port, "GET", "/api/runs/cmp_20260725_101500/manifest");
     assert_eq!(resp.status, 200);
-    let block: Value = serde_json::from_str(&resp.body).unwrap();
-    assert_eq!(block["param"], Value::from("ZETA"));
-    assert_eq!(block["mode"], Value::from("x"));
-    assert_eq!(block["sweeps"].as_array().unwrap().len(), 1);
-    assert_eq!(block["sweeps"][0]["accel_per_hz"], Value::from(75.0));
-    assert_eq!(block["sweeps"][0]["response_ratio"][1], Value::from(0.75));
-
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[test]
-fn the_pin_compare_endpoint_404s_for_a_run_that_is_not_a_comparison() {
-    let root = temp_dir("pin_compare_absent");
-    write_bare_manifest(&root.join("plain_run"), "plain");
-    let port = spawn_server(root.clone());
-
-    let resp = request(port, "GET", "/api/runs/plain_run/pin_compare");
-    assert_eq!(resp.status, 404);
-    let parsed: Value = serde_json::from_str(&resp.body).expect("404 body is json");
-    assert!(parsed["error"]
-        .as_str()
-        .unwrap()
-        .contains("not a pin comparison"));
+    let manifest: Value = serde_json::from_str(&resp.body).unwrap();
+    let steps = manifest["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0]["name"], Value::from("v0_zeta0p005"));
+    assert_eq!(steps[0]["swept"]["value"], Value::from(0.005));
+    assert_eq!(steps[0]["accel"], Value::from("accel_v0_zeta0p005.csv"));
 
     std::fs::remove_dir_all(&root).ok();
 }
