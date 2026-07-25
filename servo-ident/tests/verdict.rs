@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use servo_ident::analyze::compute_verdict;
-use servo_ident::results::{Applied, Step, StepResult};
+use servo_ident::results::{Applied, Manifest, PlotPsd, PlotStep, Step, StepResult, Verdict};
 
 fn step_result(name: &str, flags: &[&str]) -> StepResult {
     StepResult {
@@ -34,14 +34,38 @@ fn manifest_step(name: &str, swept: serde_json::Value) -> Step {
     }
 }
 
+fn manifest(experiment: &str, stroke_plan: serde_json::Value, steps: Vec<Step>) -> Manifest {
+    Manifest {
+        version: 1,
+        experiment: experiment.to_string(),
+        command: None,
+        tag: String::new(),
+        axis: None,
+        kinematics: None,
+        belts: None,
+        stroke_plan,
+        ff_lead_us: 0.0,
+        ff_lead_cycles: 0,
+        spatial: None,
+        motors: Vec::new(),
+        steps,
+    }
+}
+
+/// Most arms never look at the stroke plan or the plot series; this keeps
+/// their call sites at the old shape.
+fn verdict(experiment: &str, steps: &[StepResult], msteps: Vec<Step>) -> Result<Verdict, String> {
+    compute_verdict(&manifest(experiment, json!({}), msteps), steps, &[])
+}
+
 #[test]
 fn gain_sweep_picks_highest_clean_speed() {
     let steps = vec![step_result("a", &[]), step_result("b", &[])];
-    let manifest = vec![
+    let msteps = vec![
         manifest_step("a", json!({"speed": 550})),
         manifest_step("b", json!({"speed": 700})),
     ];
-    let v = compute_verdict("gain_sweep", &steps, &manifest).unwrap();
+    let v = verdict("gain_sweep", &steps, msteps).unwrap();
     assert_eq!(v.recommended_step.as_deref(), Some("b"));
     assert!(v.apply.is_some());
 }
@@ -52,11 +76,11 @@ fn gain_sweep_skips_resonant_top_step() {
         step_result("a", &[]),
         step_result("b", &["resonance_detected"]),
     ];
-    let manifest = vec![
+    let msteps = vec![
         manifest_step("a", json!({"speed": 550})),
         manifest_step("b", json!({"speed": 700})),
     ];
-    let v = compute_verdict("gain_sweep", &steps, &manifest).unwrap();
+    let v = verdict("gain_sweep", &steps, msteps).unwrap();
     assert_eq!(v.recommended_step.as_deref(), Some("a"));
 }
 
@@ -66,11 +90,11 @@ fn gain_sweep_null_when_all_flagged() {
         step_result("a", &["torque_saturated"]),
         step_result("b", &["resonance_detected"]),
     ];
-    let manifest = vec![
+    let msteps = vec![
         manifest_step("a", json!({"speed": 550})),
         manifest_step("b", json!({"speed": 700})),
     ];
-    let v = compute_verdict("gain_sweep", &steps, &manifest).unwrap();
+    let v = verdict("gain_sweep", &steps, msteps).unwrap();
     assert_eq!(v.recommended_step, None);
     assert!(v.apply.is_none());
     assert!(!v.reason.is_empty());
@@ -79,11 +103,11 @@ fn gain_sweep_null_when_all_flagged() {
 #[test]
 fn refine_sweep_uses_single_swept_value() {
     let steps = vec![step_result("lo", &[]), step_result("hi", &[])];
-    let manifest = vec![
+    let msteps = vec![
         manifest_step("lo", json!({"gain": 600})),
         manifest_step("hi", json!({"gain": 800})),
     ];
-    let v = compute_verdict("refine_sweep", &steps, &manifest).unwrap();
+    let v = verdict("refine_sweep", &steps, msteps).unwrap();
     assert_eq!(v.recommended_step.as_deref(), Some("hi"));
 }
 
@@ -94,21 +118,21 @@ fn accel_sweep_ports_recommend() {
         step_result("a2", &[]),
         step_result("a3", &["torque_saturated"]),
     ];
-    let manifest = vec![
+    let msteps = vec![
         manifest_step("a1", json!({"accel": 10000})),
         manifest_step("a2", json!({"accel": 20000})),
         manifest_step("a3", json!({"accel": 30000})),
     ];
-    let v = compute_verdict("accel_sweep", &steps, &manifest).unwrap();
+    let v = verdict("accel_sweep", &steps, msteps).unwrap();
     assert_eq!(v.recommended_step.as_deref(), Some("a2"));
 }
 
 #[test]
 fn inertia_sweep_defers_to_human() {
-    let v = compute_verdict(
+    let v = verdict(
         "inertia_sweep",
         &[step_result("a", &[])],
-        &[manifest_step("a", json!({"ratio": 200}))],
+        vec![manifest_step("a", json!({"ratio": 200}))],
     )
     .unwrap();
     assert_eq!(v.recommended_step, None);
@@ -126,10 +150,10 @@ fn tracking_and_grid_are_not_sweeps() {
         "strain_response",
         "strain_tune",
     ] {
-        let v = compute_verdict(
+        let v = verdict(
             exp,
             &[step_result("a", &[])],
-            &[manifest_step("a", json!({}))],
+            vec![manifest_step("a", json!({}))],
         )
         .unwrap();
         assert_eq!(v.recommended_step, None);
@@ -139,10 +163,10 @@ fn tracking_and_grid_are_not_sweeps() {
 
 #[test]
 fn dynamics_refine_defers_to_the_host_macro() {
-    let v = compute_verdict(
+    let v = verdict(
         "dynamics_refine",
         &[step_result("a", &[])],
-        &[manifest_step("a", json!({"scale": 0.95}))],
+        vec![manifest_step("a", json!({"scale": 0.95}))],
     )
     .unwrap();
     assert_eq!(v.recommended_step, None);
@@ -151,10 +175,10 @@ fn dynamics_refine_defers_to_the_host_macro() {
 
 #[test]
 fn dynamics_tune_defers_to_the_host_macro() {
-    let v = compute_verdict(
+    let v = verdict(
         "dynamics_tune",
         &[step_result("a", &[])],
-        &[manifest_step("a", json!({"accel": 25000.0}))],
+        vec![manifest_step("a", json!({"accel": 25000.0}))],
     )
     .unwrap();
     assert_eq!(v.recommended_step, None);
@@ -163,7 +187,7 @@ fn dynamics_tune_defers_to_the_host_macro() {
 
 #[test]
 fn unknown_experiment_fails_loud() {
-    assert!(compute_verdict("bogus", &[], &[]).is_err());
+    assert!(verdict("bogus", &[], Vec::new()).is_err());
 }
 
 #[test]
@@ -191,7 +215,7 @@ fn every_host_experiment_string_clears_the_whitelist() {
         "strain_response",
         "strain_tune",
     ] {
-        let v = compute_verdict(exp, &[], &[]);
+        let v = verdict(exp, &[], Vec::new());
         assert!(
             !matches!(&v, Err(e) if e.contains("unknown experiment")),
             "{exp} fell through compute_verdict's whitelist"
@@ -248,12 +272,12 @@ fn pin_sweep_recommends_min_residual_step() {
         pin_step("v1", Some(0.0012)),
         pin_step("v2", Some(0.009)),
     ];
-    let manifest = vec![
+    let msteps = vec![
         manifest_step("v0", json!({"zeta": 0.02})),
         manifest_step("v1", json!({"zeta": 0.05})),
         manifest_step("v2", json!({"zeta": 0.1})),
     ];
-    let v = compute_verdict("pin_sweep", &steps, &manifest).unwrap();
+    let v = verdict("pin_sweep", &steps, msteps).unwrap();
     assert_eq!(v.recommended_step.as_deref(), Some("v1"));
     assert!(
         v.reason.contains("min residual 1.20 um at v1"),
@@ -265,11 +289,11 @@ fn pin_sweep_recommends_min_residual_step() {
 #[test]
 fn pin_sweep_without_pin_channels_recommends_nothing() {
     let steps = vec![pin_step("v0", None), pin_step("v1", None)];
-    let manifest = vec![
+    let msteps = vec![
         manifest_step("v0", json!({"zeta": 0.02})),
         manifest_step("v1", json!({"zeta": 0.05})),
     ];
-    let v = compute_verdict("pin_sweep", &steps, &manifest).unwrap();
+    let v = verdict("pin_sweep", &steps, msteps).unwrap();
     assert!(v.recommended_step.is_none());
     assert!(
         v.reason.contains("no step carries pin residual"),
@@ -278,24 +302,226 @@ fn pin_sweep_without_pin_channels_recommends_nothing() {
     );
 }
 
-/// A comparison sweeps the same pin parameter a staircase does, one chirp per
-/// step instead of one dwell tone, so it ranks through the same arm. Dropping
-/// it from that arm would fail the whole run's analyze as an unknown
-/// experiment, not just lose the verdict line.
+// ---- pin_compare ----------------------------------------------------------
+
+/// Uniform PSD grid every compare plot shares; the swept band below is
+/// 70-200 Hz, so the 240/280 Hz bins are out of band.
+const COMPARE_GRID_HZ: [f64; 8] = [0.0, 40.0, 80.0, 120.0, 160.0, 200.0, 240.0, 280.0];
+
+/// mm²/Hz putting a single-sided tone of `amp_um` into one Welch bin of
+/// width `df`: the inverse of the arm's amplitude conversion.
+fn psd_for_amp_um(amp_um: f64, df: f64) -> f64 {
+    let amp_mm = amp_um * 1e-3;
+    amp_mm * amp_mm / (2.0 * 1.5 * df)
+}
+
+fn plot_step_with_psd(name: &str, grid: Vec<f64>, psd: Vec<f64>) -> PlotStep {
+    let mut cartesian = BTreeMap::new();
+    cartesian.insert("y".to_string(), psd);
+    PlotStep {
+        name: name.to_string(),
+        fs_hz: 4000.0,
+        stride: 1,
+        t_s: Vec::new(),
+        moving: Vec::new(),
+        drives: BTreeMap::new(),
+        combined: None,
+        accel: None,
+        differential: None,
+        ringdown: None,
+        compliance: None,
+        path: None,
+        psd: PlotPsd {
+            freq_hz: grid,
+            per_drive: BTreeMap::new(),
+            cartesian: Some(cartesian),
+            accel: None,
+        },
+    }
+}
+
+fn compare_plot(name: &str, in_band_amp_um: f64) -> PlotStep {
+    // The in-band peak rides the 120 Hz bin; both out-of-band bins carry a
+    // tone ten times larger, so a scorer ignoring the swept band would rank
+    // every step by garbage the operator never asked about.
+    let mut psd = vec![0.0; COMPARE_GRID_HZ.len()];
+    psd[3] = psd_for_amp_um(in_band_amp_um, 40.0);
+    psd[6] = psd_for_amp_um(in_band_amp_um * 10.0, 40.0);
+    psd[7] = psd_for_amp_um(in_band_amp_um * 10.0, 40.0);
+    plot_step_with_psd(name, COMPARE_GRID_HZ.to_vec(), psd)
+}
+
+/// Fine grid (df = 5 Hz) for FREQ-compare tests: the migration tolerance is
+/// two bins, which the coarse grid above cannot resolve.
+fn freq_plot(name: &str, amp_um: f64, tone_hz: f64) -> PlotStep {
+    let grid: Vec<f64> = (0..=40).map(|k| k as f64 * 5.0).collect();
+    let mut psd = vec![0.0; grid.len()];
+    psd[(tone_hz / 5.0).round() as usize] = psd_for_amp_um(amp_um, 5.0);
+    plot_step_with_psd(name, grid, psd)
+}
+
+fn compare_plan(param: &str) -> serde_json::Value {
+    json!({
+        "mode": "y",
+        "param": param,
+        "freq_start": 70.0,
+        "freq_end": 200.0,
+    })
+}
+
+/// The bench shape that motivated the arm (compare_20260725_170124): the
+/// in-band ferr peak is a U over zeta while the settled-tail residual is
+/// monotone in the pin gain — the residuals here rank the largest zeta
+/// first, and the verdict must ignore them.
 #[test]
-fn pin_compare_ranks_through_the_pin_sweep_arm() {
+fn pin_compare_scores_the_swept_band_not_the_residual_tail() {
     let steps = vec![
-        pin_step("zeta0p005", Some(0.004)),
-        pin_step("zeta0p02", Some(0.0012)),
+        pin_step("zeta0p03", Some(0.000040)),
+        pin_step("zeta0p04", Some(0.000035)),
+        pin_step("zeta0p045", Some(0.000033)),
+        pin_step("zeta0p07", Some(0.000030)),
     ];
-    let manifest = vec![
-        manifest_step("zeta0p005", json!({"value": 0.005})),
-        manifest_step("zeta0p02", json!({"value": 0.02})),
+    let plots = vec![
+        compare_plot("zeta0p03", 2.63),
+        compare_plot("zeta0p04", 1.59),
+        compare_plot("zeta0p045", 1.57),
+        compare_plot("zeta0p07", 2.34),
     ];
-    let v = compute_verdict("pin_compare", &steps, &manifest).unwrap();
-    assert_eq!(v.recommended_step.as_deref(), Some("zeta0p02"));
+    let msteps = vec![
+        manifest_step("zeta0p03", json!({"value": 0.03})),
+        manifest_step("zeta0p04", json!({"value": 0.04})),
+        manifest_step("zeta0p045", json!({"value": 0.045})),
+        manifest_step("zeta0p07", json!({"value": 0.07})),
+    ];
+    let m = manifest("pin_compare", compare_plan("ZETA"), msteps);
+    let v = compute_verdict(&m, &steps, &plots).unwrap();
+    // zeta0p045 scores best, but ZETA takes the lowest value within 15% —
+    // zeta0p04 — matching the staircase picker's under-driving rule.
+    assert_eq!(
+        v.recommended_step.as_deref(),
+        Some("zeta0p04"),
+        "{}",
+        v.reason
+    );
+    assert!(v.reason.contains("flattest in-band ferr"), "{}", v.reason);
+    assert!(v.reason.contains("lowest ZETA within 15%"), "{}", v.reason);
+    assert!(v.reason.contains("@ 120 Hz"), "{}", v.reason);
+}
+
+#[test]
+fn pin_compare_lead_takes_the_outright_minimum() {
+    // lead0 is within 15% of lead600's score; the ZETA tie rule would take
+    // the lower value, but LEAD is not a gain and must take the minimum.
+    let steps = vec![pin_step("lead0", None), pin_step("lead600", None)];
+    let plots = vec![compare_plot("lead0", 1.9), compare_plot("lead600", 1.8)];
+    let msteps = vec![
+        manifest_step("lead0", json!({"value": 0.0})),
+        manifest_step("lead600", json!({"value": 600.0})),
+    ];
+    let m = manifest("pin_compare", compare_plan("LEAD"), msteps);
+    let v = compute_verdict(&m, &steps, &plots).unwrap();
+    assert_eq!(
+        v.recommended_step.as_deref(),
+        Some("lead600"),
+        "{}",
+        v.reason
+    );
+}
+
+/// Bench frequency-ladder signature (2026-07-25): every too-high model f_b
+/// parks its worst tone at one fixed physical frequency (~135 here, NOT its
+/// own f_b), so a winner whose tone still sits with the failing steps'
+/// means the frequency is off, and a winner at the ladder floor means the
+/// ladder should extend - both notes must fire together here.
+#[test]
+fn pin_compare_freq_flags_an_unmigrated_tone_and_the_ladder_floor() {
+    let steps = vec![
+        pin_step("freq136", None),
+        pin_step("freq134", None),
+        pin_step("freq133", None),
+    ];
+    let plots = vec![
+        freq_plot("freq136", 3.0, 135.0),
+        freq_plot("freq134", 2.5, 135.0),
+        freq_plot("freq133", 2.1, 135.0),
+    ];
+    let msteps = vec![
+        manifest_step("freq136", json!({"value": 136.0})),
+        manifest_step("freq134", json!({"value": 134.0})),
+        manifest_step("freq133", json!({"value": 133.0})),
+    ];
+    let m = manifest("pin_compare", compare_plan("FREQ"), msteps);
+    let v = compute_verdict(&m, &steps, &plots).unwrap();
+    assert_eq!(
+        v.recommended_step.as_deref(),
+        Some("freq133"),
+        "{}",
+        v.reason
+    );
+    assert!(v.reason.contains("has not migrated"), "{}", v.reason);
+    assert!(v.reason.contains("ladder floor"), "{}", v.reason);
+}
+
+#[test]
+fn pin_compare_freq_migrated_tone_drops_the_off_note() {
+    // The winner's worst tone moved to unrelated background (160 Hz) while
+    // the failing step's sits at 135: the frequency is right, only the
+    // floor note remains (nothing below it was tested).
+    let steps = vec![pin_step("freq133", None), pin_step("freq130", None)];
+    let plots = vec![
+        freq_plot("freq133", 2.1, 135.0),
+        freq_plot("freq130", 1.6, 160.0),
+    ];
+    let msteps = vec![
+        manifest_step("freq133", json!({"value": 133.0})),
+        manifest_step("freq130", json!({"value": 130.0})),
+    ];
+    let m = manifest("pin_compare", compare_plan("FREQ"), msteps);
+    let v = compute_verdict(&m, &steps, &plots).unwrap();
+    assert_eq!(
+        v.recommended_step.as_deref(),
+        Some("freq130"),
+        "{}",
+        v.reason
+    );
+    assert!(!v.reason.contains("has not migrated"), "{}", v.reason);
+    assert!(v.reason.contains("ladder floor"), "{}", v.reason);
+}
+
+#[test]
+fn pin_compare_freq_flat_ladder_reports_a_tie() {
+    // Both tones already in the background and scores within 25%: the
+    // frequencies are equivalent - say so instead of a false "still off"
+    // (both tones sit at the same background frequency).
+    let steps = vec![pin_step("freq131", None), pin_step("freq130", None)];
+    let plots = vec![
+        freq_plot("freq131", 1.62, 160.0),
+        freq_plot("freq130", 1.59, 160.0),
+    ];
+    let msteps = vec![
+        manifest_step("freq131", json!({"value": 131.0})),
+        manifest_step("freq130", json!({"value": 130.0})),
+    ];
+    let m = manifest("pin_compare", compare_plan("FREQ"), msteps);
+    let v = compute_verdict(&m, &steps, &plots).unwrap();
+    assert!(v.reason.contains("nearly tie"), "{}", v.reason);
+    assert!(!v.reason.contains("has not migrated"), "{}", v.reason);
+}
+
+/// A manifest without a chirp plan (older build, foreign run) cannot be
+/// ranked - but the verdict must degrade to a named no-recommendation, not
+/// an Err: a verdict Err fails the whole analyze and takes the charts (the
+/// comparison's actual product) down with it.
+#[test]
+fn pin_compare_without_a_band_plan_degrades_to_no_recommendation() {
+    let steps = vec![pin_step("zeta0p04", None)];
+    let plots = vec![compare_plot("zeta0p04", 1.59)];
+    let msteps = vec![manifest_step("zeta0p04", json!({"value": 0.04}))];
+    let m = manifest("pin_compare", json!({}), msteps);
+    let v = compute_verdict(&m, &steps, &plots).unwrap();
+    assert!(v.recommended_step.is_none());
     assert!(
-        v.reason.contains("min residual 1.20 um at zeta0p02"),
+        v.reason.contains("cannot rank the sweep") && v.reason.contains("stroke_plan.freq_start"),
         "{}",
         v.reason
     );

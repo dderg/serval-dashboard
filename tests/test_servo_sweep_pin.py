@@ -473,6 +473,28 @@ def test_pin_sweep_accel_empty_capture_reports_na():
 
 
 @requires_tomllib
+def test_pin_sweep_all_accel_captures_empty_refuses_residual_fallback():
+    # A fitted accelerometer that yields nothing on EVERY step is a broken
+    # measurement, not a preference: silently re-picking on the drive-side
+    # residual is how LEAD=0 beat the bench-correct 600.
+    sc, _gcode, _node, _path = _setup(
+        residuals=[5.0e-3, 1.0e-3, 3.0e-3],
+        accel_amps=[None, None, None],
+        accel_freq=130.0,
+    )
+    gcmd = FakeGcmd(
+        MODE="X",
+        FREQ="130",
+        PARAM="ZETA",
+        VALUES="0.02,0.04,0.06",
+        DWELL="1",
+        ACCEL_CHIP="adxl345 tool",
+    )
+    with pytest.raises(Exception, match="no staircase step yielded accel"):
+        sc.cmd_SERVO_SWEEP_PIN(gcmd)
+
+
+@requires_tomllib
 def test_pin_sweep_writes_per_step_accel_csv_for_the_psd():
     # The scalar amplitude at the tone cannot show whether the pin
     # collapsed the coupled spike or merely added a second one - that needs

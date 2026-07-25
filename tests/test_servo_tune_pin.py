@@ -328,9 +328,11 @@ def test_tune_pin_scores_accel_on_every_ladder_stage():
 
 
 @requires_tomllib
-def test_tune_pin_accel_empty_capture_scores_nothing():
-    # Every step's accel capture is empty: no accel-minimum line is printed
-    # (no fake zero wins) while the residual tune proceeds normally.
+def test_tune_pin_all_accel_captures_empty_fails_loud():
+    # Every step's accel capture is empty - a broken accelerometer, not a
+    # preference. Proceeding on the drive-side residual alone is how LEAD=0
+    # beat the bench-correct 600, so the tune refuses instead, restoring
+    # the pre-tune model.
     n_steps = 7 + 5 + 5
     sc, _gcode, node, path = _setup(
         accel_amps=[None] * n_steps, accel_freq=131.5
@@ -342,7 +344,6 @@ def test_tune_pin_accel_empty_capture_scores_nothing():
         X_PEAK="200",
         ACCEL_CHIP="adxl345 tool",
     )
-    sc.cmd_SERVO_TUNE_PIN(gcmd)
-    report = " ".join(gcmd.responses)
-    assert "pin sweep accel" not in report
-    assert node.live_dynamics_profile != path
+    with pytest.raises(Exception, match="no staircase step yielded accel"):
+        sc.cmd_SERVO_TUNE_PIN(gcmd)
+    assert node.live_dynamics_profile == path

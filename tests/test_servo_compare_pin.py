@@ -307,6 +307,57 @@ def test_compare_restores_baseline_on_failure_mid_sweep():
 
 
 @requires_tomllib
+def test_compare_freq_streams_recomputed_compliance_and_pin_mass():
+    # PARAM=FREQ sweeps the model f_b: compliance is 1/(2*pi*f)^2 per value
+    # and pin_mass follows mass*(1-(f/f_peak)^2) with the coupled peak held
+    # at the baseline's implied value (f_b=130 from c=1.5e-6, fraction 0.6
+    # -> f_peak = 130/sqrt(0.4) ~= 205.5 Hz).
+    sc, _gcode, node, path, _chip = _setup(amps=[1.0, 1.0])
+    sc.cmd_SERVO_COMPARE_PIN(_gcmd(PARAM="FREQ", VALUES="120,125"))
+    engine = sc.printer.lookup_object("motion_engine")
+    f_b = 1.0 / (2.0 * math.pi * math.sqrt(1.5e-6))
+    f_peak = f_b / math.sqrt(1.0 - 0.3 / 0.5)
+    for call, f in zip(engine.dynamics_calls, (120.0, 125.0)):
+        assert call[5][0] == pytest.approx(1.0 / (2.0 * math.pi * f) ** 2)
+        assert call[6][0] == pytest.approx(0.5 * (1.0 - (f / f_peak) ** 2))
+        # the swept mode's other pin parameters ride along unchanged
+        assert call[7] == [0.05, 0.0]
+        assert call[8] == 100.0
+    # baseline restored last: original compliance and pin_mass
+    assert engine.dynamics_calls[-1][5][0] == pytest.approx(1.5e-6)
+    assert engine.dynamics_calls[-1][6][0] == pytest.approx(0.3)
+    assert node.live_dynamics_profile == path
+    assert [s["name"] for s in _steps(_run_dirs(sc)[0])] == [
+        "freq120",
+        "freq125",
+    ]
+
+
+@requires_tomllib
+def test_compare_freq_at_or_above_the_coupled_peak_rejects_before_motion():
+    # f_b = f_peak implies pin_mass = 0: the pin stops existing. The check
+    # needs the baseline, but still lands before the first excitation.
+    sc, _gcode, _node, _path, _chip = _setup()
+    with pytest.raises(Exception, match="coupled peak"):
+        sc.cmd_SERVO_COMPARE_PIN(_gcmd(PARAM="FREQ", VALUES="120,206"))
+    assert sc.printer.lookup_object("motion_engine").buzzes == []
+    assert _run_dirs(sc) == []
+
+
+@requires_tomllib
+def test_compare_freq_requires_an_actively_pinned_mode():
+    # Mode y carries pin_mass 0 in the baseline: there is no pin whose
+    # frequency could be swept.
+    sc, _gcode, _node, _path, _chip = _setup()
+    with pytest.raises(Exception, match="actively pinned"):
+        sc.cmd_SERVO_COMPARE_PIN(
+            _gcmd(MODE="Y", PARAM="FREQ", VALUES="120,125")
+        )
+    assert sc.printer.lookup_object("motion_engine").buzzes == []
+    assert _run_dirs(sc) == []
+
+
+@requires_tomllib
 def test_compare_requires_accel_chip():
     sc, _gcode, _node, _path, _chip = _setup()
     with pytest.raises(Exception, match="ACCEL_CHIP"):
